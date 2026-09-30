@@ -4,6 +4,10 @@ Status: Alpha
 ### Description:
 It will convert lines of lyrics into AI generated images, one for each line. The idea is one could arrange these in a movie editor, and fade in/out between sections of images, to make simple music videos. One could also take the line of lyrics and the generated images, and feed that into AI video generator to make clips, that could then be assembled.
 
+### Media:
+- Early version, somewhat working...
+![Generation_Page](https://github.com/wiseman-timelord/Lyrics-Materials/blob/main/media/Generation_Page.jpg)
+
 ### Features:
 - Local Windows tool: paste lyrics → one still per non-marker lyric line → `output/<song_name>/` folder of numbered PNGs for use in external AI video tools.
 - Not a video app: slideshow assembly, section fades, Whisper timing, and audio input were removed when converting from Lyrics-Slideshow.
