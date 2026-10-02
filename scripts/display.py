@@ -155,18 +155,45 @@ def _can_create(lyrics: str, song_name: str = "") -> bool:
     return True
 
 
+def _partial_project_state(lyrics: str = "") -> bool:
+    """True when the active project has SOME but not ALL of its stills on disk."""
+    try:
+        folder = (configure.APP_STATE.get("current_project_folder") or "").strip()
+        if not folder or not Path(folder).is_dir():
+            return False
+        n_lines = 0
+        if (lyrics or "").strip():
+            from scripts.inference import parse_lyrics, lyric_lines_only
+            n_lines = len(lyric_lines_only(parse_lyrics(lyrics)))
+        if n_lines <= 0:
+            n_lines = int(configure.APP_STATE.get("thumb_expected_count") or 0)
+        if n_lines <= 0:
+            return False
+        have = _line_path_map(_list_project_images(folder))
+        n_have = len([k for k in have if 1 <= k <= n_lines])
+        return 0 < n_have < n_lines
+    except Exception:
+        return False
+
+
+def _run_btn_label(lyrics: str = "") -> str:
+    """'Complete Materials' when resuming a partly finished project, else 'Generate Materials'."""
+    return "Complete Materials" if _partial_project_state(lyrics) else "Generate Materials"
+
+
 def _run_btn_updates(lyrics: str = "", song_name: str = ""):
     """
     One primary action button:
-      ready  → Generate Materials (clickable)
-      not    → Configure the Pages First (disabled grey)
+      ready, new / fully done project → Generate Materials (clickable)
+      ready, project has some stills  → Complete Materials (same action)
+      not ready                       → Configure the Pages First (disabled grey)
     Using a single control avoids Gradio dual-visibility races where both
     buttons could end up hidden.
     """
     ok = _can_create(lyrics, song_name)
     if ok:
         return gr.update(
-            value="Generate Materials",
+            value=_run_btn_label(lyrics),
             interactive=True,
             variant="primary",
             visible=True,
@@ -177,6 +204,18 @@ def _run_btn_updates(lyrics: str = "", song_name: str = ""):
         variant="secondary",
         visible=True,
     )
+
+
+def _run_btn_for_project(proj: str) -> Any:
+    """Run-button update for the active project (reads lyrics.txt + folder name)."""
+    lyrics = ""
+    try:
+        lp = Path(proj) / "lyrics.txt"
+        if lp.is_file():
+            lyrics = lp.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        pass
+    return _run_btn_updates(lyrics, Path(proj).name if proj else "")
 
 
 def _lyrics_line_count(text: str) -> int:
@@ -239,20 +278,78 @@ def _gallery_height_for(n_images: int) -> int:
     return min(1600, max(cell_h + 16, rows * cell_h + 24))
 
 
+def _is_numbered_still(path: str | Path) -> bool:
+    """True only for materials stills named like 001-… / 001 - …. Excludes reference.*"""
+    name = Path(path).name
+    if name.lower().startswith("reference"):
+        return False
+    return bool(re.match(r"^\d{3}(?:\s*[-–—]|[-.])", name) or re.match(r"^\d{3}\.", name) or re.match(r"^\d{3}$", Path(path).stem))
+
+
+_PLACEHOLDER_WARNED: set = set()
+
+# kind -> file under images/ (user-facing spelling "qued" is intentional)
+_PLACEHOLDER_FILES = {
+    "no_image": "thumbnails_no_image.jpg",
+    "queued": "thumbnails_qued_for_generation.jpg",
+    "generating": "thumbnails_generating.jpg",
+}
+
+
+def _placeholder_thumb(kind: str) -> Optional[str]:
+    """Absolute path to images/<placeholder>.jpg for no_image | queued | generating.
+
+    Returns None if the file is missing (a one-time console warning is printed).
+    """
+    fname = _PLACEHOLDER_FILES.get(kind, f"thumbnails_{kind}.jpg")
+    try:
+        p = configure.get_images_dir() / fname
+        if p.is_file():
+            return str(p.resolve())
+        if fname not in _PLACEHOLDER_WARNED:
+            _PLACEHOLDER_WARNED.add(fname)
+            print(f"  WARNING: placeholder not found: {p}", flush=True)
+    except Exception:
+        pass
+    return None
+
+
+def _queued_lines() -> set:
+    """1-based line numbers currently listed for generation (not started yet)."""
+    out: set = set()
+    for x in configure.APP_STATE.get("thumb_queued_lines") or []:
+        try:
+            out.add(int(x))
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def _unqueue_line(line_no_1based: int) -> None:
+    """Remove a line from the queued list (it is starting, or finished)."""
+    try:
+        n = int(line_no_1based)
+    except (TypeError, ValueError):
+        return
+    configure.APP_STATE["thumb_queued_lines"] = sorted(_queued_lines() - {n})
+
+
 def _list_project_images(project_dir: str = "") -> List[str]:
-    """Sorted still paths for the active project (or APP_STATE paths)."""
+    """Sorted numbered still paths for the active project (never includes reference.*)."""
     paths: List[str] = []
     folder = (project_dir or configure.APP_STATE.get("current_project_folder") or "").strip()
     if folder and Path(folder).is_dir():
-        for p in sorted(Path(folder).glob("*.png")):
-            paths.append(str(p))
-        for p in sorted(Path(folder).glob("*.jpg")):
-            paths.append(str(p))
+        for p in Path(folder).iterdir():
+            if not p.is_file():
+                continue
+            if p.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
+                continue
+            if _is_numbered_still(p):
+                paths.append(str(p))
     if not paths:
         for p in configure.APP_STATE.get("generation_output_paths") or []:
-            if p and Path(p).exists():
+            if p and Path(p).exists() and _is_numbered_still(p):
                 paths.append(str(p))
-    # de-dupe preserve order
     seen = set()
     out: List[str] = []
     for p in paths:
@@ -262,45 +359,125 @@ def _list_project_images(project_dir: str = "") -> List[str]:
     return out
 
 
-def _thumb_panel_updates(paths: Optional[List[str]] = None) -> List[Any]:
-    """
-    Gradio updates for the thumb grid: each slot → (col visible, image value, button visible).
-    Order matches _gen['thumb_cols'], _gen['thumb_imgs'], _gen['thumb_btns'].
-    """
+def _line_path_map(paths: Optional[List[str]] = None) -> Dict[int, str]:
+    """Map 1-based line number → absolute still path."""
     if paths is None:
         paths = _list_project_images()
-    # Stable order by leading line number ("001-…" or "001 - …")
-    def _sort_key(p: str):
-        name = Path(p).name
-        m = re.match(r"^(\d+)", name)
+    out: Dict[int, str] = {}
+    for p in paths:
+        if not p or not Path(p).is_file():
+            continue
+        m = re.match(r"^(\d+)", Path(p).name)
+        if not m:
+            continue
+        out[int(m.group(1))] = str(Path(p).resolve())
+    return out
+
+
+def _thumb_expected_count() -> int:
+    """How many sequential slots to show (line_count), capped at THUMB_SLOTS."""
+    n = int(configure.APP_STATE.get("thumb_expected_count") or 0)
+    if n <= 0:
+        # Fall back to highest existing still number
+        m = _line_path_map()
         if m:
-            return (0, int(m.group(1)), name.lower())
-        return (1, 0, name.lower())
-    paths = sorted([p for p in paths if p and Path(p).is_file()], key=_sort_key)
+            n = max(m.keys())
+    return max(0, min(int(n), THUMB_SLOTS))
+
+
+def _thumb_panel_updates(paths: Optional[List[str]] = None) -> List[Any]:
+    """
+    Gradio updates for the thumb grid (slot i = lyric line i+1):
+      - has still on disk → that image
+      - line is generating / regenerating now → thumbnails_generating.jpg
+      - line is listed for generation, not started → thumbnails_qued_for_generation.jpg
+      - expected but missing / removed, nothing pending → thumbnails_no_image.jpg
+    Rows are shown for the expected line count (not only existing files).
+    """
+    by_line = _line_path_map(paths)
+    expected = _thumb_expected_count()
+    # Always show at least the highest existing line
+    if by_line:
+        expected = max(expected, min(max(by_line.keys()), THUMB_SLOTS))
+    expected = min(expected, THUMB_SLOTS)
+
+    busy_raw = configure.APP_STATE.get("regen_busy_lines") or []
+    busy: set = set()
+    for x in busy_raw:
+        try:
+            busy.add(int(x))
+        except (TypeError, ValueError):
+            pass
+    # Current batch line (1-based) while full Generate is running
+    cur = configure.APP_STATE.get("thumb_generating_line")
+    if cur is not None:
+        try:
+            busy.add(int(cur))
+        except (TypeError, ValueError):
+            pass
+
+    queued = _queued_lines()
+    no_img = _placeholder_thumb("no_image")
+    que_img = _placeholder_thumb("queued") or no_img
+    gen_img = _placeholder_thumb("generating") or no_img
     th = _thumb_size_px()
-    n = min(len(paths), THUMB_SLOTS)
+    n_rows = len(_gen.get("thumb_rows") or []) or max(1, (THUMB_SLOTS + THUMB_COLS - 1) // THUMB_COLS)
+
     updates: List[Any] = []
+    for r in range(n_rows):
+        row_start = r * THUMB_COLS  # 0-based slot
+        # Show row if any slot in it is within expected range
+        row_has = row_start < expected
+        updates.append(gr.update(visible=row_has))
+
     for i in range(THUMB_SLOTS):
-        if i < n:
-            # Absolute path string — Gradio Image accepts filepath values
-            p = str(Path(paths[i]).resolve())
-            updates.append(gr.update(visible=True))  # col
-            updates.append(gr.update(value=p))  # img
-            updates.append(gr.update(visible=True))  # btn
-        else:
+        line_no = i + 1
+        if line_no > expected:
             updates.append(gr.update(visible=False))
             updates.append(gr.update(value=None))
+            updates.append(gr.update(visible=False, value="Regenerate"))
             updates.append(gr.update(visible=False))
+            continue
+
+        real = by_line.get(line_no)
+        # Priority: real still > generating now > queued > no_image.
+        # A queued line is not "generating" until it is un-queued (starts).
+        is_queued = (line_no in queued) and not real
+        is_busy = (line_no in busy) and not real and not is_queued
+        if real:
+            value = real
+        elif is_busy:
+            value = gen_img
+        elif is_queued:
+            value = que_img
+        else:
+            value = no_img
+
+        updates.append(gr.update(visible=True))
+        updates.append(gr.update(value=value, height=th))
+        # Regenerate/Remove only when a real still exists (not placeholders)
+        # Regenerate allowed for existing OR missing (refill) slots; Remove only when file exists
+        can_regen = not is_busy and not is_queued
+        can_remove = bool(real) and not is_busy
+        updates.append(gr.update(
+            visible=True,
+            interactive=can_regen,
+            value="…" if (is_busy or is_queued) else "Regenerate",
+        ))
+        updates.append(gr.update(visible=True, interactive=can_remove))
     return updates
 
 
 def _thumb_panel_outputs() -> List[Any]:
     """Ordered list of Gradio components for thumb-panel updates."""
     outs: List[Any] = []
+    for row in (_gen.get("thumb_rows") or []):
+        outs.append(row)
     for i in range(THUMB_SLOTS):
         outs.append(_gen["thumb_cols"][i])
         outs.append(_gen["thumb_imgs"][i])
         outs.append(_gen["thumb_btns"][i])
+        outs.append(_gen["thumb_remove_btns"][i])
     return outs
 
 
@@ -478,8 +655,16 @@ def _build_create_tab() -> None:
                         value=initial_lyrics,
                         elem_id="lyrics-box",
                     )
+                    _gen["negative_prompt"] = gr.Textbox(
+                        label="Negative prompt (saved with the project)",
+                        lines=2,
+                        max_lines=4,
+                        value=getattr(configure, "DEFAULT_NEGATIVE_PROMPT", ""),
+                        placeholder="Things to avoid in every still…",
+                        elem_id="negative-prompt-box",
+                    )
 
-            with gr.Row():
+            with gr.Row(elem_id="gen-action-row"):
                 _gen["run_btn"] = gr.Button(
                     "Generate Materials" if can else "Configure the Pages First",
                     variant="primary" if can else "secondary",
@@ -494,50 +679,67 @@ def _build_create_tab() -> None:
                     elem_id="stop-btn",
                 )
 
-            th0 = _thumb_size_px()
-            with gr.Column(
-                elem_id="materials-gallery",
-                elem_classes=["materials-thumbs"],
-            ) as _thumbs_panel:
-                _gen["open_materials_folder"] = gr.Button(
-                    "Materials Thumbnails",
-                    variant="secondary",
-                    elem_id="materials-thumbs-header",
-                    elem_classes=["materials-thumbs-heading"],
-                    size="sm",
-                )
-                _gen["thumbs_panel"] = _thumbs_panel
-                _gen["thumb_cols"] = []
-                _gen["thumb_imgs"] = []
-                _gen["thumb_btns"] = []
-                for row_i in range(0, THUMB_SLOTS, THUMB_COLS):
-                    with gr.Row(elem_classes=["thumb-row"]):
-                        for j in range(THUMB_COLS):
-                            idx = row_i + j
-                            with gr.Column(
+        # Materials Thumbnails: FULL WIDTH under the sidebar+settings row
+        # (left session column only affects Project Settings / Song Lyrics above)
+    th0 = _thumb_size_px()
+    with gr.Column(
+        elem_id="materials-gallery",
+        elem_classes=["materials-thumbs"],
+    ) as _thumbs_panel:
+        _gen["open_materials_folder"] = gr.Button(
+            "Materials Thumbnails",
+            variant="secondary",
+            elem_id="materials-thumbs-header",
+            elem_classes=["materials-thumbs-heading"],
+            size="sm",
+        )
+        _gen["thumbs_panel"] = _thumbs_panel
+        _gen["thumb_cols"] = []
+        _gen["thumb_imgs"] = []
+        _gen["thumb_btns"] = []
+        _gen["thumb_remove_btns"] = []
+        _gen["thumb_rows"] = []
+        for row_i in range(0, THUMB_SLOTS, THUMB_COLS):
+            with gr.Row(visible=False, elem_classes=["thumb-row"]) as trow:
+                for j in range(THUMB_COLS):
+                    idx = row_i + j
+                    with gr.Column(
+                        visible=False,
+                        scale=1,
+                        min_width=max(64, th0 // 2),
+                        elem_classes=["thumb-slot"],
+                    ) as col:
+                        img = gr.Image(
+                            value=None,
+                            label=None,
+                            show_label=False,
+                            height=th0,
+                            interactive=False,
+                            elem_classes=["thumb-img"],
+                        )
+                        with gr.Row(elem_classes=["thumb-btn-row"]):
+                            btn = gr.Button(
+                                "Regenerate",
                                 visible=False,
+                                size="sm",
+                                elem_classes=["thumb-regen-btn"],
+                                min_width=48,
+                                scale=2,
+                            )
+                            rmv = gr.Button(
+                                "Remove",
+                                visible=False,
+                                size="sm",
+                                variant="stop",
+                                elem_classes=["thumb-remove-btn"],
+                                min_width=48,
                                 scale=1,
-                                min_width=max(64, th0 // 2),
-                                elem_classes=["thumb-slot"],
-                            ) as col:
-                                img = gr.Image(
-                                    value=None,
-                                    label=None,
-                                    show_label=False,
-                                    height=th0,
-                                    interactive=False,
-                                    elem_classes=["thumb-img"],
-                                )
-                                btn = gr.Button(
-                                    "Regenerate",
-                                    visible=False,
-                                    size="sm",
-                                    elem_classes=["thumb-regen-btn"],
-                                    min_width=max(64, int(th0 * 768 / 512) // 2),
-                                )
-                                _gen["thumb_cols"].append(col)
-                                _gen["thumb_imgs"].append(img)
-                                _gen["thumb_btns"].append(btn)
+                            )
+                        _gen["thumb_cols"].append(col)
+                        _gen["thumb_imgs"].append(img)
+                        _gen["thumb_btns"].append(btn)
+                        _gen["thumb_remove_btns"].append(rmv)
+            _gen["thumb_rows"].append(trow)
 
 
 def _wire_create_events(status_box: gr.Textbox) -> None:
@@ -705,6 +907,10 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
         )
         imgs = s.get("image_paths") or configure.list_session_images(Path(s["path"]))
         configure.APP_STATE["generation_output_paths"] = list(imgs)
+        configure.APP_STATE["thumb_expected_count"] = int(s.get("line_count") or len(imgs) or 0)
+        configure.APP_STATE["thumb_generating_line"] = None
+        configure.APP_STATE["regen_busy_lines"] = []
+        configure.APP_STATE["thumb_queued_lines"] = []
         # Prefer stored lyrics; fall back to lyrics.txt
         lyrics = s.get("lyrics") or ""
         if not lyrics:
@@ -741,6 +947,7 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
             gr.update(value=steps),
             gr.update(value=cfg_scale),
             gr.update(value=ref),
+            gr.update(value=(s.get("negative_prompt") if s.get("negative_prompt") is not None else configure.DEFAULT_NEGATIVE_PROMPT)),
             status,
             sid,
         )
@@ -760,6 +967,7 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
                 _gen["steps"],
                 _gen["cfg"],
                 _gen["ref_image"],
+                _gen["negative_prompt"],
                 status_box,
                 _gen["active_session_id"],
                 _gen["run_btn"],
@@ -789,6 +997,10 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
         configure.APP_STATE["current_project_folder"] = ""
         configure.APP_STATE["session_status"] = "idle"
         configure.APP_STATE["generation_output_paths"] = []
+        configure.APP_STATE["thumb_expected_count"] = 0
+        configure.APP_STATE["thumb_generating_line"] = None
+        configure.APP_STATE["regen_busy_lines"] = []
+        configure.APP_STATE["thumb_queued_lines"] = []
         main = (
             gr.update(value=""),
             gr.update(value="", lines=12, max_lines=12),
@@ -796,6 +1008,7 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
             gr.update(value=configure.DEFAULT_STEPS),
             gr.update(value=configure.DEFAULT_CFG),
             gr.update(value=""),
+            gr.update(value=configure.DEFAULT_NEGATIVE_PROMPT),
             "New session — enter song name & lyrics, then Generate.",
             "",
         )
@@ -812,6 +1025,7 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
             _gen["steps"],
             _gen["cfg"],
             _gen["ref_image"],
+            _gen["negative_prompt"],
             status_box,
             _gen["active_session_id"],
             _gen["run_btn"],
@@ -889,11 +1103,12 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
     # via a dummy refresh bound after wiring (see build_app).
 
     def _run(
-        lyrics, song_name, style, steps, cfg_scale, ref_image, active_session_id,
+        lyrics, song_name, style, steps, cfg_scale, ref_image, negative_prompt, active_session_id,
         progress=gr.Progress(track_tqdm=False),
     ):
         # During a run: keep the action button visible but disabled; show Stop
-        hide_run = gr.update(interactive=False, value="Generate Materials", visible=True)
+        # One or the other: never show Generate and Emergency Stop together
+        hide_run = gr.update(visible=False)
         show_stop = gr.update(visible=True)
         show_run = _run_btn_updates(lyrics, song_name)  # restore ready/not-ready label
         hide_stop = gr.update(visible=False)
@@ -917,6 +1132,9 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
         cfg["imagegen_steps"] = int(steps or configure.DEFAULT_STEPS)
         cfg["imagegen_cfg_scale"] = float(cfg_scale or configure.DEFAULT_CFG)
         cfg["prompt_template"] = configure.prompt_template_for_style(style)
+        cfg["negative_prompt"] = (
+            (negative_prompt if negative_prompt is not None else configure.DEFAULT_NEGATIVE_PROMPT) or ""
+        )
 
         configure.update_generation({
             "last_lyrics": lyrics,
@@ -936,10 +1154,31 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
             if s and Path(s["path"]).is_dir():
                 resume_folder = s["path"]
 
+        # Size gallery immediately (no_image placeholders for every lyric line)
+        try:
+            from scripts.inference import parse_lyrics, lyric_lines_only
+            n_pre = len(lyric_lines_only(parse_lyrics(lyrics or "")))
+            if n_pre > 0:
+                configure.APP_STATE["thumb_expected_count"] = n_pre
+        except Exception:
+            pass
+        configure.APP_STATE["thumb_generating_line"] = None
+        configure.APP_STATE["regen_busy_lines"] = []
+        configure.APP_STATE["thumb_queued_lines"] = []
+        # Every lyric line without a still on disk is now listed for generation
+        try:
+            _n_q = int(configure.APP_STATE.get("thumb_expected_count") or 0)
+            _have = _line_path_map(_list_project_images(resume_folder)) if resume_folder else {}
+            configure.APP_STATE["thumb_queued_lines"] = [
+                k for k in range(1, min(_n_q, THUMB_SLOTS) + 1) if k not in _have
+            ]
+        except Exception:
+            configure.APP_STATE["thumb_queued_lines"] = []
+
         yield (
             "[  0%] start  Starting materials pipeline…",
             hide_run, show_stop, active_session_id or "",
-        ) + tuple(_thumb_panel_updates([])) + tuple(
+        ) + tuple(_thumb_panel_updates()) + tuple(
             _refresh_session_slots(active_session_id or "")
         )
 
@@ -977,6 +1216,17 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
         last_yield = time.time()
         sid = active_session_id or ""
         configure.APP_STATE["generating"] = True
+        # Pre-size the gallery to the full lyric line count (placeholders for each slot)
+        try:
+            from scripts.inference import parse_lyrics, lyric_lines_only
+            n_lines = len(lyric_lines_only(parse_lyrics(lyrics or "")))
+        except Exception:
+            n_lines = 0
+        if n_lines > 0:
+            configure.APP_STATE["thumb_expected_count"] = n_lines
+        configure.APP_STATE["thumb_generating_line"] = None
+        configure.APP_STATE["regen_busy_lines"] = []
+        configure.APP_STATE["thumb_queued_lines"] = []
 
         while th.is_alive() or not prog_q.empty():
             updated = False
@@ -984,6 +1234,18 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
                 while True:
                     msg, frac, info = prog_q.get_nowait()
                     status_line = _format_progress_line(msg, frac, info)
+                    # Track which still is currently generating (1-based)
+                    phase = (info or {}).get("phase") or ""
+                    line = (info or {}).get("line")
+                    if phase in ("images", "regen") and line is not None:
+                        try:
+                            configure.APP_STATE["thumb_generating_line"] = int(line)
+                            _unqueue_line(int(line))
+                        except (TypeError, ValueError):
+                            pass
+                    elif phase in ("done", "error", "analysis", "prompts"):
+                        if phase in ("done", "error"):
+                            configure.APP_STATE["thumb_generating_line"] = None
                     try:
                         progress(float(frac), desc=msg)
                     except Exception:
@@ -993,7 +1255,13 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
                 pass
 
             if updated or (time.time() - last_yield) > 0.5:
-                paths = [p for p in (configure.APP_STATE.get("generation_output_paths") or []) if Path(p).exists()]
+                paths = _list_project_images(
+                    configure.APP_STATE.get("current_project_folder") or ""
+                )
+                # Also merge any paths the pipeline reported
+                for p in (configure.APP_STATE.get("generation_output_paths") or []):
+                    if p and Path(p).exists() and p not in paths:
+                        paths.append(p)
                 sid = configure.APP_STATE.get("active_session_id") or sid
                 yield (
                     status_line,
@@ -1014,24 +1282,43 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
             })
             configure.APP_STATE["active_session_id"] = sid
         configure.APP_STATE["generating"] = False
+        # Run finished/stopped/failed: nothing from the batch stays queued
+        configure.APP_STATE["thumb_queued_lines"] = []
 
         # Drain regenerate queue (queued while this run was busy)
         q = list(configure.APP_STATE.get("regen_queue") or [])
         configure.APP_STATE["regen_queue"] = []
         if q and not inference.is_cancel_requested():
-            msg = f"{msg}  Processing {len(q)} queued regenerate(s)…"
-            yield (
-                msg, show_run, hide_stop, sid,
-            ) + tuple(_thumb_panel_updates(paths)) + tuple(_refresh_session_slots(sid))
+            # Drop invalid indices before running
+            valid_q = []
+            for qi in q:
+                try:
+                    qi = int(qi)
+                except (TypeError, ValueError):
+                    continue
+                if qi < 0:
+                    continue
+                valid_q.append(qi)
+            q = valid_q
+            configure.APP_STATE["thumb_queued_lines"] = [qi + 1 for qi in q]
+            if q:
+                msg = f"{msg}  Processing {len(q)} queued regenerate(s)…"
+                yield (
+                    msg, show_run, hide_stop, sid,
+                ) + tuple(_thumb_panel_updates(paths)) + tuple(_refresh_session_slots(sid))
             for line_idx in q:
                 if inference.is_cancel_requested():
                     break
                 try:
                     configure.APP_STATE["generating"] = True
+                    _unqueue_line(int(line_idx) + 1)
                     proj = configure.APP_STATE.get("current_project_folder") or ""
                     cfg_now = configure.load_configuration()
                     cfg_now["imagegen_steps"] = steps
                     cfg_now["imagegen_cfg_scale"] = cfg_scale
+                    cfg_now["negative_prompt"] = (
+                        (negative_prompt if negative_prompt is not None else configure.DEFAULT_NEGATIVE_PROMPT) or ""
+                    )
                     inference.regenerate_single_still(
                         Path(proj), int(line_idx), cfg_now, reference_image=ref_image or "",
                     )
@@ -1048,7 +1335,11 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
                 finally:
                     configure.APP_STATE["generating"] = False
 
+        configure.APP_STATE["thumb_generating_line"] = None
+        configure.APP_STATE["regen_busy_lines"] = []
+        configure.APP_STATE["thumb_queued_lines"] = []
         paths = _list_project_images(configure.APP_STATE.get("current_project_folder") or "")
+        show_run = _run_btn_updates(lyrics, song_name)  # label may now be Complete/Generate
         yield (
             msg,
             show_run, hide_stop, sid,
@@ -1070,104 +1361,281 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
             _gen["steps"],
             _gen["cfg"],
             _gen["ref_image"],
+            _gen["negative_prompt"],
             _gen["active_session_id"],
         ],
         outputs=_run_outputs,
     )
 
 
-    def _do_regen(line_idx: int, steps, cfg_scale, ref_image, active_session_id):
-        """Regenerate one still, or queue if a generation is already running."""
+    def _resolve_line_from_slot(line_idx: int, paths: list = None) -> int | None:
+        """Map thumbnail slot → 0-based lyric line index.
+
+        Gallery is sequential: slot 0 = line 1, slot 1 = line 2, …
+        """
+        if line_idx < 0 or line_idx >= THUMB_SLOTS:
+            return None
+        expected = _thumb_expected_count()
+        if expected > 0 and line_idx >= expected:
+            return None
+        return line_idx
+
+    def _mark_busy(line_no_1based: int, on: bool) -> None:
+        busy = set(int(x) for x in (configure.APP_STATE.get("regen_busy_lines") or []))
+        if on:
+            busy.add(int(line_no_1based))
+        else:
+            busy.discard(int(line_no_1based))
+        configure.APP_STATE["regen_busy_lines"] = sorted(busy)
+
+    def _do_remove(line_idx: int, active_session_id):
+        """Delete one still file; Generate Materials will refill gaps."""
         proj = (configure.APP_STATE.get("current_project_folder") or "").strip()
         if not proj or not Path(proj).is_dir():
             paths = _list_project_images()
             return (
-                "No active project folder — load a session or Generate first.",
-                gr.update(), gr.update(), active_session_id or "",
+                "No active project folder.",
+                active_session_id or "",
             ) + tuple(_thumb_panel_updates(paths)) + tuple(
                 _refresh_session_slots(active_session_id or "")
             )
-
-        # Map slot index to line number via sorted image filenames when possible
         paths = _list_project_images(proj)
-        if line_idx < 0 or line_idx >= THUMB_SLOTS:
+        resolved = _resolve_line_from_slot(line_idx, paths)
+        if resolved is None:
             return (
-                "Invalid still index.",
-                gr.update(), gr.update(), active_session_id or "",
+                "Nothing to remove in that slot.",
+                active_session_id or "",
             ) + tuple(_thumb_panel_updates(paths)) + tuple(
                 _refresh_session_slots(active_session_id or "")
             )
+        line_no = resolved + 1
+        removed = []
+        for old in list(Path(proj).iterdir()):
+            if not old.is_file():
+                continue
+            if old.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
+                continue
+            m = re.match(r"^(\d+)", old.name)
+            if m and int(m.group(1)) == line_no:
+                try:
+                    old.unlink()
+                    removed.append(old.name)
+                except OSError as e:
+                    print(f"[remove] {old}: {e}", flush=True)
+        # Drop from APP_STATE paths
+        kept = []
+        for p in (configure.APP_STATE.get("generation_output_paths") or []):
+            try:
+                m = re.match(r"^(\d+)", Path(p).name)
+                if m and int(m.group(1)) == line_no:
+                    continue
+            except Exception:
+                pass
+            kept.append(p)
+        configure.APP_STATE["generation_output_paths"] = kept
+        paths = _list_project_images(proj)
+        try:
+            configure.save_session_meta(Path(proj), {
+                "images_done": len(paths),
+            })
+        except Exception:
+            pass
+        # Keep slot visible with no_image placeholder
+        exp = int(configure.APP_STATE.get("thumb_expected_count") or 0)
+        if line_no > exp:
+            configure.APP_STATE["thumb_expected_count"] = line_no
+        msg = (
+            f"Removed still {line_no}"
+            + (f" ({', '.join(removed)})" if removed else "")
+            + ". Slot shows placeholder — Generate Materials or Regenerate to refill."
+        )
+        return (
+            msg,
+            active_session_id or "",
+        ) + tuple(_thumb_panel_updates(paths)) + tuple(
+            _refresh_session_slots(active_session_id or "")
+        )
 
-        # Prefer line number from filename "001-…" / "001 - …" if the slot has an image
-        resolved_idx = line_idx
-        if line_idx < len(paths):
-            name = Path(paths[line_idx]).name
-            m = re.match(r"^(\d+)", name)
-            if m:
-                resolved_idx = int(m.group(1)) - 1
-            else:
+    def _do_regen(line_idx: int, steps, cfg_scale, ref_image, negative_prompt, active_session_id):
+        """
+        Regenerate ONE still. Clears that slot immediately, runs sd-cli for that
+        line only, supports queueing other slots while one is running.
+        show_progress is disabled on the button so Gradio does not spin every thumb.
+        """
+        proj = (configure.APP_STATE.get("current_project_folder") or "").strip()
+        empty = (
+            "No active project folder — load a session or Generate first.",
+            gr.update(), gr.update(), active_session_id or "",
+        ) + tuple(_thumb_panel_updates()) + tuple(
+            _refresh_session_slots(active_session_id or "")
+        )
+        if not proj or not Path(proj).is_dir():
+            yield empty
+            return
+
+        paths = _list_project_images(proj)
+        resolved_idx = _resolve_line_from_slot(line_idx, paths)
+        # Slot index IS the line index when gallery is sequential (slot 0 = line 1)
+        if resolved_idx is None:
+            expected = _thumb_expected_count()
+            if 0 <= line_idx < expected:
                 resolved_idx = line_idx
+            else:
+                yield (
+                    "That thumbnail slot is outside the project line count.",
+                    gr.update(), gr.update(), active_session_id or "",
+                ) + tuple(_thumb_panel_updates(paths)) + tuple(
+                    _refresh_session_slots(active_session_id or "")
+                )
+                return
 
+        # Bound against lyrics
+        try:
+            lyrics_path = Path(proj) / "lyrics.txt"
+            n_lines = 0
+            if lyrics_path.is_file():
+                from scripts.inference import parse_lyrics, lyric_lines_only
+                n_lines = len(lyric_lines_only(parse_lyrics(
+                    lyrics_path.read_text(encoding="utf-8", errors="replace")
+                )))
+            if n_lines > 0 and not (0 <= resolved_idx < n_lines):
+                yield (
+                    f"Still index {resolved_idx + 1} is out of range (1..{n_lines}).",
+                    gr.update(), gr.update(), active_session_id or "",
+                ) + tuple(_thumb_panel_updates(paths)) + tuple(
+                    _refresh_session_slots(active_session_id or "")
+                )
+                return
+        except Exception:
+            pass
+
+        line_no = resolved_idx + 1
+
+        # Persist negative prompt on the project
+        neg = (negative_prompt or "").strip()
+        try:
+            configure.save_session_meta(Path(proj), {"negative_prompt": neg})
+            (Path(proj) / "negative_prompt.txt").write_text(neg + "\n", encoding="utf-8")
+        except Exception:
+            pass
+
+        # Queue if already generating
         if configure.APP_STATE.get("generating") or configure.APP_STATE.get("session_status") == "running":
             q = list(configure.APP_STATE.get("regen_queue") or [])
             if resolved_idx not in q:
                 q.append(resolved_idx)
             configure.APP_STATE["regen_queue"] = q
-            return (
-                f"Queued regenerate for still {resolved_idx + 1} "
-                f"(will run after current generation finishes).",
+            _mark_busy(line_no, True)
+            configure.APP_STATE["thumb_queued_lines"] = sorted(_queued_lines() | {line_no})
+            # Delete existing still now so UI shows blank for this slot only
+            for old in list(Path(proj).iterdir()):
+                if not old.is_file():
+                    continue
+                if old.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
+                    continue
+                m = re.match(r"^(\d+)", old.name)
+                if m and int(m.group(1)) == line_no:
+                    try:
+                        old.unlink()
+                    except OSError:
+                        pass
+            paths = _list_project_images(proj)
+            yield (
+                f"Queued regenerate for still {line_no} "
+                f"(runs after current work finishes).",
                 gr.update(), gr.update(), active_session_id or "",
             ) + tuple(_thumb_panel_updates(paths)) + tuple(
                 _refresh_session_slots(active_session_id or "")
             )
+            return
+
+        # Immediate: blank this slot, mark busy, delete file
+        _mark_busy(line_no, True)
+        for old in list(Path(proj).iterdir()):
+            if not old.is_file():
+                continue
+            if old.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
+                continue
+            m = re.match(r"^(\d+)", old.name)
+            if m and int(m.group(1)) == line_no:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+        paths = _list_project_images(proj)
+        yield (
+            f"Regenerating still {line_no}…",
+            gr.update(visible=False),
+            gr.update(visible=True),
+            active_session_id or "",
+        ) + tuple(_thumb_panel_updates(paths)) + tuple(
+            _refresh_session_slots(active_session_id or "")
+        )
 
         configure.APP_STATE["generating"] = True
         configure.APP_STATE["session_status"] = "running"
+        msg = f"Regenerated still {line_no}."
         try:
             cfg_now = configure.load_configuration()
             cfg_now["imagegen_steps"] = steps
             cfg_now["imagegen_cfg_scale"] = cfg_scale
+            cfg_now["negative_prompt"] = neg
             inference.regenerate_single_still(
                 Path(proj),
                 int(resolved_idx),
                 cfg_now,
                 reference_image=ref_image or "",
             )
-            paths = _list_project_images(proj)
             configure.APP_STATE["session_status"] = "stopped"
-            msg = f"Regenerated still {resolved_idx + 1}."
         except Exception as e:
-            paths = _list_project_images(proj)
             configure.APP_STATE["session_status"] = "stopped"
-            msg = f"Regenerate failed for still {resolved_idx + 1}: {e}"
+            msg = f"Regenerate failed for still {line_no}: {e}"
             print(f"[regen] {msg}", flush=True)
         finally:
             configure.APP_STATE["generating"] = False
+            _mark_busy(line_no, False)
 
-        # Drain any items queued while we were regenerating
+        # Drain queue (other slots clicked while this one ran)
         q = list(configure.APP_STATE.get("regen_queue") or [])
         configure.APP_STATE["regen_queue"] = []
         extra = ""
         for qi in q:
             if inference.is_cancel_requested():
                 break
+            qi = int(qi)
+            q_line = qi + 1
+            _unqueue_line(q_line)
+            _mark_busy(q_line, True)
+            paths = _list_project_images(proj)
+            yield (
+                f"Regenerating still {q_line} (from queue)…",
+                gr.update(visible=False),
+                gr.update(visible=True),
+                active_session_id or "",
+            ) + tuple(_thumb_panel_updates(paths)) + tuple(
+                _refresh_session_slots(active_session_id or "")
+            )
             try:
                 configure.APP_STATE["generating"] = True
                 cfg_now = configure.load_configuration()
                 cfg_now["imagegen_steps"] = steps
                 cfg_now["imagegen_cfg_scale"] = cfg_scale
+                cfg_now["negative_prompt"] = neg
                 inference.regenerate_single_still(
-                    Path(proj), int(qi), cfg_now, reference_image=ref_image or "",
+                    Path(proj), qi, cfg_now, reference_image=ref_image or "",
                 )
-                extra += f" Also regenerated {int(qi) + 1}."
+                extra += f" Also regenerated {q_line}."
             except Exception as e:
-                extra += f" Queued {int(qi) + 1} failed: {e}."
+                extra += f" Queued {q_line} failed: {e}."
             finally:
                 configure.APP_STATE["generating"] = False
+                _mark_busy(q_line, False)
+
+        configure.APP_STATE["thumb_queued_lines"] = []
         paths = _list_project_images(proj)
-        return (
+        yield (
             msg + extra,
-            gr.update(visible=True, interactive=True, value="Generate Materials"),
+            _run_btn_for_project(proj),
             gr.update(visible=False),
             active_session_id or "",
         ) + tuple(_thumb_panel_updates(paths)) + tuple(
@@ -1181,12 +1649,28 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
         _gen["active_session_id"],
     ] + _thumb_panel_outputs() + _session_refresh_outputs
 
-    # Wire each Regenerate button to ONE slot index only (partial, not shared lambda)
+    _remove_outputs = [
+        status_box,
+        _gen["active_session_id"],
+    ] + _thumb_panel_outputs() + _session_refresh_outputs
+
+    # Wire each Regenerate / Remove button to ONE slot index only
     for i, btn in enumerate(_gen["thumb_btns"]):
         btn.click(
             functools.partial(_do_regen, i),
-            inputs=[_gen["steps"], _gen["cfg"], _gen["ref_image"], _gen["active_session_id"]],
+            inputs=[
+                _gen["steps"], _gen["cfg"], _gen["ref_image"],
+                _gen["negative_prompt"], _gen["active_session_id"],
+            ],
             outputs=_regen_outputs,
+            show_progress="minimal",
+        )
+    for i, btn in enumerate(_gen.get("thumb_remove_btns") or []):
+        btn.click(
+            functools.partial(_do_remove, i),
+            inputs=[_gen["active_session_id"]],
+            outputs=_remove_outputs,
+            show_progress=False,
         )
 
     # Populate sidebar once after UI is up
@@ -1712,21 +2196,40 @@ def build_app():
   opacity: 0.9 !important;
 }
 #materials-gallery {
-  min-height: 120px;
+  width: 100% !important;
+  min-height: 0;
   overflow-y: auto;
   max-height: 70vh;
+  margin-top: 0.35rem;
+}
+#materials-gallery .thumb-row {
+  margin: 0 !important;
+  gap: 0.25rem !important;
 }
 #materials-gallery .thumb-slot {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 0.2rem;
+  gap: 0.15rem;
   padding: 0.1rem;
 }
-#materials-gallery .thumb-img img,
+/* Fit still to thumbnail BOX HEIGHT (768x512 → width follows height) */
 #materials-gallery .thumb-img {
-  object-fit: contain !important;
+  width: auto !important;
   max-width: 100% !important;
+  height: auto !important;
+  min-height: 0 !important;
+  overflow: hidden !important;
+}
+#materials-gallery .thumb-img img,
+#materials-gallery .thumb-img button:has(img) img {
+  display: block !important;
+  width: auto !important;
+  max-width: 100% !important;
+  height: 100% !important;
+  max-height: 100% !important;
+  object-fit: contain !important;
+  object-position: center !important;
 }
 /* Hide Gradio Image toolbar only — do NOT hide the wrapper that contains <img>
    (Gradio 6 puts the still inside a button; hiding all buttons blanks the thumbs). */
@@ -1767,17 +2270,6 @@ def build_app():
   opacity: 0.7 !important;
   cursor: not-allowed !important;
 }
-#materials-gallery .thumb-img {
-  min-height: 64px !important;
-}
-#materials-gallery .thumb-img img {
-  display: block !important;
-  width: 100% !important;
-  height: auto !important;
-  max-height: 100% !important;
-  object-fit: contain !important;
-}
-/* Do not hide the actual image element if Gradio wraps it oddly */
 #materials-gallery .thumb-img img[src] {
   visibility: visible !important;
   opacity: 1 !important;

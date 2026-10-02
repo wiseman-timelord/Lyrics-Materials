@@ -441,6 +441,9 @@ DEFAULT_WIDTH = 768
 DEFAULT_HEIGHT = 512
 DEFAULT_STEPS = 4
 DEFAULT_CFG = 1.0
+DEFAULT_NEGATIVE_PROMPT = (
+    "cartoon, pixelated, graphical overlay, text overlay, watermark, logo, blurry, low quality, deformed, extra limbs"
+)
 DEFAULT_SAMPLER = "euler_a"
 DEFAULT_SEED = -1
 
@@ -493,6 +496,9 @@ APP_STATE: Dict[str, Any] = {
     # Per-still regenerate queue (0-based line indices); drained when idle
     "regen_queue": [],
     "generating": False,
+    # 1-based lyric line numbers listed for generation but not started yet
+    # (drives thumbnails_qued_for_generation.jpg in the Materials grid)
+    "thumb_queued_lines": [],
 }
 
 
@@ -1063,6 +1069,7 @@ def load_session_meta(project_dir: Path) -> Dict[str, Any]:
         "steps": DEFAULT_STEPS,
         "cfg_scale": DEFAULT_CFG,
         "reference_image": "",
+        "negative_prompt": DEFAULT_NEGATIVE_PROMPT,
         "phase": "none",
         "line_count": 0,
         "images_done": 0,
@@ -1101,7 +1108,7 @@ def save_session_meta(project_dir: Path, updates: Dict[str, Any]) -> Dict[str, A
 
 
 def list_session_images(project_dir: Path) -> List[str]:
-    """Sorted list of existing still paths (NNN - *.png)."""
+    """Sorted list of numbered stills only (001-… / 001 - …). Never reference.*."""
     if not project_dir or not Path(project_dir).is_dir():
         return []
     imgs: List[Tuple[int, Path]] = []
@@ -1110,11 +1117,13 @@ def list_session_images(project_dir: Path) -> List[str]:
             continue
         if p.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
             continue
-        m = re.match(r"^(\d+)\s*[-–—]", p.name)
-        if m:
-            imgs.append((int(m.group(1)), p))
-        else:
-            imgs.append((99999, p))
+        if p.name.lower().startswith("reference"):
+            continue
+        # Accept "001-slug.png", "001 - lyric.png", "001.png"
+        m = re.match(r"^(\d{3})(?:\s*[-–—]|[-.]|$)", p.name)
+        if not m:
+            continue
+        imgs.append((int(m.group(1)), p))
     imgs.sort(key=lambda t: (t[0], t[1].name))
     return [str(p) for _, p in imgs]
 
@@ -1182,6 +1191,7 @@ def list_sessions() -> List[Dict[str, Any]]:
             "steps": meta.get("steps", DEFAULT_STEPS),
             "cfg_scale": meta.get("cfg_scale", DEFAULT_CFG),
             "reference_image": meta.get("reference_image") or "",
+            "negative_prompt": meta.get("negative_prompt") if meta.get("negative_prompt") is not None else DEFAULT_NEGATIVE_PROMPT,
         })
     sessions.sort(key=lambda s: s["mtime"], reverse=True)
     return sessions
@@ -1213,6 +1223,7 @@ def get_session_by_id(session_id: str) -> Optional[Dict[str, Any]]:
             "steps": meta.get("steps", DEFAULT_STEPS),
             "cfg_scale": meta.get("cfg_scale", DEFAULT_CFG),
             "reference_image": meta.get("reference_image") or "",
+            "negative_prompt": meta.get("negative_prompt") if meta.get("negative_prompt") is not None else DEFAULT_NEGATIVE_PROMPT,
         }
     return None
 

@@ -1067,12 +1067,21 @@ def _snapshot_session(
         "steps": int(cfg.get("imagegen_steps") or configure.DEFAULT_STEPS),
         "cfg_scale": float(cfg.get("imagegen_cfg_scale") or configure.DEFAULT_CFG),
         "reference_image": reference_image or "",
+        "negative_prompt": (cfg.get("negative_prompt") if cfg.get("negative_prompt") is not None
+                            else configure.DEFAULT_NEGATIVE_PROMPT) or "",
         "line_count": int(line_count or 0),
         "images_done": int(images_done),
     }
     if phase:
         updates["phase"] = phase
     configure.save_session_meta(project_dir, updates)
+    # Side file for easy inspection / external tools
+    try:
+        neg = updates.get("negative_prompt") or ""
+        payload = (neg + "\n") if neg else ""
+        (project_dir / "negative_prompt.txt").write_text(payload, encoding="utf-8")
+    except OSError:
+        pass
 
 
 
@@ -1396,16 +1405,22 @@ def _run_sd_cli_once(cmd: List[str], exe: Path, timeout: float = 600.0) -> Tuple
     saved_ok = False
     model_loaded = False
     rc = -1
+    flags: List[str] = []
     try:
         deadline = time.time() + timeout
         assert proc.stdout is not None
         while True:
             if is_cancel_requested():
                 proc.kill()
+                flags.append("[[CANCELLED]] sd-cli was stopped by a cancel request.")
                 break
             if time.time() > deadline:
                 proc.kill()
                 print(f"[sd-cli] TIMEOUT after {time.time() - t0:.1f}s", flush=True)
+                flags.append(
+                    f"[[TIMEOUT]] sd-cli was killed after {time.time() - t0:.0f}s "
+                    f"(limit {timeout:.0f}s) before saving an image."
+                )
                 break
             line = proc.stdout.readline()
             if line == "" and proc.poll() is not None:
@@ -1466,6 +1481,7 @@ def _run_sd_cli_once(cmd: List[str], exe: Path, timeout: float = 600.0) -> Tuple
     # Marker so callers can treat "saved" even if the exact Path lookup fails
     if saved_ok and "[[SAVED_OK]]" not in "\n".join(tail[-5:]):
         tail.append("[[SAVED_OK]]")
+    tail.extend(flags)
     return "\n".join(tail), int(rc if rc is not None else -1)
 
 
@@ -1663,8 +1679,16 @@ def _flux2_vae_help(diffusion_path: str = "", tried: str = "") -> str:
     )
 
 
-def _format_sd_failure(out: str, vae_path: str = "", diffusion_path: str = "") -> str:
-    """Turn sd-cli stderr into an actionable message (especially wrong VAE)."""
+_SD_DUMP_LINE_RE = re.compile(r"^\s*[\w\-]+:\s.*,\s*$")
+_SD_ERROR_HINTS = (
+    "error", "fail", "assert", "abort", "exception", "out of memory", "oom",
+    "cannot", "can't", "unable", "invalid", "not found", "device lost",
+    "vk::", "vulkan", "ggml_", "[[timeout]]", "[[cancelled]]", "access violation",
+)
+
+
+def _format_sd_failure(out: str, vae_path: str = "", diffusion_path: str = "", rc: Optional[int] = None) -> str:
+    """Turn sd-cli output into an actionable message (cause first, params dump removed)."""
     text = out or ""
     low = text.lower()
     if (
@@ -1674,9 +1698,47 @@ def _format_sd_failure(out: str, vae_path: str = "", diffusion_path: str = "") -
         or "new_sd_ctx_t failed" in low
     ):
         return _flux2_vae_help(diffusion_path, vae_path)
-    if len(text) > 2000:
-        return text[:1200] + "\n…[truncated]…\n" + text[-800:]
-    return text or "(no output captured)"
+    if not text.strip():
+        return f"(no output captured){f'  exit code {rc}' if rc is not None else ''}"
+
+    lines = text.splitlines()
+    flags = [l for l in lines if l.startswith("[[TIMEOUT]]") or l.startswith("[[CANCELLED]]")]
+    # Drop the long parameter dump (``key: value,`` lines) and blanks
+    useful = [l for l in lines if l.strip() and not _SD_DUMP_LINE_RE.match(l)
+              and not l.startswith("[[")]
+    errs = []
+    for l in useful:
+        ll = l.lower()
+        if any(h in ll for h in _SD_ERROR_HINTS):
+            errs.append(l.strip())
+    # de-duplicate, keep order, cap
+    seen, key_errs = set(), []
+    for l in errs:
+        if l not in seen:
+            seen.add(l)
+            key_errs.append(l[:300])
+    parts: List[str] = []
+    if rc is not None:
+        parts.append(f"sd-cli exit code: {rc}")
+    parts.extend(flags)
+    if key_errs:
+        parts.append("Key messages:\n  " + "\n  ".join(key_errs[-10:]))
+    parts.append("Last output:\n  " + "\n  ".join(l.rstrip()[:300] for l in useful[-18:]))
+    return "\n".join(parts)
+
+
+def _write_sd_failure_log(out_dir: Path, line_no: int, attempt: str, cmd: List[str], out: str, rc: int) -> Optional[Path]:
+    """Save the full sd-cli output for a failed line next to the stills."""
+    try:
+        path = Path(out_dir) / f"sd_failure_line_{int(line_no):03d}.log"
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"===== {time.strftime('%Y-%m-%d %H:%M:%S')}  attempt: {attempt}  exit={rc} =====\n")
+            f.write("COMMAND: " + " ".join(str(c) for c in cmd) + "\n\n")
+            f.write(out or "(no output)")
+            f.write("\n\n")
+        return path
+    except OSError:
+        return None
 
 
 _PROMPT_LEAK_MARKERS = (
@@ -1710,8 +1772,17 @@ def _sanitize_visual_prompt(prompt: str, lyric: str, style_hint: str = "") -> st
         bits.append(f"Music-video still of: {lyric.strip()}")
         bits.append("Cinematic composition, coherent lighting, no on-image text.")
         p = " ".join(bits)
-    if len(p) > 900:
-        p = p[:900].rsplit(" ", 1)[0]
+    # Soft cap — prefer ending on a sentence boundary so Flux is not fed a stump
+    if len(p) > 1400:
+        cut = p[:1400]
+        for sep in (". ", "! ", "? ", "; "):
+            pos = cut.rfind(sep)
+            if pos > 600:
+                cut = cut[: pos + 1]
+                break
+        else:
+            cut = cut.rsplit(" ", 1)[0]
+        p = cut
     return p
 
 
@@ -1836,6 +1907,9 @@ def generate_images_from_prompts(
             pass
         if attach_ref and has_ref:
             c.extend(["-r", str(ref_path)])
+        neg = (cfg.get("negative_prompt") or "").strip()
+        if neg:
+            c.extend(["-n", neg])
         c.extend(_sd_placement_args(cfg, use_gpu, vk_idx))
         return c
 
@@ -1897,6 +1971,11 @@ def generate_images_from_prompts(
         cmd = _build_sd_cmd(final_prompt, img_path, attach_ref=use_ref)
         out, rc = _run_sd_cli_once(cmd, exe)
         found = _find_still_for_line(out_dir, line_no)
+        log_path = None
+        if not _sd_attempt_succeeded(out, rc, found):
+            log_path = _write_sd_failure_log(
+                out_dir, line_no, "with reference" if use_ref else "no reference", cmd, out, rc,
+            )
 
         # Only retry when the first attempt actually failed AND we had used -r.
         # Never overwrite a still sd-cli already saved.
@@ -1908,14 +1987,17 @@ def generate_images_from_prompts(
             cmd2 = _build_sd_cmd(final_prompt, img_path, attach_ref=False)
             out, rc = _run_sd_cli_once(cmd2, exe)
             found = _find_still_for_line(out_dir, line_no)
+            if not _sd_attempt_succeeded(out, rc, found):
+                cmd = cmd2
+                log_path = _write_sd_failure_log(out_dir, line_no, "retry, no reference", cmd2, out, rc)
 
         if not _sd_attempt_succeeded(out, rc, found):
-            cmd_str = " ".join(str(c) for c in cmd)
-            detail = _format_sd_failure(out, vae_path, model_path)
+            detail = _format_sd_failure(out, vae_path, model_path, rc)
+            where = f"\nFull log: {log_path}" if log_path else ""
             raise RuntimeError(
-                f"Image generation failed for line {line_no}/{total}.\n"
-                f"{detail}\n\n"
-                f"Command: {cmd_str}"
+                f"Image generation failed for line {line_no}/{total}"
+                f" ({'reference attached' if use_ref else 'no reference'}).\n"
+                f"{detail}{where}"
             )
 
         dest = found if found is not None else img_path
@@ -2097,6 +2179,9 @@ def regenerate_single_still(
             pass
         if attach_ref and has_ref:
             c.extend(["-r", str(ref)])
+        neg = (cfg.get("negative_prompt") or "").strip()
+        if neg:
+            c.extend(["-n", neg])
         c.extend(_sd_placement_args(cfg, use_gpu, vk_idx))
         return c
 
@@ -2114,7 +2199,7 @@ def regenerate_single_still(
         found = _find_still_for_line(project_dir, line_no)
 
     if not _sd_attempt_succeeded(out, rc, found):
-        detail = _format_sd_failure(out, vae_path, model_path)
+        detail = _format_sd_failure(out, vae_path, model_path, rc)
         raise RuntimeError(
             f"Regenerate failed for line {line_no} only.\n{detail}"
         )
