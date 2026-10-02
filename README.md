@@ -28,7 +28,7 @@ ffmpeg remains installed for utility/probe use only — not used for materials o
 | Encoder | `Huihui-Qwen3-VL-4B-Instruct-abliterated*.Q4_K_M.gguf` | Analysis/prompts; also passed as Flux.2 `--llm` text conditioner |
 | Thinking (optional) | `Huihui-Qwen3-VL-4B-Thinking-abliterated*.Q5_K_M.gguf` | Richer analysis + prompts when set (preferred over Encoder for Phase 1) |
 | Diffuser | `flux-2-klein-4b-Q8_0.gguf` | Image generation (`--diffusion-model`) |
-| VAE | `flux2_ae.safetensors` / `ae.safetensors` | Flux.2 autoencoder — **not** `diffusion_pytorch_model.safetensors` |
+| VAE | `diffusion_pytorch_model.safetensors` |
 | mmproj | not used for pure text — any `mmproj*.gguf` is auto-moved to `models\mmproj\` |
 ```
 
