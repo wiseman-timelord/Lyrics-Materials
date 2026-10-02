@@ -42,6 +42,32 @@ def _play_bleep(count: int = 1) -> None:
         pass
 
 
+
+def record_last_image_gen_seconds(elapsed: float) -> None:
+    """Persist the time taken for the most recent successful still generation."""
+    try:
+        sec = round(float(elapsed), 1)
+        if sec <= 0:
+            return
+        configure.update_generation({"last_image_gen_seconds": sec})
+        configure.APP_STATE["last_image_gen_seconds"] = sec
+    except Exception:
+        pass
+
+
+def last_image_gen_seconds() -> float:
+    try:
+        v = configure.APP_STATE.get("last_image_gen_seconds")
+        if v is not None:
+            return float(v)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return float(configure.load_generation().get("last_image_gen_seconds") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def maybe_bleep_section() -> None:
     prefs = configure.load_preferences()
     if prefs.get("bleep_section_completion"):
@@ -790,23 +816,42 @@ def _ascii_line_slug(line: str, max_len: int = 48) -> str:
     return t or "line"
 
 
-def _still_filename(line_no: int, line: str) -> str:
-    """001-lyric-slug.png — ASCII only so sd-cli and Python agree on the path."""
-    return f"{int(line_no):03d}-{_ascii_line_slug(line)}.png"
+def _still_filename(line_no: int, line: str, variant: int = 1, frequency: int = 1) -> str:
+    """
+    001-lyric-slug.png (freq 1) or 001-1-lyric-slug.png … 001-N-… (freq > 1).
+    ASCII only so sd-cli and Python agree on the path.
+    """
+    slug = _ascii_line_slug(line)
+    n = int(line_no)
+    freq = max(1, int(frequency or 1))
+    var = max(1, int(variant or 1))
+    if freq <= 1:
+        return f"{n:03d}-{slug}.png"
+    return f"{n:03d}-{var}-{slug}.png"
 
 
-def _find_still_for_line(out_dir: Path, line_no: int) -> Optional[Path]:
-    """Find whatever PNG/JPG was written for this 1-based line number."""
+def _find_still_for_line(
+    out_dir: Path, line_no: int, variant: Optional[int] = None,
+) -> Optional[Path]:
+    """Find PNG/JPG for this 1-based line number (optional sequence variant)."""
     if not out_dir.is_dir():
         return None
     n = int(line_no)
-    pats = (
-        f"{n:03d}-*.png",
-        f"{n:03d}-*.jpg",
-        f"{n:03d} - *",
-        f"{n:03d}.*",
-    )
     hits: List[Path] = []
+    if variant is not None:
+        v = int(variant)
+        pats = (
+            f"{n:03d}-{v}-*.png",
+            f"{n:03d}-{v}-*.jpg",
+            f"{n:03d}-{v}.*",
+        )
+    else:
+        pats = (
+            f"{n:03d}-*.png",
+            f"{n:03d}-*.jpg",
+            f"{n:03d} - *",
+            f"{n:03d}.*",
+        )
     for pat in pats:
         for m in out_dir.glob(pat):
             if m.is_file() and m.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"):
@@ -815,6 +860,27 @@ def _find_still_for_line(out_dir: Path, line_no: int) -> Optional[Path]:
         return None
     hits.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return hits[0]
+
+
+def _existing_variants_for_line(out_dir: Path, line_no: int) -> set:
+    """Set of variant indices (1-based) already on disk for a lyric line."""
+    found: set = set()
+    if not out_dir.is_dir():
+        return found
+    n = int(line_no)
+    prefix = f"{n:03d}-"
+    for m in out_dir.iterdir():
+        if not m.is_file() or m.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
+            continue
+        if not m.name.startswith(prefix):
+            continue
+        rest = m.stem[len(prefix):]
+        vm = re.match(r"^(\d+)-", rest)
+        if vm:
+            found.add(int(vm.group(1)))
+        else:
+            found.add(1)
+    return found
 
 
 def _safe_line_filename(line: str, max_len: int = 80) -> str:
@@ -1852,10 +1918,18 @@ def generate_images_from_prompts(
         m = re.search(r"(\d+)", backend)
         vk_idx = int(m.group(1)) if m else 0
 
-    # Hard-coded output size (not user-configurable)
-    width = 768
-    height = 512
+    # Output size from Generation tab / generation.json
+    try:
+        width = int(cfg.get("imagegen_width") or configure.DEFAULT_WIDTH)
+        height = int(cfg.get("imagegen_height") or configure.DEFAULT_HEIGHT)
+    except (TypeError, ValueError):
+        width, height = configure.DEFAULT_WIDTH, configure.DEFAULT_HEIGHT
+    if width < 64 or height < 64:
+        width, height = configure.DEFAULT_WIDTH, configure.DEFAULT_HEIGHT
     steps = int(cfg.get("imagegen_steps") or configure.DEFAULT_STEPS)
+    freq = configure.normalize_image_frequency(cfg.get("imagegen_frequency") or 1)
+    seq_hints = configure.image_frequency_hints(freq)
+    print(f"[images] frequency = {freq} still(s) per lyric line", flush=True)
     cfg_scale = float(cfg.get("imagegen_cfg_scale") or configure.DEFAULT_CFG)
     sampler = str(cfg.get("imagegen_sampling") or configure.DEFAULT_SAMPLER)
     seed_val = cfg.get("imagegen_seed")
@@ -1913,6 +1987,8 @@ def generate_images_from_prompts(
         c.extend(_sd_placement_args(cfg, use_gpu, vk_idx))
         return c
 
+    work_total = max(1, total * freq)
+    work_done = 0
     for i, prompt in enumerate(prompts):
         if is_cancel_requested():
             break
@@ -1922,102 +1998,140 @@ def generate_images_from_prompts(
             if force_line_numbers and i < len(force_line_numbers)
             else i + 1
         )
-        img_path = out_dir / _still_filename(line_no, line_text)
-
-        existing = _find_still_for_line(out_dir, line_no)
-        if line_no in already or existing is not None:
-            dest = existing or img_path
-            if dest not in images:
-                images.append(dest)
-                configure.APP_STATE.setdefault("generation_output_paths", []).append(str(dest))
-            print(f"[images] Lyrics Line {line_no}/{total}: SKIP (already exists)", flush=True)
-            if progress_callback:
-                progress_callback(
-                    f"Image {line_no}/{total}: skipped (exists)",
-                    0.35 + 0.55 * (i / max(total, 1)),
-                    {"phase": "images", "line": line_no, "total": total},
-                )
-            continue
-
-        print(f"[images] ────────────────────────────────────────", flush=True)
-        print(f"[images] Lyrics Line {line_no}/{total}: {line_text}", flush=True)
-        if progress_callback:
-            progress_callback(
-                f"Image {line_no}/{total}: {line_text[:60]}",
-                0.35 + 0.55 * (i / max(total, 1)),
-                {"phase": "images", "line": line_no, "total": total},
-            )
+        existing_vars = _existing_variants_for_line(out_dir, line_no)
 
         pres = "none"
         if presence_per_line and i < len(presence_per_line):
             pres = (presence_per_line[i] or "none").lower()
         use_ref = bool(has_ref and pres != "none")
         clean_prompt = _sanitize_visual_prompt(prompt, line_text, style_hint)
-        if use_ref:
-            final_prompt = (
-                f"{clean_prompt} "
-                f"[Reference character presence: {pres}. "
-                "Match the provided reference image likeness accordingly.]"
-            )
-            print(f"[images] ref image ATTACHED ({pres})", flush=True)
-        else:
-            if has_ref:
-                print(f"[images] ref image OMITTED (presence=none)", flush=True)
-            final_prompt = (
-                f"{clean_prompt} "
-                "[Do not depict any specific real person from a reference photo.]"
-            ) if has_ref else clean_prompt
 
-        cmd = _build_sd_cmd(final_prompt, img_path, attach_ref=use_ref)
-        out, rc = _run_sd_cli_once(cmd, exe)
-        found = _find_still_for_line(out_dir, line_no)
-        log_path = None
-        if not _sd_attempt_succeeded(out, rc, found):
-            log_path = _write_sd_failure_log(
-                out_dir, line_no, "with reference" if use_ref else "no reference", cmd, out, rc,
+        for var in range(1, freq + 1):
+            if is_cancel_requested():
+                break
+            img_path = out_dir / _still_filename(
+                line_no, line_text, variant=var, frequency=freq,
             )
+            already_here = var in existing_vars or (
+                freq <= 1 and _find_still_for_line(out_dir, line_no) is not None
+            )
+            if already_here:
+                dest = _find_still_for_line(
+                    out_dir, line_no, variant=var if freq > 1 else None,
+                ) or img_path
+                if dest.exists() and dest not in images:
+                    images.append(dest)
+                    configure.APP_STATE.setdefault("generation_output_paths", []).append(str(dest))
+                print(
+                    f"[images] Lyrics Line {line_no}/{total} var {var}/{freq}: SKIP (exists)",
+                    flush=True,
+                )
+                work_done += 1
+                if progress_callback:
+                    progress_callback(
+                        f"Image {line_no}/{total} [{var}/{freq}]: skipped (exists)",
+                        0.35 + 0.55 * (work_done / work_total),
+                        {"phase": "images", "line": line_no, "total": total},
+                    )
+                continue
 
-        # Only retry when the first attempt actually failed AND we had used -r.
-        # Never overwrite a still sd-cli already saved.
-        if not _sd_attempt_succeeded(out, rc, found) and use_ref:
+            print("[images] ────────────────────────────────────────", flush=True)
             print(
-                f"[images] line {line_no} failed with ref — retrying without reference image…",
+                f"[images] Lyrics Line {line_no}/{total} [{var}/{freq}]: {line_text}",
                 flush=True,
             )
-            cmd2 = _build_sd_cmd(final_prompt, img_path, attach_ref=False)
-            out, rc = _run_sd_cli_once(cmd2, exe)
-            found = _find_still_for_line(out_dir, line_no)
-            if not _sd_attempt_succeeded(out, rc, found):
-                cmd = cmd2
-                log_path = _write_sd_failure_log(out_dir, line_no, "retry, no reference", cmd2, out, rc)
+            if progress_callback:
+                progress_callback(
+                    f"Image {line_no}/{total} [{var}/{freq}]: {line_text[:50]}",
+                    0.35 + 0.55 * (work_done / work_total),
+                    {"phase": "images", "line": line_no, "total": total},
+                )
 
-        if not _sd_attempt_succeeded(out, rc, found):
-            detail = _format_sd_failure(out, vae_path, model_path, rc)
-            where = f"\nFull log: {log_path}" if log_path else ""
-            raise RuntimeError(
-                f"Image generation failed for line {line_no}/{total}"
-                f" ({'reference attached' if use_ref else 'no reference'}).\n"
-                f"{detail}{where}"
+            hint = seq_hints[var - 1] if var - 1 < len(seq_hints) else ""
+            seq_bit = f" [Sequence {var}/{freq}: {hint}.]" if hint else ""
+            if use_ref:
+                final_prompt = (
+                    f"{clean_prompt}{seq_bit} "
+                    f"[Reference character presence: {pres}. "
+                    "Match the provided reference image likeness accordingly.]"
+                )
+                if var == 1:
+                    print(f"[images] ref image ATTACHED ({pres})", flush=True)
+            else:
+                if has_ref and var == 1:
+                    print("[images] ref image OMITTED (presence=none)", flush=True)
+                final_prompt = (
+                    f"{clean_prompt}{seq_bit} "
+                    "[Do not depict any specific real person from a reference photo.]"
+                ) if has_ref else f"{clean_prompt}{seq_bit}"
+
+            cmd = _build_sd_cmd(final_prompt, img_path, attach_ref=use_ref)
+            t_img = time.time()
+            out, rc = _run_sd_cli_once(cmd, exe)
+            found = _find_still_for_line(
+                out_dir, line_no, variant=var if freq > 1 else None,
             )
+            log_path = None
+            if not _sd_attempt_succeeded(out, rc, found):
+                log_path = _write_sd_failure_log(
+                    out_dir, line_no,
+                    f"var{var} with reference" if use_ref else f"var{var} no reference",
+                    cmd, out, rc,
+                )
 
-        dest = found if found is not None else img_path
-        images.append(dest)
-        configure.APP_STATE.setdefault("generation_output_paths", []).append(str(dest))
-        already.add(line_no)
-        try:
-            sz = dest.stat().st_size
-        except OSError:
-            sz = 0
-        print(f"[images] saved {dest.name} ({sz} bytes)", flush=True)
-        try:
-            configure.save_session_meta(out_dir, {
-                "phase": "images",
-                "images_done": len(images),
-                "line_count": total,
-            })
-        except Exception:
-            pass
-        gc.collect()
+            if not _sd_attempt_succeeded(out, rc, found) and use_ref:
+                print(
+                    f"[images] line {line_no} var {var} failed with ref — "
+                    "retrying without reference…",
+                    flush=True,
+                )
+                cmd2 = _build_sd_cmd(final_prompt, img_path, attach_ref=False)
+                out, rc = _run_sd_cli_once(cmd2, exe)
+                found = _find_still_for_line(
+                    out_dir, line_no, variant=var if freq > 1 else None,
+                )
+                if not _sd_attempt_succeeded(out, rc, found):
+                    cmd = cmd2
+                    log_path = _write_sd_failure_log(
+                        out_dir, line_no, f"var{var} retry, no reference", cmd2, out, rc,
+                    )
+
+            if not _sd_attempt_succeeded(out, rc, found):
+                detail = _format_sd_failure(out, vae_path, model_path, rc)
+                where = f"\nFull log: {log_path}" if log_path else ""
+                raise RuntimeError(
+                    f"Image generation failed for line {line_no}/{total} "
+                    f"variant {var}/{freq}"
+                    f" ({'reference attached' if use_ref else 'no reference'}).\n"
+                    f"{detail}{where}"
+                )
+
+            dest = found if found is not None else img_path
+            images.append(dest)
+            configure.APP_STATE.setdefault("generation_output_paths", []).append(str(dest))
+            already.add(line_no)
+            existing_vars.add(var)
+            try:
+                sz = dest.stat().st_size
+            except OSError:
+                sz = 0
+            img_elapsed = time.time() - t_img
+            record_last_image_gen_seconds(img_elapsed)
+            print(
+                f"[images] saved {dest.name} ({sz} bytes) in {img_elapsed:.1f}s",
+                flush=True,
+            )
+            work_done += 1
+            try:
+                configure.save_session_meta(out_dir, {
+                    "phase": "images",
+                    "images_done": len(images),
+                    "line_count": total,
+                })
+            except Exception:
+                pass
+            gc.collect()
+
 
     return images
 
@@ -2116,7 +2230,13 @@ def regenerate_single_still(
     if use_gpu:
         m = re.search(r"(\d+)", backend)
         vk_idx = int(m.group(1)) if m else 0
-    width, height = 768, 512
+    try:
+        width = int(cfg.get("imagegen_width") or configure.DEFAULT_WIDTH)
+        height = int(cfg.get("imagegen_height") or configure.DEFAULT_HEIGHT)
+    except (TypeError, ValueError):
+        width, height = configure.DEFAULT_WIDTH, configure.DEFAULT_HEIGHT
+    if width < 64 or height < 64:
+        width, height = configure.DEFAULT_WIDTH, configure.DEFAULT_HEIGHT
     steps = int(cfg.get("imagegen_steps") or configure.DEFAULT_STEPS)
     cfg_scale = float(cfg.get("imagegen_cfg_scale") or configure.DEFAULT_CFG)
     sampler = str(cfg.get("imagegen_sampling") or configure.DEFAULT_SAMPLER)
@@ -2190,6 +2310,7 @@ def regenerate_single_still(
     else:
         print("[regen] ref image OMITTED", flush=True)
 
+    t_img = time.time()
     out, rc = _run_sd_cli_once(_one_cmd(attach_ref=use_ref), exe)
     found = _find_still_for_line(project_dir, line_no)
 
@@ -2205,6 +2326,8 @@ def regenerate_single_still(
         )
 
     dest = found if found is not None else img_path
+    img_elapsed = time.time() - t_img
+    record_last_image_gen_seconds(img_elapsed)
     kept = []
     for p in (configure.APP_STATE.get("generation_output_paths") or []):
         try:
@@ -2217,7 +2340,7 @@ def regenerate_single_still(
         kept.append(p)
     kept.append(str(dest))
     configure.APP_STATE["generation_output_paths"] = kept
-    print(f"[regen] done — only {dest.name} ({dest.stat().st_size} bytes)", flush=True)
+    print(f"[regen] done — only {dest.name} ({dest.stat().st_size} bytes) in {img_elapsed:.1f}s", flush=True)
     try:
         configure.save_session_meta(project_dir, {
             "phase": "images",
@@ -2232,6 +2355,495 @@ def regenerate_single_still(
 # ---------------------------------------------------------------------------
 # Top-level pipeline
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Cover image + Theme images (assessment-driven)
+# ---------------------------------------------------------------------------
+
+def _theme_topics_from_analysis(analysis: Dict[str, Any]) -> List[Dict[str, str]]:
+    """
+    Flatten analysis notes into ordered theme topics for still generation.
+    Each entry: {id, title, notes} — one still per non-empty paragraph.
+    """
+    topics: List[Dict[str, str]] = []
+    overall = (analysis.get("overall") or "").strip()
+    if overall:
+        topics.append({"id": "overall", "title": "Overall", "notes": overall})
+    char = (analysis.get("character_guidance") or "").strip()
+    if char and char.lower() not in ("none specified", "none", "n/a"):
+        topics.append({"id": "character", "title": "Character", "notes": char})
+    sections = analysis.get("sections") or {}
+    if isinstance(sections, dict):
+        for label, notes in sections.items():
+            n = (notes or "").strip()
+            if not n:
+                continue
+            slug = _ascii_line_slug(str(label), max_len=40) or "section"
+            topics.append({
+                "id": f"section-{slug}",
+                "title": str(label),
+                "notes": n,
+            })
+    return topics
+
+
+def _build_cfg_for_imagegen(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure width/height/steps are concrete ints on a shallow copy."""
+    out = dict(cfg or {})
+    try:
+        w = int(out.get("imagegen_width") or configure.DEFAULT_WIDTH)
+        h = int(out.get("imagegen_height") or configure.DEFAULT_HEIGHT)
+    except (TypeError, ValueError):
+        w, h = configure.DEFAULT_WIDTH, configure.DEFAULT_HEIGHT
+    if w < 64 or h < 64:
+        w, h = configure.DEFAULT_WIDTH, configure.DEFAULT_HEIGHT
+    out["imagegen_width"] = w
+    out["imagegen_height"] = h
+    try:
+        out["imagegen_steps"] = int(out.get("imagegen_steps") or configure.DEFAULT_STEPS)
+    except (TypeError, ValueError):
+        out["imagegen_steps"] = configure.DEFAULT_STEPS
+    try:
+        out["imagegen_cfg_scale"] = float(out.get("imagegen_cfg_scale") or configure.DEFAULT_CFG)
+    except (TypeError, ValueError):
+        out["imagegen_cfg_scale"] = configure.DEFAULT_CFG
+    return out
+
+
+def _generate_named_still(
+    dest: Path,
+    prompt: str,
+    cfg: Dict[str, Any],
+    reference_image: str = "",
+    attach_ref: bool = False,
+) -> Path:
+    """
+    Run sd-cli once for a named output path (cover / theme / custom).
+    Does not use the lyric-line numbering scheme.
+    """
+    cfg = _build_cfg_for_imagegen(cfg)
+    exe = find_sd_cpp()
+    if not exe:
+        raise RuntimeError("sd-cli binary not found. Run Installation.")
+    model_path = (cfg.get("imagegen_model_path") or "").strip()
+    if not model_path or not Path(model_path).exists():
+        raise RuntimeError(f"Diffuser model not set/found: {model_path or '(empty)'}")
+    llm_path = (cfg.get("encoder_model_path") or "").strip()
+    if not llm_path or not Path(llm_path).exists():
+        raise RuntimeError(f"Encoder not set/found: {llm_path or '(empty)'}")
+    vae_path = _resolve_flux2_vae(cfg, model_path)
+    if not vae_path:
+        raise RuntimeError(_flux2_vae_help(model_path, (cfg.get("vae_model_path") or "").strip()))
+
+    backend = str(cfg.get("imagegen_backend") or "CPU")
+    use_gpu = backend.upper().startswith(("VULKAN", "CUDA"))
+    vk_idx = 0
+    if use_gpu:
+        m = re.search(r"(\d+)", backend)
+        vk_idx = int(m.group(1)) if m else 0
+    width = int(cfg["imagegen_width"])
+    height = int(cfg["imagegen_height"])
+    steps = int(cfg["imagegen_steps"])
+    cfg_scale = float(cfg["imagegen_cfg_scale"])
+    sampler = str(cfg.get("imagegen_sampling") or configure.DEFAULT_SAMPLER)
+    seed_val = cfg.get("imagegen_seed")
+    seed = int(seed_val) if seed_val not in (None, "") else configure.DEFAULT_SEED
+    threads = _worker_thread_count(cfg)
+    ref_path = (reference_image or "").strip()
+    has_ref = bool(ref_path and Path(ref_path).is_file() and attach_ref)
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    # Remove prior file at this path so we do not leave a stale still
+    try:
+        if dest.exists():
+            dest.unlink()
+    except OSError:
+        pass
+
+    clean = _sanitize_visual_prompt(prompt, "", str(cfg.get("style") or ""))
+    cmd = [
+        str(exe),
+        "--diffusion-model", str(model_path),
+        "--llm", str(llm_path),
+        "-p", clean,
+        "-o", str(dest),
+        "-W", str(width), "-H", str(height),
+        "--steps", str(steps),
+        "--cfg-scale", str(cfg_scale),
+        "--sampling-method", sampler,
+        "-s", str(seed if seed >= 0 else seed),
+        "-t", str(threads),
+    ]
+    if vae_path and Path(vae_path).exists():
+        cmd.extend(["--vae", str(vae_path)])
+    cmd.append("--vae-tiling")
+    try:
+        vk = configure.get_vulkan_info()
+        for d in vk.get("devices") or []:
+            if int(d.get("index", -1)) == int(vk_idx) and d.get("fp16"):
+                cmd.append("--diffusion-fa")
+                break
+    except Exception:
+        pass
+    if has_ref:
+        cmd.extend(["-r", str(ref_path)])
+    neg = (cfg.get("negative_prompt") or "").strip()
+    if neg:
+        cmd.extend(["-n", neg])
+    cmd.extend(_sd_placement_args(cfg, use_gpu, vk_idx))
+
+    t_img = time.time()
+    out, rc = _run_sd_cli_once(cmd, exe)
+    # Prefer exact dest; fall back to newest matching stem nearby
+    found = dest if dest.is_file() else None
+    if found is None and dest.parent.is_dir():
+        stem = dest.stem
+        cands = sorted(
+            [p for p in dest.parent.glob(stem + ".*")
+             if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if cands:
+            found = cands[0]
+    if not _sd_attempt_succeeded(out, rc, found):
+        detail = _format_sd_failure(out, vae_path, model_path, rc)
+        raise RuntimeError(f"Still generation failed for {dest.name}.\n{detail}")
+    dest_final = found if found is not None else dest
+    img_elapsed = time.time() - t_img
+    record_last_image_gen_seconds(img_elapsed)
+    try:
+        sz = dest_final.stat().st_size
+    except OSError:
+        sz = 0
+    print(f"[named] saved {dest_final.name} ({sz} bytes) in {img_elapsed:.1f}s", flush=True)
+    gc.collect()
+    return dest_final
+
+
+def generate_cover_image(
+    song_name: str,
+    cfg: Dict[str, Any],
+    reference_image: str = "",
+    progress_callback: Optional[Callable] = None,
+    resume_folder: str = "",
+) -> Dict[str, Any]:
+    """
+    One cover still derived from the song name (and style / optional reference).
+    Writes cover-<slug>.png into the project folder.
+    """
+    clear_cancel_state()
+    configure.APP_STATE["session_status"] = "running"
+    t0 = time.time()
+    result: Dict[str, Any] = {
+        "success": False,
+        "message": "",
+        "project_folder": "",
+        "image_count": 0,
+        "image_paths": [],
+        "elapsed_seconds": 0.0,
+        "session_id": "",
+    }
+    try:
+        cfg = _build_cfg_for_imagegen(cfg)
+        label = _slugify_folder_name(
+            (song_name or cfg.get("project_label") or "").strip(),
+            fallback="",
+        )
+        if not label and not resume_folder:
+            result["message"] = "Song name is required for a cover image."
+            configure.APP_STATE["session_status"] = "idle"
+            return result
+        if not label and resume_folder:
+            label = Path(resume_folder).name
+        project_dir = ensure_project_dir(
+            label, sequential=False, resume_path=resume_folder or None,
+        )
+        result["project_folder"] = str(project_dir)
+        result["session_id"] = project_dir.name
+        configure.APP_STATE["active_session_id"] = project_dir.name
+
+        style = str(cfg.get("style") or configure.STYLE_LIGHT)
+        style_hint = configure.prompt_template_for_style(style)
+        # Cover prompt: song title as subject, style template as framing
+        title = (song_name or label).replace("_", " ").strip() or label
+        cover_prompt = (
+            f"{style_hint.replace('{line}', title)} "
+            f"Album-style cover art for the song titled \"{title}\". "
+            "Bold, iconic composition suitable as a single cover image. "
+            "No readable text, no logos, no watermarks."
+        )
+        if progress_callback:
+            progress_callback(f"Cover image for “{title}”…", 0.2, {"phase": "cover"})
+
+        # Fail fast on models
+        _diff = (cfg.get("imagegen_model_path") or "").strip()
+        _enc = (cfg.get("encoder_model_path") or "").strip()
+        if not _diff or not Path(_diff).is_file() or not _enc or not Path(_enc).is_file():
+            result["message"] = "Encoder + Diffuser models must be configured before generating a cover."
+            configure.APP_STATE["session_status"] = "idle"
+            return result
+        vae = _resolve_flux2_vae(cfg, _diff)
+        if not vae:
+            result["message"] = _flux2_vae_help(_diff, (cfg.get("vae_model_path") or "").strip())
+            configure.APP_STATE["session_status"] = "idle"
+            return result
+        cfg["vae_model_path"] = vae
+
+        has_ref = bool(reference_image and Path(reference_image).is_file())
+        if has_ref:
+            try:
+                dest_ref = project_dir / f"reference{Path(reference_image).suffix.lower() or '.png'}"
+                if not dest_ref.exists():
+                    shutil.copy2(reference_image, dest_ref)
+            except OSError:
+                pass
+
+        # Phase barrier not needed (no prior text phase); still unload any leftover workers
+        phase_barrier("cover image")
+        dest = project_dir / f"cover-{_ascii_line_slug(title, max_len=48) or 'song'}.png"
+        if progress_callback:
+            progress_callback("Generating cover still…", 0.45, {"phase": "cover"})
+        out = _generate_named_still(
+            dest, cover_prompt, cfg,
+            reference_image=reference_image if has_ref else "",
+            attach_ref=has_ref,
+        )
+        elapsed = time.time() - t0
+        configure.APP_STATE["session_status"] = "stopped"
+        result.update(
+            success=True,
+            image_count=1,
+            image_paths=[str(out)],
+            message=f"Cover image ready: {out.name} ({int(elapsed)}s)",
+            elapsed_seconds=round(elapsed, 1),
+            session_id=project_dir.name,
+            project_folder=str(project_dir),
+        )
+        if progress_callback:
+            progress_callback(result["message"], 1.0, {"phase": "done"})
+        maybe_bleep_done()
+    except Exception as e:
+        traceback.print_exc()
+        result["message"] = f"Cover generation error: {e}"
+        result["elapsed_seconds"] = round(time.time() - t0, 1)
+        configure.APP_STATE["session_status"] = "stopped"
+    return result
+
+
+def generate_theme_images(
+    lyrics: str,
+    cfg: Dict[str, Any],
+    song_name: str = "",
+    reference_image: str = "",
+    progress_callback: Optional[Callable] = None,
+    resume_folder: str = "",
+) -> Dict[str, Any]:
+    """
+    Analysis-driven theme stills: one image per assessment paragraph
+    (OVERALL, CHARACTER, each SECTIONS note).
+    Files: theme-01-overall.png, theme-02-character.png, theme-03-<section>.png, …
+    """
+    clear_cancel_state()
+    configure.APP_STATE["session_status"] = "running"
+    t0 = time.time()
+    result: Dict[str, Any] = {
+        "success": False,
+        "message": "",
+        "project_folder": "",
+        "image_count": 0,
+        "image_paths": [],
+        "elapsed_seconds": 0.0,
+        "session_id": "",
+    }
+    try:
+        cfg = _build_cfg_for_imagegen(cfg)
+        parsed = parse_lyrics(lyrics)
+        lines = lyric_lines_only(parsed)
+        if not lines and not (lyrics or "").strip():
+            result["message"] = "Lyrics are required so the assessment can produce theme notes."
+            configure.APP_STATE["session_status"] = "idle"
+            return result
+
+        label = _slugify_folder_name(
+            (song_name or cfg.get("project_label") or "").strip(),
+            fallback="",
+        )
+        if not label and not resume_folder:
+            result["message"] = "Song name is required for theme images."
+            configure.APP_STATE["session_status"] = "idle"
+            return result
+        if not label and resume_folder:
+            label = Path(resume_folder).name
+        project_dir = ensure_project_dir(
+            label, sequential=False, resume_path=resume_folder or None,
+        )
+        result["project_folder"] = str(project_dir)
+        result["session_id"] = project_dir.name
+        configure.APP_STATE["active_session_id"] = project_dir.name
+
+        try:
+            (project_dir / "lyrics.txt").write_text(lyrics or "", encoding="utf-8")
+        except OSError:
+            pass
+
+        # Model preflight
+        _diff = (cfg.get("imagegen_model_path") or "").strip()
+        _enc = (cfg.get("encoder_model_path") or "").strip()
+        if not _diff or not Path(_diff).is_file() or not _enc or not Path(_enc).is_file():
+            result["message"] = "Encoder + Diffuser models must be configured before theme images."
+            configure.APP_STATE["session_status"] = "idle"
+            return result
+        vae = _resolve_flux2_vae(cfg, _diff)
+        if not vae:
+            result["message"] = _flux2_vae_help(_diff, (cfg.get("vae_model_path") or "").strip())
+            configure.APP_STATE["session_status"] = "idle"
+            return result
+        cfg["vae_model_path"] = vae
+
+        has_ref = bool(reference_image and Path(reference_image).is_file())
+        if has_ref:
+            try:
+                dest_ref = project_dir / f"reference{Path(reference_image).suffix.lower() or '.png'}"
+                if not dest_ref.exists():
+                    shutil.copy2(reference_image, dest_ref)
+            except OSError:
+                pass
+
+        _text_path, _text_role = _resolve_prompt_model(cfg)
+        log_phase_plan(cfg, _text_role)
+
+        # Phase 1: analysis (reuse disk when present)
+        analysis = _load_analysis_from_disk(project_dir)
+        if analysis and (analysis.get("overall") or analysis.get("sections")):
+            print("[theme] RESUME — loaded analysis.txt from disk", flush=True)
+            if progress_callback:
+                progress_callback("Resumed analysis from disk", 0.1, {"phase": "analysis"})
+        else:
+            if progress_callback:
+                progress_callback("Analysing song for theme notes…", 0.08, {"phase": "analysis"})
+            analysis = analyze_song_and_sections(
+                lyrics, parsed, cfg, has_character_ref=has_ref, progress_callback=progress_callback,
+            )
+            try:
+                (project_dir / "analysis.txt").write_text(
+                    "OVERALL\n"
+                    + (analysis.get("overall") or "")
+                    + "\n\nCHARACTER\n"
+                    + (analysis.get("character_guidance") or "")
+                    + "\n\nCHARACTER_MAP\n"
+                    + "\n".join(
+                        f"{k}: {v}"
+                        for k, v in (analysis.get("character_presence") or {}).items()
+                    )
+                    + "\n\nSECTIONS\n"
+                    + "\n".join(f"{k}: {v}" for k, v in (analysis.get("sections") or {}).items()),
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
+            maybe_bleep_section()
+
+        if is_cancel_requested():
+            configure.APP_STATE["session_status"] = "stopped"
+            result["message"] = "Cancelled during analysis."
+            return result
+
+        topics = _theme_topics_from_analysis(analysis)
+        if not topics:
+            result["message"] = "Assessment produced no theme paragraphs to illustrate."
+            configure.APP_STATE["session_status"] = "stopped"
+            return result
+
+        style = str(cfg.get("style") or configure.STYLE_LIGHT)
+        style_tpl = configure.prompt_template_for_style(style)
+        freq = configure.normalize_image_frequency(cfg.get("imagegen_frequency") or 1)
+        seq_hints = configure.image_frequency_hints(freq)
+        print(f"[theme] frequency = {freq} still(s) per assessment aspect", flush=True)
+
+        phase_barrier("text → theme images")
+        if progress_callback:
+            progress_callback(
+                f"Generating {len(topics)} theme still(s)…", 0.35, {"phase": "theme"},
+            )
+
+        images: List[Path] = []
+        total = len(topics)
+        work_total = max(1, total * freq)
+        work_done = 0
+        for i, topic in enumerate(topics):
+            if is_cancel_requested():
+                break
+            title = topic["title"]
+            notes = topic["notes"]
+            tid = topic["id"]
+            line_subject = f"{title}: {notes[:280]}"
+            base_prompt = (
+                f"{style_tpl.replace('{line}', line_subject)} "
+                f"Theme still for the music-video assessment note “{title}”. "
+                "Cinematic, coherent with the song’s mood. No readable text."
+            )
+            attach = bool(has_ref and tid == "character")
+            for var in range(1, freq + 1):
+                if is_cancel_requested():
+                    break
+                hint = seq_hints[var - 1] if var - 1 < len(seq_hints) else ""
+                seq_bit = f" [Sequence {var}/{freq}: {hint}.]" if hint else ""
+                prompt = base_prompt + seq_bit
+                if freq <= 1:
+                    fname = f"theme-{i + 1:02d}-{_ascii_line_slug(tid, max_len=40) or 'topic'}.png"
+                else:
+                    fname = (
+                        f"theme-{i + 1:02d}-{var}-"
+                        f"{_ascii_line_slug(tid, max_len=36) or 'topic'}.png"
+                    )
+                dest = project_dir / fname
+                if progress_callback:
+                    progress_callback(
+                        f"Theme {i + 1}/{total} [{var}/{freq}]: {title}",
+                        0.35 + 0.55 * (work_done / work_total),
+                        {"phase": "theme", "line": i + 1, "total": total},
+                    )
+                print(f"[theme] {i + 1}/{total} [{var}/{freq}] — {title}", flush=True)
+                try:
+                    out = _generate_named_still(
+                        dest, prompt, cfg,
+                        reference_image=reference_image if has_ref else "",
+                        attach_ref=attach,
+                    )
+                    images.append(out)
+                    work_done += 1
+                except Exception as e:
+                    print(f"[theme] failed {title} var {var}: {e}", flush=True)
+                    raise
+
+        elapsed = time.time() - t0
+        configure.APP_STATE["session_status"] = "stopped"
+        result.update(
+            success=bool(images),
+            image_count=len(images),
+            image_paths=[str(p) for p in images],
+            message=(
+                f"Theme images ready: {len(images)} still(s) in {project_dir.name}/ "
+                f"({int(elapsed)}s)"
+                if images else "No theme images were generated."
+            ),
+            elapsed_seconds=round(elapsed, 1),
+            session_id=project_dir.name,
+            project_folder=str(project_dir),
+        )
+        if progress_callback:
+            progress_callback(result["message"], 1.0, {"phase": "done"})
+        if images:
+            maybe_bleep_done()
+    except Exception as e:
+        traceback.print_exc()
+        result["message"] = f"Theme generation error: {e}"
+        result["elapsed_seconds"] = round(time.time() - t0, 1)
+        configure.APP_STATE["session_status"] = "stopped"
+    return result
+
 
 def run_materials_pipeline(
     lyrics: str,
@@ -2248,7 +2860,7 @@ def run_materials_pipeline(
          (or resume an existing folder when resume_folder is set)
       3. Song + section analysis notes (skipped if analysis.txt present on resume)
       4. Per-line visual prompts (skipped if prompts.txt complete on resume)
-      5. Generate hard-coded 768×512 images named "NNN - lyric line.png"
+      5. Generate stills (user-selected size, default 768×512) named "NNN - lyric line.png"
          (skips indices that already exist on disk)
     """
     clear_cancel_state()
@@ -2265,10 +2877,17 @@ def run_materials_pipeline(
     }
 
     try:
-        # Enforce hard-coded image size for this run
+        # Resolve image size from cfg / generation defaults
         cfg = dict(cfg)
-        cfg["imagegen_width"] = 768
-        cfg["imagegen_height"] = 512
+        try:
+            w = int(cfg.get("imagegen_width") or configure.DEFAULT_WIDTH)
+            h = int(cfg.get("imagegen_height") or configure.DEFAULT_HEIGHT)
+        except (TypeError, ValueError):
+            w, h = configure.DEFAULT_WIDTH, configure.DEFAULT_HEIGHT
+        if w < 64 or h < 64:
+            w, h = configure.DEFAULT_WIDTH, configure.DEFAULT_HEIGHT
+        cfg["imagegen_width"] = w
+        cfg["imagegen_height"] = h
 
         parsed = parse_lyrics(lyrics)
         lines = lyric_lines_only(parsed)

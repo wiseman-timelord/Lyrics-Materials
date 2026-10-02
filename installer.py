@@ -386,13 +386,16 @@ def write_default_generation() -> None:
     data = {
         "imagegen_width": 768,
         "imagegen_height": 512,
-        "imagegen_steps": 4,
+        "imagegen_size": "768 × 512",
+        "imagegen_frequency": 1,
+        "imagegen_steps": 8,
         "imagegen_cfg_scale": 1.0,
         "imagegen_seed": -1,
         "imagegen_sampling": "euler_a",
         "song_length_seconds": 180,
         "last_lyrics": "",
         "last_audio_path": "",
+        "last_image_gen_seconds": 0.0,
     }
     with open(_GENERATION_PATH, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)

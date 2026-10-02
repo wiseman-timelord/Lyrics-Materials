@@ -146,6 +146,7 @@ def _models_configured() -> bool:
 
 
 def _can_create(lyrics: str, song_name: str = "") -> bool:
+    """Full lyrics slideshow: needs song name + lyrics + models."""
     if not (lyrics or "").strip():
         return False
     if not (song_name or "").strip():
@@ -153,6 +154,22 @@ def _can_create(lyrics: str, song_name: str = "") -> bool:
     if not _models_configured():
         return False
     return True
+
+
+def _can_cover(song_name: str = "") -> bool:
+    """Cover image: needs song name + models only."""
+    if not (song_name or "").strip():
+        return False
+    return _models_configured()
+
+
+def _can_theme(lyrics: str = "", song_name: str = "") -> bool:
+    """Theme images: needs lyrics assessment material + song name + models."""
+    if not (lyrics or "").strip():
+        return False
+    if not (song_name or "").strip():
+        return False
+    return _models_configured()
 
 
 def _partial_project_state(lyrics: str = "") -> bool:
@@ -176,38 +193,80 @@ def _partial_project_state(lyrics: str = "") -> bool:
         return False
 
 
-def _run_btn_label(lyrics: str = "") -> str:
-    """'Complete Materials' when resuming a partly finished project, else 'Generate Materials'."""
-    return "Complete Materials" if _partial_project_state(lyrics) else "Generate Materials"
-
-
-def _run_btn_updates(lyrics: str = "", song_name: str = ""):
-    """
-    One primary action button:
-      ready, new / fully done project → Generate Materials (clickable)
-      ready, project has some stills  → Complete Materials (same action)
-      not ready                       → Configure the Pages First (disabled grey)
-    Using a single control avoids Gradio dual-visibility races where both
-    buttons could end up hidden.
-    """
-    ok = _can_create(lyrics, song_name)
-    if ok:
-        return gr.update(
-            value=_run_btn_label(lyrics),
-            interactive=True,
-            variant="primary",
-            visible=True,
-        )
-    return gr.update(
-        value="Configure the Pages First",
-        interactive=False,
-        variant="secondary",
-        visible=True,
+def _lyrics_btn_label(lyrics: str = "") -> str:
+    """'Complete Lyrics Slideshow' when resuming a partly finished project."""
+    return (
+        "Complete Lyrics Slideshow"
+        if _partial_project_state(lyrics)
+        else "Generate Lyrics Slideshow"
     )
 
 
+def _action_btn_updates(lyrics: str = "", song_name: str = "", *, running: bool = False):
+    """
+    Visibility / interactivity for the three generate buttons + stop.
+
+    Gate on Configuration (models):
+      - Models not set  → only "Configure the Pages First" (run_btn), Cover/Theme hidden.
+      - Models set      → Cover + Theme + Lyrics Slideshow all visible; each enabled when
+                          its own inputs are ready (song name / lyrics).
+
+    When running: hide generate buttons, show Emergency Stop.
+
+    Returns (cover_u, theme_u, lyrics_u, stop_u).
+    """
+    if running:
+        hide = gr.update(visible=False)
+        return hide, hide, hide, gr.update(visible=True)
+
+    models_ok = _models_configured()
+    if not models_ok:
+        # Single gate button until Encoder + Diffuser paths are saved in Configuration
+        return (
+            gr.update(visible=False),
+            gr.update(visible=False),
+            gr.update(
+                value="Configure the Pages First",
+                interactive=False,
+                variant="secondary",
+                visible=True,
+            ),
+            gr.update(visible=False),
+        )
+
+    cover_ok = _can_cover(song_name)
+    theme_ok = _can_theme(lyrics, song_name)
+    lyrics_ok = _can_create(lyrics, song_name)
+    cover_u = gr.update(
+        value="Generate Cover Image",
+        interactive=cover_ok,
+        variant="primary" if cover_ok else "secondary",
+        visible=True,
+    )
+    theme_u = gr.update(
+        value="Generate Theme Images",
+        interactive=theme_ok,
+        variant="primary" if theme_ok else "secondary",
+        visible=True,
+    )
+    lyrics_u = gr.update(
+        value=_lyrics_btn_label(lyrics),
+        interactive=lyrics_ok,
+        variant="primary" if lyrics_ok else "secondary",
+        visible=True,
+    )
+    stop_u = gr.update(visible=False)
+    return cover_u, theme_u, lyrics_u, stop_u
+
+
+def _run_btn_updates(lyrics: str = "", song_name: str = ""):
+    """Back-compat: return only the lyrics-slideshow button update."""
+    _, _, lyrics_u, _ = _action_btn_updates(lyrics, song_name, running=False)
+    return lyrics_u
+
+
 def _run_btn_for_project(proj: str) -> Any:
-    """Run-button update for the active project (reads lyrics.txt + folder name)."""
+    """Lyrics-slideshow button update for the active project."""
     lyrics = ""
     try:
         lp = Path(proj) / "lyrics.txt"
@@ -216,6 +275,18 @@ def _run_btn_for_project(proj: str) -> Any:
     except OSError:
         pass
     return _run_btn_updates(lyrics, Path(proj).name if proj else "")
+
+
+def _action_btns_for_project(proj: str):
+    """Tuple of (cover, theme, lyrics, stop) updates for a project folder."""
+    lyrics = ""
+    try:
+        lp = Path(proj) / "lyrics.txt"
+        if lp.is_file():
+            lyrics = lp.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        pass
+    return _action_btn_updates(lyrics, Path(proj).name if proj else "", running=False)
 
 
 def _lyrics_line_count(text: str) -> int:
@@ -236,6 +307,16 @@ def _format_progress_line(msg: str, frac: float, info: dict) -> str:
     if line_n is not None and total is not None:
         bits.append(f"{line_n}/{total}")
     bits.append(msg)
+    try:
+        last = float(
+            configure.APP_STATE.get("last_image_gen_seconds")
+            or configure.load_generation().get("last_image_gen_seconds")
+            or 0
+        )
+        if last > 0 and str(phase) in ("images", "regen"):
+            bits.append(f"(prev still {last:.0f}s)")
+    except (TypeError, ValueError):
+        pass
     return " ".join(bits).replace("\n", " ").strip()[:240]
 
 
@@ -257,6 +338,9 @@ def _session_choices_payload() -> List[Dict[str, Any]]:
 # Max still slots in the Generation thumb grid (4 columns).
 THUMB_SLOTS = 80
 THUMB_COLS = 8
+# Cover / Theme gallery slot budgets (separate sections)
+COVER_SLOTS = 8
+THEME_SLOTS = 32
 
 
 def _thumb_size_px() -> int:
@@ -359,6 +443,63 @@ def _list_project_images(project_dir: str = "") -> List[str]:
     return out
 
 
+
+def _project_folder(project_dir: str = "") -> str:
+    return (project_dir or configure.APP_STATE.get("current_project_folder") or "").strip()
+
+
+def _list_cover_images(project_dir: str = "") -> List[str]:
+    """Cover stills: cover*.png/jpg (not reference)."""
+    folder = _project_folder(project_dir)
+    if not folder or not Path(folder).is_dir():
+        return []
+    out: List[str] = []
+    for p in sorted(Path(folder).iterdir(), key=lambda x: x.name.lower()):
+        if not p.is_file():
+            continue
+        if p.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
+            continue
+        low = p.name.lower()
+        if low.startswith("cover"):
+            out.append(str(p.resolve()))
+    return out
+
+
+def _list_theme_images(project_dir: str = "") -> List[str]:
+    """Theme stills: theme-*.png/jpg."""
+    folder = _project_folder(project_dir)
+    if not folder or not Path(folder).is_dir():
+        return []
+    out: List[str] = []
+    for p in sorted(Path(folder).iterdir(), key=lambda x: x.name.lower()):
+        if not p.is_file():
+            continue
+        if p.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
+            continue
+        if p.name.lower().startswith("theme"):
+            out.append(str(p.resolve()))
+    return out
+
+
+def _lyrics_section_should_show(paths: Optional[List[str]] = None) -> bool:
+    """True when the Lyrics Thumbnails section should be visible."""
+    if configure.APP_STATE.get("generating") and configure.APP_STATE.get("thumb_queued_lines"):
+        return True
+    if configure.APP_STATE.get("thumb_generating_line") is not None:
+        return True
+    if int(configure.APP_STATE.get("thumb_expected_count") or 0) > 0:
+        # Only show if we actually have lyric stills or an active lyrics run queued
+        by_line = _line_path_map(paths)
+        if by_line:
+            return True
+        if configure.APP_STATE.get("thumb_queued_lines"):
+            return True
+        return False
+    by_line = _line_path_map(paths)
+    return bool(by_line)
+
+
+
 def _line_path_map(paths: Optional[List[str]] = None) -> Dict[int, str]:
     """Map 1-based line number → absolute still path."""
     if paths is None:
@@ -385,21 +526,62 @@ def _thumb_expected_count() -> int:
     return max(0, min(int(n), THUMB_SLOTS))
 
 
+def _simple_grid_updates(
+    paths: List[str],
+    n_slots: int,
+    rows_key: str,
+    cols_key: str,
+    imgs_key: str,
+) -> List[Any]:
+    """Visibility + image values for a simple (no regen) thumbnail grid."""
+    th = _thumb_size_px()
+    n_rows = len(_gen.get(rows_key) or []) or max(1, (n_slots + THUMB_COLS - 1) // THUMB_COLS)
+    n_show = min(len(paths), n_slots)
+    updates: List[Any] = []
+    for r in range(n_rows):
+        row_start = r * THUMB_COLS
+        updates.append(gr.update(visible=row_start < n_show))
+    for i in range(n_slots):
+        if i < n_show:
+            updates.append(gr.update(visible=True))
+            updates.append(gr.update(value=paths[i], height=th))
+        else:
+            updates.append(gr.update(visible=False))
+            updates.append(gr.update(value=None))
+    return updates
+
+
+def _cover_panel_updates(project_dir: str = "") -> List[Any]:
+    paths = _list_cover_images(project_dir)
+    show = bool(paths)
+    return [gr.update(visible=show)] + _simple_grid_updates(
+        paths, COVER_SLOTS, "cover_rows", "cover_cols", "cover_imgs",
+    )
+
+
+def _theme_panel_updates(project_dir: str = "") -> List[Any]:
+    paths = _list_theme_images(project_dir)
+    show = bool(paths)
+    return [gr.update(visible=show)] + _simple_grid_updates(
+        paths, THEME_SLOTS, "theme_rows", "theme_cols", "theme_imgs",
+    )
+
+
 def _thumb_panel_updates(paths: Optional[List[str]] = None) -> List[Any]:
     """
-    Gradio updates for the thumb grid (slot i = lyric line i+1):
+    Gradio updates for Lyrics Thumbnails grid (slot i = lyric line i+1):
       - has still on disk → that image
       - line is generating / regenerating now → thumbnails_generating.jpg
       - line is listed for generation, not started → thumbnails_qued_for_generation.jpg
       - expected but missing / removed, nothing pending → thumbnails_no_image.jpg
-    Rows are shown for the expected line count (not only existing files).
+    Section is hidden when there are no lyrics stills and nothing queued.
     """
     by_line = _line_path_map(paths)
     expected = _thumb_expected_count()
-    # Always show at least the highest existing line
     if by_line:
         expected = max(expected, min(max(by_line.keys()), THUMB_SLOTS))
     expected = min(expected, THUMB_SLOTS)
+    show_section = _lyrics_section_should_show(paths)
 
     busy_raw = configure.APP_STATE.get("regen_busy_lines") or []
     busy: set = set()
@@ -408,7 +590,6 @@ def _thumb_panel_updates(paths: Optional[List[str]] = None) -> List[Any]:
             busy.add(int(x))
         except (TypeError, ValueError):
             pass
-    # Current batch line (1-based) while full Generate is running
     cur = configure.APP_STATE.get("thumb_generating_line")
     if cur is not None:
         try:
@@ -423,16 +604,15 @@ def _thumb_panel_updates(paths: Optional[List[str]] = None) -> List[Any]:
     th = _thumb_size_px()
     n_rows = len(_gen.get("thumb_rows") or []) or max(1, (THUMB_SLOTS + THUMB_COLS - 1) // THUMB_COLS)
 
-    updates: List[Any] = []
+    updates: List[Any] = [gr.update(visible=show_section)]
     for r in range(n_rows):
-        row_start = r * THUMB_COLS  # 0-based slot
-        # Show row if any slot in it is within expected range
-        row_has = row_start < expected
+        row_start = r * THUMB_COLS
+        row_has = show_section and row_start < expected
         updates.append(gr.update(visible=row_has))
 
     for i in range(THUMB_SLOTS):
         line_no = i + 1
-        if line_no > expected:
+        if not show_section or line_no > expected:
             updates.append(gr.update(visible=False))
             updates.append(gr.update(value=None))
             updates.append(gr.update(visible=False, value="Regenerate"))
@@ -440,8 +620,6 @@ def _thumb_panel_updates(paths: Optional[List[str]] = None) -> List[Any]:
             continue
 
         real = by_line.get(line_no)
-        # Priority: real still > generating now > queued > no_image.
-        # A queued line is not "generating" until it is un-queued (starts).
         is_queued = (line_no in queued) and not real
         is_busy = (line_no in busy) and not real and not is_queued
         if real:
@@ -455,8 +633,6 @@ def _thumb_panel_updates(paths: Optional[List[str]] = None) -> List[Any]:
 
         updates.append(gr.update(visible=True))
         updates.append(gr.update(value=value, height=th))
-        # Regenerate/Remove only when a real still exists (not placeholders)
-        # Regenerate allowed for existing OR missing (refill) slots; Remove only when file exists
         can_regen = not is_busy and not is_queued
         can_remove = bool(real) and not is_busy
         updates.append(gr.update(
@@ -468,9 +644,46 @@ def _thumb_panel_updates(paths: Optional[List[str]] = None) -> List[Any]:
     return updates
 
 
+def _all_gallery_updates(project_dir: str = "", lyric_paths: Optional[List[str]] = None) -> List[Any]:
+    """Cover + Theme + Lyrics panel updates in a fixed order."""
+    folder = _project_folder(project_dir)
+    if lyric_paths is None:
+        lyric_paths = _list_project_images(folder)
+    return (
+        _cover_panel_updates(folder)
+        + _theme_panel_updates(folder)
+        + _thumb_panel_updates(lyric_paths)
+    )
+
+
 def _thumb_panel_outputs() -> List[Any]:
-    """Ordered list of Gradio components for thumb-panel updates."""
+    """Ordered list of Gradio components for Lyrics + Cover + Theme gallery updates.
+
+    Order matches _all_gallery_updates:
+      cover panel, cover rows/cols/imgs,
+      theme panel, theme rows/cols/imgs,
+      lyrics panel, lyrics rows + slots.
+    """
     outs: List[Any] = []
+    # Cover
+    if _gen.get("cover_panel") is not None:
+        outs.append(_gen["cover_panel"])
+    for row in (_gen.get("cover_rows") or []):
+        outs.append(row)
+    for i in range(COVER_SLOTS):
+        outs.append(_gen["cover_cols"][i])
+        outs.append(_gen["cover_imgs"][i])
+    # Theme
+    if _gen.get("theme_panel") is not None:
+        outs.append(_gen["theme_panel"])
+    for row in (_gen.get("theme_rows") or []):
+        outs.append(row)
+    for i in range(THEME_SLOTS):
+        outs.append(_gen["theme_cols"][i])
+        outs.append(_gen["theme_imgs"][i])
+    # Lyrics
+    if _gen.get("thumbs_panel") is not None:
+        outs.append(_gen["thumbs_panel"])
     for row in (_gen.get("thumb_rows") or []):
         outs.append(row)
     for i in range(THUMB_SLOTS):
@@ -479,6 +692,7 @@ def _thumb_panel_outputs() -> List[Any]:
         outs.append(_gen["thumb_btns"][i])
         outs.append(_gen["thumb_remove_btns"][i])
     return outs
+
 
 
 def _session_row_label(s: Dict[str, Any], expanded: bool = True, index: int = 0) -> str:
@@ -593,39 +807,62 @@ def _build_create_tab() -> None:
                     gr.Markdown("### Project settings")
                     with gr.Row():
                         _gen["style"] = gr.Dropdown(
-                            label="Visual style",
+                            label="Visual Style",
                             choices=configure.STYLE_CHOICES,
                             value=initial_style,
                             info="Influences prompt templates for still generation.",
                         )
                     gr.Markdown(
-                        "### Generation defaults (Flux.2-klein-4B)\n"
-                        "Image size is fixed at **768 × 512**."
+                        "### Generation Options\n"
+                        "Still size, how many images per lyric line / assessment aspect, "
+                        "and sampling. Default steps **8** (better eyes / detail on Flux.2)."
                     )
+                    _g0 = _gcfg()
+                    _init_size = configure.image_size_label_from_wh(
+                        int(_g0.get("imagegen_width") or configure.DEFAULT_WIDTH),
+                        int(_g0.get("imagegen_height") or configure.DEFAULT_HEIGHT),
+                    )
+                    if _g0.get("imagegen_size"):
+                        _init_size = configure.normalize_image_size(str(_g0.get("imagegen_size")))
+                    _init_freq = configure.normalize_image_frequency(
+                        _g0.get("imagegen_frequency") or configure.DEFAULT_IMAGE_FREQUENCY
+                    )
+                    with gr.Row():
+                        _gen["image_size"] = gr.Dropdown(
+                            label="Image size",
+                            choices=configure.IMAGE_SIZE_CHOICES,
+                            value=_init_size,
+                            info="Output still dimensions (width × height).",
+                        )
+                        _gen["image_frequency"] = gr.Dropdown(
+                            label="Image Frequency",
+                            choices=configure.IMAGE_FREQUENCY_CHOICES,
+                            value=_init_freq,
+                            info="How many stills per lyric line or assessment aspect (sequence variants).",
+                        )
                     with gr.Row():
                         _gen["steps"] = gr.Slider(
                             label="Steps",
                             minimum=1,
                             maximum=20,
                             step=1,
-                            value=configure.DEFAULT_STEPS,
+                            value=int(_g0.get("imagegen_steps") or configure.DEFAULT_STEPS),
                         )
                         _gen["cfg"] = gr.Slider(
                             label="CFG",
                             minimum=0.5,
                             maximum=4.0,
                             step=0.1,
-                            value=configure.DEFAULT_CFG,
+                            value=float(_g0.get("imagegen_cfg_scale") or configure.DEFAULT_CFG),
                         )
 
                     gr.Markdown(
-                        "### Optional reference image\n"
-                        "If provided, the central character(s) in the stills are guided by this photo. "
-                        "Without it, characters are invented purely from the lyrics."
+                        "### Reference Character (optional)\n"
+                        "The central character(s) in the images, without it only the lyrics/title are used."
                     )
                     with gr.Row():
                         _gen["ref_image"] = gr.Textbox(
-                            label="Reference character image (optional)",
+                            label="Reference Character (optional)",
                             value=initial_ref,
                             interactive=True,
                             scale=4,
@@ -639,7 +876,7 @@ def _build_create_tab() -> None:
                         "Spaces become underscores. Section headers (`[Intro]`, `[Chorus_1]`, …) "
                         "are context only — they do **not** get images. Blank lines are skipped.\n\n"
                         "Select a **session** on the left to resume, or leave blank and click "
-                        "**Generate Materials** to start a new one."
+                        "**Generate Lyrics Slideshow** (or Cover / Theme) to start a new one."
                     )
                     _gen["song_name"] = gr.Textbox(
                         label="Song name (required — becomes output folder)",
@@ -665,10 +902,29 @@ def _build_create_tab() -> None:
                     )
 
             with gr.Row(elem_id="gen-action-row"):
+                _models_ok0 = _models_configured()
+                _gen["cover_btn"] = gr.Button(
+                    "Generate Cover Image",
+                    variant="primary" if _can_cover(initial_song) else "secondary",
+                    interactive=bool(_can_cover(initial_song)),
+                    visible=bool(_models_ok0),
+                    elem_id="cover-btn",
+                )
+                _gen["theme_btn"] = gr.Button(
+                    "Generate Theme Images",
+                    variant="primary" if _can_theme(initial_lyrics, initial_song) else "secondary",
+                    interactive=bool(_can_theme(initial_lyrics, initial_song)),
+                    visible=bool(_models_ok0),
+                    elem_id="theme-btn",
+                )
                 _gen["run_btn"] = gr.Button(
-                    "Generate Materials" if can else "Configure the Pages First",
-                    variant="primary" if can else "secondary",
-                    interactive=bool(can),
+                    (
+                        _lyrics_btn_label(initial_lyrics)
+                        if _models_ok0
+                        else "Configure the Pages First"
+                    ),
+                    variant="primary" if (can and _models_ok0) else "secondary",
+                    interactive=bool(can and _models_ok0),
                     visible=True,
                     elem_id="run-btn",
                 )
@@ -679,15 +935,61 @@ def _build_create_tab() -> None:
                     elem_id="stop-btn",
                 )
 
-        # Materials Thumbnails: FULL WIDTH under the sidebar+settings row
-        # (left session column only affects Project Settings / Song Lyrics above)
+        # Dynamic galleries: Cover / Theme / Lyrics — each hidden until images exist
     th0 = _thumb_size_px()
+
+    def _build_simple_gallery(prefix: str, n_slots: int, title: str, elem_id: str):
+        """Build a simple image-only gallery section (cover / theme)."""
+        with gr.Column(
+            visible=False,
+            elem_id=elem_id,
+            elem_classes=["materials-thumbs"],
+        ) as panel:
+            header = gr.Button(
+                title,
+                variant="secondary",
+                elem_id=f"{elem_id}-header",
+                elem_classes=["materials-thumbs-heading"],
+                size="sm",
+            )
+            cols, imgs, rows = [], [], []
+            for row_i in range(0, n_slots, THUMB_COLS):
+                with gr.Row(visible=False, elem_classes=["thumb-row"]) as trow:
+                    for j in range(THUMB_COLS):
+                        with gr.Column(
+                            visible=False,
+                            scale=1,
+                            min_width=max(64, th0 // 2),
+                            elem_classes=["thumb-slot"],
+                        ) as col:
+                            img = gr.Image(
+                                value=None,
+                                label=None,
+                                show_label=False,
+                                height=th0,
+                                interactive=False,
+                                elem_classes=["thumb-img"],
+                            )
+                            cols.append(col)
+                            imgs.append(img)
+                rows.append(trow)
+        _gen[f"{prefix}_panel"] = panel
+        _gen[f"{prefix}_header"] = header
+        _gen[f"{prefix}_cols"] = cols
+        _gen[f"{prefix}_imgs"] = imgs
+        _gen[f"{prefix}_rows"] = rows
+        return header
+
+    _build_simple_gallery("cover", COVER_SLOTS, "Cover Thumbnails", "cover-gallery")
+    _build_simple_gallery("theme", THEME_SLOTS, "Theme Thumbnails", "theme-gallery")
+
     with gr.Column(
+        visible=False,
         elem_id="materials-gallery",
         elem_classes=["materials-thumbs"],
     ) as _thumbs_panel:
         _gen["open_materials_folder"] = gr.Button(
-            "Materials Thumbnails",
+            "Lyrics Thumbnails",
             variant="secondary",
             elem_id="materials-thumbs-header",
             elem_classes=["materials-thumbs-heading"],
@@ -702,7 +1004,6 @@ def _build_create_tab() -> None:
         for row_i in range(0, THUMB_SLOTS, THUMB_COLS):
             with gr.Row(visible=False, elem_classes=["thumb-row"]) as trow:
                 for j in range(THUMB_COLS):
-                    idx = row_i + j
                     with gr.Column(
                         visible=False,
                         scale=1,
@@ -750,19 +1051,20 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
     _gen["browse_ref"].click(_browse_ref, outputs=_gen["ref_image"])
 
     def _ready_change(lyrics, song_name):
-        return _run_btn_updates(lyrics, song_name)
+        cover_u, theme_u, lyrics_u, stop_u = _action_btn_updates(lyrics, song_name, running=False)
+        return cover_u, theme_u, lyrics_u
 
     for _evt in ("change", "input", "blur"):
         try:
             getattr(_gen["lyrics"], _evt)(
                 _ready_change,
                 inputs=[_gen["lyrics"], _gen["song_name"]],
-                outputs=_gen["run_btn"],
+                outputs=[_gen["cover_btn"], _gen["theme_btn"], _gen["run_btn"]],
             )
             getattr(_gen["song_name"], _evt)(
                 _ready_change,
                 inputs=[_gen["lyrics"], _gen["song_name"]],
-                outputs=_gen["run_btn"],
+                outputs=[_gen["cover_btn"], _gen["theme_btn"], _gen["run_btn"]],
             )
         except Exception:
             pass
@@ -795,6 +1097,10 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
         return _open_project_folder()
 
     _gen["open_materials_folder"].click(_open_materials_folder, outputs=status_box)
+    if _gen.get("cover_header") is not None:
+        _gen["cover_header"].click(_open_materials_folder, outputs=status_box)
+    if _gen.get("theme_header") is not None:
+        _gen["theme_header"].click(_open_materials_folder, outputs=status_box)
 
 
     # ── Session sidebar helpers ─────────────────────────────────────────
@@ -940,10 +1246,19 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
             f"Session loaded: {sid}  "
             f"({len(imgs)}/{s.get('line_count') or '?'} images, phase={s.get('phase')})"
         )
+        # Prefer global generation size; session meta does not store size yet
+        g = configure.load_generation()
+        size_label = configure.normalize_image_size(
+            str(g.get("imagegen_size") or configure.image_size_label_from_wh(
+                int(g.get("imagegen_width") or configure.DEFAULT_WIDTH),
+                int(g.get("imagegen_height") or configure.DEFAULT_HEIGHT),
+            ))
+        )
         main = (
             gr.update(value=song),
             gr.update(value=lyrics, lines=12, max_lines=12),
             gr.update(value=style if style in configure.STYLE_CHOICES else configure.STYLE_LIGHT),
+            gr.update(value=size_label),
             gr.update(value=steps),
             gr.update(value=cfg_scale),
             gr.update(value=ref),
@@ -951,9 +1266,9 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
             status,
             sid,
         )
-        run_btn_u = _run_btn_updates(lyrics, song)
+        cover_u, theme_u, lyrics_u, _stop_u = _action_btn_updates(lyrics, song, running=False)
         refresh = _refresh_session_slots(sid)
-        return main + (run_btn_u,) + tuple(_thumb_panel_updates(list(imgs))) + tuple(refresh)
+        return main + (cover_u, theme_u, lyrics_u) + tuple(_all_gallery_updates(lyric_paths=list(imgs))) + tuple(refresh)
 
     # Wire each select button with its index
     for i, btn in enumerate(_gen["session_select_btns"]):
@@ -964,12 +1279,15 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
                 _gen["song_name"],
                 _gen["lyrics"],
                 _gen["style"],
+                _gen["image_size"],
                 _gen["steps"],
                 _gen["cfg"],
                 _gen["ref_image"],
                 _gen["negative_prompt"],
                 status_box,
                 _gen["active_session_id"],
+                _gen["cover_btn"],
+                _gen["theme_btn"],
                 _gen["run_btn"],
             ] + _thumb_panel_outputs() + _session_refresh_outputs,
         )
@@ -1005,6 +1323,7 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
             gr.update(value=""),
             gr.update(value="", lines=12, max_lines=12),
             gr.update(value=configure.STYLE_LIGHT),
+            gr.update(value=configure.DEFAULT_IMAGE_SIZE),
             gr.update(value=configure.DEFAULT_STEPS),
             gr.update(value=configure.DEFAULT_CFG),
             gr.update(value=""),
@@ -1012,7 +1331,8 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
             "New session — enter song name & lyrics, then Generate.",
             "",
         )
-        return main + (_run_btn_updates("", ""),) + tuple(_thumb_panel_updates([])) + tuple(
+        cover_u, theme_u, lyrics_u, _stop_u = _action_btn_updates("", "", running=False)
+        return main + (cover_u, theme_u, lyrics_u) + tuple(_all_gallery_updates(lyric_paths=[])) + tuple(
             _refresh_session_slots("")
         )
 
@@ -1022,12 +1342,15 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
             _gen["song_name"],
             _gen["lyrics"],
             _gen["style"],
+            _gen["image_size"],
             _gen["steps"],
             _gen["cfg"],
             _gen["ref_image"],
             _gen["negative_prompt"],
             status_box,
             _gen["active_session_id"],
+            _gen["cover_btn"],
+            _gen["theme_btn"],
             _gen["run_btn"],
         ] + _thumb_panel_outputs() + _session_refresh_outputs,
     )
@@ -1056,7 +1379,7 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
                 gr.update(visible=True),
                 "Tick the confirm box first.",
                 gr.update(),
-            ) + tuple(_thumb_panel_updates()) + tuple(
+            ) + tuple(_all_gallery_updates()) + tuple(
                 _refresh_session_slots(configure.APP_STATE.get("active_session_id") or "")
             )
         n = configure.delete_all_sessions()
@@ -1067,7 +1390,7 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
             gr.update(visible=False),
             f"Deleted {n} session(s).",
             "",
-        ) + tuple(_thumb_panel_updates([])) + tuple(_refresh_session_slots(""))
+        ) + tuple(_all_gallery_updates(lyric_paths=[])) + tuple(_refresh_session_slots(""))
 
     _gen["delete_all_sessions"].click(
         _ask_delete_all,
@@ -1103,22 +1426,19 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
     # via a dummy refresh bound after wiring (see build_app).
 
     def _run(
-        lyrics, song_name, style, steps, cfg_scale, ref_image, negative_prompt, active_session_id,
+        lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale, ref_image, negative_prompt, active_session_id,
         progress=gr.Progress(track_tqdm=False),
     ):
-        # During a run: keep the action button visible but disabled; show Stop
-        # One or the other: never show Generate and Emergency Stop together
-        hide_run = gr.update(visible=False)
-        show_stop = gr.update(visible=True)
-        show_run = _run_btn_updates(lyrics, song_name)  # restore ready/not-ready label
-        hide_stop = gr.update(visible=False)
+        # Idle restore vs running (hide generate trio, show Emergency Stop)
+        idle_btns = _action_btn_updates(lyrics, song_name, running=False)
+        run_btns = _action_btn_updates(lyrics, song_name, running=True)
 
         if not _can_create(lyrics, song_name):
             yield (
                 "Song name, lyrics, and models are required — fill the song name "
                 "and configure Encoder + Diffuser paths.",
-                _run_btn_updates(lyrics, song_name), hide_stop, active_session_id or "",
-            ) + tuple(_thumb_panel_updates()) + tuple(
+                *idle_btns, active_session_id or "",
+            ) + tuple(_all_gallery_updates()) + tuple(
                 _refresh_session_slots(active_session_id or "")
             )
             return
@@ -1127,8 +1447,13 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
         cfg = dict(c)
         cfg["style"] = style
         cfg["project_label"] = (song_name or "").strip()
-        cfg["imagegen_width"] = configure.DEFAULT_WIDTH
-        cfg["imagegen_height"] = configure.DEFAULT_HEIGHT
+        size_label = configure.normalize_image_size(str(image_size or configure.DEFAULT_IMAGE_SIZE))
+        w, h = configure.image_size_pixels(size_label)
+        freq = configure.normalize_image_frequency(image_frequency)
+        cfg["imagegen_width"] = w
+        cfg["imagegen_height"] = h
+        cfg["imagegen_size"] = size_label
+        cfg["imagegen_frequency"] = freq
         cfg["imagegen_steps"] = int(steps or configure.DEFAULT_STEPS)
         cfg["imagegen_cfg_scale"] = float(cfg_scale or configure.DEFAULT_CFG)
         cfg["prompt_template"] = configure.prompt_template_for_style(style)
@@ -1140,8 +1465,10 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
             "last_lyrics": lyrics,
             "project_label": (song_name or "").strip(),
             "reference_image_path": ref_image or "",
-            "imagegen_width": configure.DEFAULT_WIDTH,
-            "imagegen_height": configure.DEFAULT_HEIGHT,
+            "imagegen_width": w,
+            "imagegen_height": h,
+            "imagegen_size": size_label,
+            "imagegen_frequency": freq,
             "imagegen_steps": cfg["imagegen_steps"],
             "imagegen_cfg_scale": cfg["imagegen_cfg_scale"],
         })
@@ -1176,9 +1503,9 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
             configure.APP_STATE["thumb_queued_lines"] = []
 
         yield (
-            "[  0%] start  Starting materials pipeline…",
-            hide_run, show_stop, active_session_id or "",
-        ) + tuple(_thumb_panel_updates()) + tuple(
+            "[  0%] start  Starting lyrics slideshow pipeline…",
+            *run_btns, active_session_id or "",
+        ) + tuple(_all_gallery_updates()) + tuple(
             _refresh_session_slots(active_session_id or "")
         )
 
@@ -1265,8 +1592,8 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
                 sid = configure.APP_STATE.get("active_session_id") or sid
                 yield (
                     status_line,
-                    hide_run, show_stop, sid,
-                ) + tuple(_thumb_panel_updates(paths)) + tuple(_refresh_session_slots(sid))
+                    *run_btns, sid,
+                ) + tuple(_all_gallery_updates(lyric_paths=paths)) + tuple(_refresh_session_slots(sid))
                 last_yield = time.time()
             else:
                 time.sleep(0.15)
@@ -1304,8 +1631,8 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
             if q:
                 msg = f"{msg}  Processing {len(q)} queued regenerate(s)…"
                 yield (
-                    msg, show_run, hide_stop, sid,
-                ) + tuple(_thumb_panel_updates(paths)) + tuple(_refresh_session_slots(sid))
+                    msg, *idle_btns, sid,
+                ) + tuple(_all_gallery_updates(lyric_paths=paths)) + tuple(_refresh_session_slots(sid))
             for line_idx in q:
                 if inference.is_cancel_requested():
                     break
@@ -1316,6 +1643,13 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
                     cfg_now = configure.load_configuration()
                     cfg_now["imagegen_steps"] = steps
                     cfg_now["imagegen_cfg_scale"] = cfg_scale
+                    _sz = configure.normalize_image_size(str(image_size or configure.DEFAULT_IMAGE_SIZE))
+                    _w, _h = configure.image_size_pixels(_sz)
+                    _fq = configure.normalize_image_frequency(image_frequency)
+                    cfg_now["imagegen_width"] = _w
+                    cfg_now["imagegen_height"] = _h
+                    cfg_now["imagegen_size"] = _sz
+                    cfg_now["imagegen_frequency"] = _fq
                     cfg_now["negative_prompt"] = (
                         (negative_prompt if negative_prompt is not None else configure.DEFAULT_NEGATIVE_PROMPT) or ""
                     )
@@ -1325,13 +1659,13 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
                     paths = _list_project_images(proj)
                     yield (
                         f"Regenerated still {int(line_idx) + 1}.",
-                        show_run, hide_stop, sid,
-                    ) + tuple(_thumb_panel_updates(paths)) + tuple(_refresh_session_slots(sid))
+                        *idle_btns, sid,
+                    ) + tuple(_all_gallery_updates(lyric_paths=paths)) + tuple(_refresh_session_slots(sid))
                 except Exception as e:
                     yield (
                         f"Queued regenerate line {int(line_idx) + 1} failed: {e}",
-                        show_run, hide_stop, sid,
-                    ) + tuple(_thumb_panel_updates(paths)) + tuple(_refresh_session_slots(sid))
+                        *idle_btns, sid,
+                    ) + tuple(_all_gallery_updates(lyric_paths=paths)) + tuple(_refresh_session_slots(sid))
                 finally:
                     configure.APP_STATE["generating"] = False
 
@@ -1339,31 +1673,253 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
         configure.APP_STATE["regen_busy_lines"] = []
         configure.APP_STATE["thumb_queued_lines"] = []
         paths = _list_project_images(configure.APP_STATE.get("current_project_folder") or "")
-        show_run = _run_btn_updates(lyrics, song_name)  # label may now be Complete/Generate
+        idle_btns = _action_btn_updates(lyrics, song_name, running=False)
         yield (
             msg,
-            show_run, hide_stop, sid,
-        ) + tuple(_thumb_panel_updates(paths)) + tuple(_refresh_session_slots(sid))
+            *idle_btns, sid,
+        ) + tuple(_all_gallery_updates(lyric_paths=paths)) + tuple(_refresh_session_slots(sid))
 
     _run_outputs = [
         status_box,
+        _gen["cover_btn"],
+        _gen["theme_btn"],
         _gen["run_btn"],
         _gen["stop_btn"],
         _gen["active_session_id"],
     ] + _thumb_panel_outputs() + _session_refresh_outputs
 
-    _gen["run_btn"].click(
-        _run,
-        inputs=[
+    def _shared_gen_inputs():
+        return [
             _gen["lyrics"],
             _gen["song_name"],
             _gen["style"],
+            _gen["image_size"],
+            _gen["image_frequency"],
             _gen["steps"],
             _gen["cfg"],
             _gen["ref_image"],
             _gen["negative_prompt"],
             _gen["active_session_id"],
-        ],
+        ]
+
+    _gen["run_btn"].click(
+        _run,
+        inputs=_shared_gen_inputs(),
+        outputs=_run_outputs,
+    )
+
+    def _run_cover(
+        lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale, ref_image, negative_prompt, active_session_id,
+        progress=gr.Progress(track_tqdm=False),
+    ):
+        idle_btns = _action_btn_updates(lyrics, song_name, running=False)
+        run_btns = _action_btn_updates(lyrics, song_name, running=True)
+        if not _can_cover(song_name):
+            yield (
+                "Song name and models are required for a cover image.",
+                *idle_btns, active_session_id or "",
+            ) + tuple(_all_gallery_updates()) + tuple(
+                _refresh_session_slots(active_session_id or "")
+            )
+            return
+        c = _cfg()
+        cfg = dict(c)
+        cfg["style"] = style
+        cfg["project_label"] = (song_name or "").strip()
+        size_label = configure.normalize_image_size(str(image_size or configure.DEFAULT_IMAGE_SIZE))
+        w, h = configure.image_size_pixels(size_label)
+        freq = configure.normalize_image_frequency(image_frequency)
+        cfg["imagegen_width"] = w
+        cfg["imagegen_height"] = h
+        cfg["imagegen_size"] = size_label
+        cfg["imagegen_frequency"] = freq
+        cfg["imagegen_steps"] = int(steps or configure.DEFAULT_STEPS)
+        cfg["imagegen_cfg_scale"] = float(cfg_scale or configure.DEFAULT_CFG)
+        cfg["prompt_template"] = configure.prompt_template_for_style(style)
+        cfg["negative_prompt"] = (
+            (negative_prompt if negative_prompt is not None else configure.DEFAULT_NEGATIVE_PROMPT) or ""
+        )
+        configure.update_generation({
+            "project_label": (song_name or "").strip(),
+            "reference_image_path": ref_image or "",
+            "imagegen_width": w,
+            "imagegen_height": h,
+            "imagegen_size": size_label,
+            "imagegen_frequency": freq,
+            "imagegen_steps": cfg["imagegen_steps"],
+            "imagegen_cfg_scale": cfg["imagegen_cfg_scale"],
+        })
+        configure.update_preferences({"style": style})
+        resume_folder = ""
+        if active_session_id:
+            s = configure.get_session_by_id(active_session_id)
+            if s and Path(s["path"]).is_dir():
+                resume_folder = s["path"]
+        yield (
+            "[  0%] cover  Generating cover image…",
+            *run_btns, active_session_id or "",
+        ) + tuple(_all_gallery_updates()) + tuple(
+            _refresh_session_slots(active_session_id or "")
+        )
+        prog_q: queue.Queue = queue.Queue()
+        result_holder: Dict[str, Any] = {}
+
+        def _cb(msg, frac, info=None):
+            prog_q.put((_format_progress_line(msg, frac, info or {}), frac, info or {}))
+
+        def _worker():
+            try:
+                result_holder["r"] = inference.generate_cover_image(
+                    song_name or "",
+                    cfg,
+                    reference_image=ref_image or "",
+                    progress_callback=_cb,
+                    resume_folder=resume_folder,
+                )
+            except Exception as e:
+                result_holder["r"] = {"success": False, "message": str(e)}
+            finally:
+                prog_q.put(None)
+
+        threading.Thread(target=_worker, daemon=True).start()
+        last_yield = 0.0
+        while True:
+            try:
+                item = prog_q.get(timeout=0.2)
+            except queue.Empty:
+                item = "__tick__"
+            if item is None:
+                break
+            if item != "__tick__":
+                status_line, _frac, _info = item
+                sid = configure.APP_STATE.get("active_session_id") or active_session_id or ""
+                yield (
+                    status_line, *run_btns, sid,
+                ) + tuple(_all_gallery_updates()) + tuple(_refresh_session_slots(sid))
+                last_yield = time.time()
+            else:
+                time.sleep(0.05)
+        r = result_holder.get("r") or {}
+        msg = r.get("message") or "Cover done."
+        sid = r.get("session_id") or configure.APP_STATE.get("active_session_id") or active_session_id or ""
+        if r.get("success") and r.get("project_folder"):
+            configure.APP_STATE["current_project_folder"] = r["project_folder"]
+            configure.update_generation({"last_project_folder": r["project_folder"]})
+        idle_btns = _action_btn_updates(lyrics, song_name, running=False)
+        yield (
+            msg, *idle_btns, sid,
+        ) + tuple(_all_gallery_updates()) + tuple(_refresh_session_slots(sid))
+
+    def _run_theme(
+        lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale, ref_image, negative_prompt, active_session_id,
+        progress=gr.Progress(track_tqdm=False),
+    ):
+        idle_btns = _action_btn_updates(lyrics, song_name, running=False)
+        run_btns = _action_btn_updates(lyrics, song_name, running=True)
+        if not _can_theme(lyrics, song_name):
+            yield (
+                "Song name, lyrics, and models are required for theme images.",
+                *idle_btns, active_session_id or "",
+            ) + tuple(_all_gallery_updates()) + tuple(
+                _refresh_session_slots(active_session_id or "")
+            )
+            return
+        c = _cfg()
+        cfg = dict(c)
+        cfg["style"] = style
+        cfg["project_label"] = (song_name or "").strip()
+        size_label = configure.normalize_image_size(str(image_size or configure.DEFAULT_IMAGE_SIZE))
+        w, h = configure.image_size_pixels(size_label)
+        freq = configure.normalize_image_frequency(image_frequency)
+        cfg["imagegen_width"] = w
+        cfg["imagegen_height"] = h
+        cfg["imagegen_size"] = size_label
+        cfg["imagegen_frequency"] = freq
+        cfg["imagegen_steps"] = int(steps or configure.DEFAULT_STEPS)
+        cfg["imagegen_cfg_scale"] = float(cfg_scale or configure.DEFAULT_CFG)
+        cfg["prompt_template"] = configure.prompt_template_for_style(style)
+        cfg["negative_prompt"] = (
+            (negative_prompt if negative_prompt is not None else configure.DEFAULT_NEGATIVE_PROMPT) or ""
+        )
+        configure.update_generation({
+            "last_lyrics": lyrics,
+            "project_label": (song_name or "").strip(),
+            "reference_image_path": ref_image or "",
+            "imagegen_width": w,
+            "imagegen_height": h,
+            "imagegen_size": size_label,
+            "imagegen_frequency": freq,
+            "imagegen_steps": cfg["imagegen_steps"],
+            "imagegen_cfg_scale": cfg["imagegen_cfg_scale"],
+        })
+        configure.update_preferences({"style": style})
+        resume_folder = ""
+        if active_session_id:
+            s = configure.get_session_by_id(active_session_id)
+            if s and Path(s["path"]).is_dir():
+                resume_folder = s["path"]
+        yield (
+            "[  0%] theme  Analysing song & generating theme images…",
+            *run_btns, active_session_id or "",
+        ) + tuple(_all_gallery_updates()) + tuple(
+            _refresh_session_slots(active_session_id or "")
+        )
+        prog_q: queue.Queue = queue.Queue()
+        result_holder: Dict[str, Any] = {}
+
+        def _cb(msg, frac, info=None):
+            prog_q.put((_format_progress_line(msg, frac, info or {}), frac, info or {}))
+
+        def _worker():
+            try:
+                result_holder["r"] = inference.generate_theme_images(
+                    lyrics or "",
+                    cfg,
+                    song_name=song_name or "",
+                    reference_image=ref_image or "",
+                    progress_callback=_cb,
+                    resume_folder=resume_folder,
+                )
+            except Exception as e:
+                result_holder["r"] = {"success": False, "message": str(e)}
+            finally:
+                prog_q.put(None)
+
+        threading.Thread(target=_worker, daemon=True).start()
+        while True:
+            try:
+                item = prog_q.get(timeout=0.2)
+            except queue.Empty:
+                item = "__tick__"
+            if item is None:
+                break
+            if item != "__tick__":
+                status_line, _frac, _info = item
+                sid = configure.APP_STATE.get("active_session_id") or active_session_id or ""
+                yield (
+                    status_line, *run_btns, sid,
+                ) + tuple(_all_gallery_updates()) + tuple(_refresh_session_slots(sid))
+            else:
+                time.sleep(0.05)
+        r = result_holder.get("r") or {}
+        msg = r.get("message") or "Theme images done."
+        sid = r.get("session_id") or configure.APP_STATE.get("active_session_id") or active_session_id or ""
+        if r.get("success") and r.get("project_folder"):
+            configure.APP_STATE["current_project_folder"] = r["project_folder"]
+            configure.update_generation({"last_project_folder": r["project_folder"]})
+        idle_btns = _action_btn_updates(lyrics, song_name, running=False)
+        yield (
+            msg, *idle_btns, sid,
+        ) + tuple(_all_gallery_updates()) + tuple(_refresh_session_slots(sid))
+
+    _gen["cover_btn"].click(
+        _run_cover,
+        inputs=_shared_gen_inputs(),
+        outputs=_run_outputs,
+    )
+    _gen["theme_btn"].click(
+        _run_theme,
+        inputs=_shared_gen_inputs(),
         outputs=_run_outputs,
     )
 
@@ -1396,7 +1952,7 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
             return (
                 "No active project folder.",
                 active_session_id or "",
-            ) + tuple(_thumb_panel_updates(paths)) + tuple(
+            ) + tuple(_all_gallery_updates(lyric_paths=paths)) + tuple(
                 _refresh_session_slots(active_session_id or "")
             )
         paths = _list_project_images(proj)
@@ -1405,7 +1961,7 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
             return (
                 "Nothing to remove in that slot.",
                 active_session_id or "",
-            ) + tuple(_thumb_panel_updates(paths)) + tuple(
+            ) + tuple(_all_gallery_updates(lyric_paths=paths)) + tuple(
                 _refresh_session_slots(active_session_id or "")
             )
         line_no = resolved + 1
@@ -1452,21 +2008,28 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
         return (
             msg,
             active_session_id or "",
-        ) + tuple(_thumb_panel_updates(paths)) + tuple(
+        ) + tuple(_all_gallery_updates(lyric_paths=paths)) + tuple(
             _refresh_session_slots(active_session_id or "")
         )
 
-    def _do_regen(line_idx: int, steps, cfg_scale, ref_image, negative_prompt, active_session_id):
+    def _do_regen(line_idx: int, image_size, image_frequency, steps, cfg_scale, ref_image, negative_prompt, active_session_id):
         """
-        Regenerate ONE still. Clears that slot immediately, runs sd-cli for that
-        line only, supports queueing other slots while one is running.
-        show_progress is disabled on the button so Gradio does not spin every thumb.
+        Regenerate ONE still. Puts a status-bar message immediately, then clears
+        that slot and runs sd-cli for that line only (queue-aware).
         """
+        # Immediate status so the user sees feedback on click before any I/O
+        yield (
+            f"Regenerate requested for still slot {int(line_idx) + 1}…",
+            gr.update(), gr.update(), gr.update(), gr.update(), active_session_id or "",
+        ) + tuple(_all_gallery_updates()) + tuple(
+            _refresh_session_slots(active_session_id or "")
+        )
+
         proj = (configure.APP_STATE.get("current_project_folder") or "").strip()
         empty = (
             "No active project folder — load a session or Generate first.",
-            gr.update(), gr.update(), active_session_id or "",
-        ) + tuple(_thumb_panel_updates()) + tuple(
+            gr.update(), gr.update(), gr.update(), gr.update(), active_session_id or "",
+        ) + tuple(_all_gallery_updates()) + tuple(
             _refresh_session_slots(active_session_id or "")
         )
         if not proj or not Path(proj).is_dir():
@@ -1483,8 +2046,8 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
             else:
                 yield (
                     "That thumbnail slot is outside the project line count.",
-                    gr.update(), gr.update(), active_session_id or "",
-                ) + tuple(_thumb_panel_updates(paths)) + tuple(
+                    gr.update(), gr.update(), gr.update(), gr.update(), active_session_id or "",
+                ) + tuple(_all_gallery_updates(lyric_paths=paths)) + tuple(
                     _refresh_session_slots(active_session_id or "")
                 )
                 return
@@ -1501,8 +2064,8 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
             if n_lines > 0 and not (0 <= resolved_idx < n_lines):
                 yield (
                     f"Still index {resolved_idx + 1} is out of range (1..{n_lines}).",
-                    gr.update(), gr.update(), active_session_id or "",
-                ) + tuple(_thumb_panel_updates(paths)) + tuple(
+                    gr.update(), gr.update(), gr.update(), gr.update(), active_session_id or "",
+                ) + tuple(_all_gallery_updates(lyric_paths=paths)) + tuple(
                     _refresh_session_slots(active_session_id or "")
                 )
                 return
@@ -1543,8 +2106,8 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
             yield (
                 f"Queued regenerate for still {line_no} "
                 f"(runs after current work finishes).",
-                gr.update(), gr.update(), active_session_id or "",
-            ) + tuple(_thumb_panel_updates(paths)) + tuple(
+                gr.update(), gr.update(), gr.update(), gr.update(), active_session_id or "",
+            ) + tuple(_all_gallery_updates(lyric_paths=paths)) + tuple(
                 _refresh_session_slots(active_session_id or "")
             )
             return
@@ -1563,12 +2126,24 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
                 except OSError:
                     pass
         paths = _list_project_images(proj)
+        last_sec = 0.0
+        try:
+            last_sec = float(
+                configure.APP_STATE.get("last_image_gen_seconds")
+                or configure.load_generation().get("last_image_gen_seconds")
+                or 0
+            )
+        except (TypeError, ValueError):
+            last_sec = 0.0
+        size_label = configure.normalize_image_size(str(image_size or configure.DEFAULT_IMAGE_SIZE))
+        w, h = configure.image_size_pixels(size_label)
+        freq = configure.normalize_image_frequency(image_frequency)
+        hint = f" (last still ~{last_sec:.0f}s)" if last_sec > 0 else ""
         yield (
-            f"Regenerating still {line_no}…",
-            gr.update(visible=False),
-            gr.update(visible=True),
+            f"Regenerating still {line_no} at {size_label}…{hint}",
+            gr.update(), gr.update(), gr.update(), gr.update(),
             active_session_id or "",
-        ) + tuple(_thumb_panel_updates(paths)) + tuple(
+        ) + tuple(_all_gallery_updates(lyric_paths=paths)) + tuple(
             _refresh_session_slots(active_session_id or "")
         )
 
@@ -1579,7 +2154,19 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
             cfg_now = configure.load_configuration()
             cfg_now["imagegen_steps"] = steps
             cfg_now["imagegen_cfg_scale"] = cfg_scale
+            cfg_now["imagegen_width"] = w
+            cfg_now["imagegen_height"] = h
+            cfg_now["imagegen_size"] = size_label
+            cfg_now["imagegen_frequency"] = freq
             cfg_now["negative_prompt"] = neg
+            configure.update_generation({
+                "imagegen_width": w,
+                "imagegen_height": h,
+                "imagegen_size": size_label,
+                "imagegen_frequency": freq,
+                "imagegen_steps": int(steps or configure.DEFAULT_STEPS),
+                "imagegen_cfg_scale": float(cfg_scale or configure.DEFAULT_CFG),
+            })
             inference.regenerate_single_still(
                 Path(proj),
                 int(resolved_idx),
@@ -1587,6 +2174,16 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
                 reference_image=ref_image or "",
             )
             configure.APP_STATE["session_status"] = "stopped"
+            try:
+                last_sec = float(
+                    configure.APP_STATE.get("last_image_gen_seconds")
+                    or configure.load_generation().get("last_image_gen_seconds")
+                    or 0
+                )
+            except (TypeError, ValueError):
+                last_sec = 0.0
+            if last_sec > 0:
+                msg = f"Regenerated still {line_no} in {last_sec:.1f}s."
         except Exception as e:
             configure.APP_STATE["session_status"] = "stopped"
             msg = f"Regenerate failed for still {line_no}: {e}"
@@ -1612,7 +2209,7 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
                 gr.update(visible=False),
                 gr.update(visible=True),
                 active_session_id or "",
-            ) + tuple(_thumb_panel_updates(paths)) + tuple(
+            ) + tuple(_all_gallery_updates(lyric_paths=paths)) + tuple(
                 _refresh_session_slots(active_session_id or "")
             )
             try:
@@ -1620,6 +2217,9 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
                 cfg_now = configure.load_configuration()
                 cfg_now["imagegen_steps"] = steps
                 cfg_now["imagegen_cfg_scale"] = cfg_scale
+                cfg_now["imagegen_width"] = w
+                cfg_now["imagegen_height"] = h
+                cfg_now["imagegen_size"] = size_label
                 cfg_now["negative_prompt"] = neg
                 inference.regenerate_single_still(
                     Path(proj), qi, cfg_now, reference_image=ref_image or "",
@@ -1635,15 +2235,16 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
         paths = _list_project_images(proj)
         yield (
             msg + extra,
-            _run_btn_for_project(proj),
-            gr.update(visible=False),
+            *_action_btns_for_project(proj),
             active_session_id or "",
-        ) + tuple(_thumb_panel_updates(paths)) + tuple(
+        ) + tuple(_all_gallery_updates(lyric_paths=paths)) + tuple(
             _refresh_session_slots(active_session_id or "")
         )
 
     _regen_outputs = [
         status_box,
+        _gen["cover_btn"],
+        _gen["theme_btn"],
         _gen["run_btn"],
         _gen["stop_btn"],
         _gen["active_session_id"],
@@ -1659,8 +2260,8 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
         btn.click(
             functools.partial(_do_regen, i),
             inputs=[
-                _gen["steps"], _gen["cfg"], _gen["ref_image"],
-                _gen["negative_prompt"], _gen["active_session_id"],
+                _gen["image_size"], _gen["image_frequency"], _gen["steps"], _gen["cfg"],
+                _gen["ref_image"], _gen["negative_prompt"], _gen["active_session_id"],
             ],
             outputs=_regen_outputs,
             show_progress="minimal",

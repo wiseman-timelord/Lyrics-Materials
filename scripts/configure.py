@@ -439,13 +439,108 @@ RESOLUTION_PIXELS = {
 # Default generation values for Flux.2-klein-4B distilled
 DEFAULT_WIDTH = 768
 DEFAULT_HEIGHT = 512
-DEFAULT_STEPS = 4
+DEFAULT_STEPS = 8  # 8 improves eyes / fine detail vs 4 on Flux.2-klein
 DEFAULT_CFG = 1.0
 DEFAULT_NEGATIVE_PROMPT = (
     "cartoon, pixelated, graphical overlay, text overlay, watermark, logo, blurry, low quality, deformed, extra limbs"
 )
 DEFAULT_SAMPLER = "euler_a"
 DEFAULT_SEED = -1
+
+# Still output sizes (width × height) — user-selectable in Generation tab
+IMAGE_SIZE_768x512 = "768 × 512"
+IMAGE_SIZE_1024x512 = "1024 × 512"
+IMAGE_SIZE_1024x768 = "1024 × 768"
+IMAGE_SIZE_1280x768 = "1280 × 768"
+IMAGE_SIZE_CHOICES = [
+    IMAGE_SIZE_768x512,
+    IMAGE_SIZE_1024x512,
+    IMAGE_SIZE_1024x768,
+    IMAGE_SIZE_1280x768,
+]
+IMAGE_SIZE_PIXELS = {
+    IMAGE_SIZE_768x512: (768, 512),
+    IMAGE_SIZE_1024x512: (1024, 512),
+    IMAGE_SIZE_1024x768: (1024, 768),
+    IMAGE_SIZE_1280x768: (1280, 768),
+}
+DEFAULT_IMAGE_SIZE = IMAGE_SIZE_768x512
+
+
+def normalize_image_size(value: str) -> str:
+    """Map a label or 'WxH' string to a canonical IMAGE_SIZE_* choice."""
+    v = (value or "").strip()
+    if v in IMAGE_SIZE_PIXELS:
+        return v
+    # Accept "768x512", "768 × 512", "768*512", etc.
+    compact = re.sub(r"\s+", "", v.lower().replace("×", "x").replace("*", "x"))
+    for label, (w, h) in IMAGE_SIZE_PIXELS.items():
+        if compact == f"{w}x{h}":
+            return label
+    return DEFAULT_IMAGE_SIZE
+
+
+def image_size_pixels(value: str) -> Tuple[int, int]:
+    """Return (width, height) for a size label; falls back to defaults."""
+    label = normalize_image_size(value)
+    return IMAGE_SIZE_PIXELS.get(label, (DEFAULT_WIDTH, DEFAULT_HEIGHT))
+
+
+def image_size_label_from_wh(width: int, height: int) -> str:
+    """Best matching dropdown label for stored width/height."""
+    for label, (w, h) in IMAGE_SIZE_PIXELS.items():
+        if int(width) == w and int(height) == h:
+            return label
+    return DEFAULT_IMAGE_SIZE
+
+
+
+# Images per lyric line / assessment aspect (sequence variants)
+IMAGE_FREQUENCY_CHOICES = [1, 2, 3, 4]
+DEFAULT_IMAGE_FREQUENCY = 1
+
+# Framing hints when generating multiple stills for one line/aspect
+IMAGE_FREQUENCY_SEQUENCE = {
+    1: [""],
+    2: [
+        "opening beat of this moment — establish the scene",
+        "closing beat of this moment — resolve the beat",
+    ],
+    3: [
+        "beginning of this moment",
+        "middle / peak of this moment",
+        "end of this moment",
+    ],
+    4: [
+        "establishing wide view of this moment",
+        "approach / build into the moment",
+        "peak of the moment",
+        "aftermath / trailing beat of the moment",
+    ],
+}
+
+
+def normalize_image_frequency(value) -> int:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_IMAGE_FREQUENCY
+    if n not in IMAGE_FREQUENCY_CHOICES:
+        return DEFAULT_IMAGE_FREQUENCY
+    return n
+
+
+def image_frequency_hints(freq: int) -> list:
+    """Ordered sequence framing strings for the given frequency (length == freq)."""
+    n = normalize_image_frequency(freq)
+    hints = IMAGE_FREQUENCY_SEQUENCE.get(n) or IMAGE_FREQUENCY_SEQUENCE[1]
+    # Ensure exact length
+    if len(hints) < n:
+        hints = list(hints) + [""] * (n - len(hints))
+    return list(hints[:n])
+
+
+
 
 # Window geometry defaults
 WINDOW_DEFAULT_WIDTH = 1280
@@ -907,6 +1002,8 @@ def update_prompting(updates: Dict[str, Any]) -> Dict[str, Any]:
 GENERATION_KEYS = [
     "imagegen_width",
     "imagegen_height",
+    "imagegen_size",
+    "imagegen_frequency",
     "imagegen_steps",
     "imagegen_cfg_scale",
     "imagegen_seed",
@@ -919,6 +1016,7 @@ GENERATION_KEYS = [
     "last_markers",
     "reference_image_path",
     "project_label",
+    "last_image_gen_seconds",
 ]
 
 
@@ -926,6 +1024,8 @@ def _default_generation() -> Dict[str, Any]:
     return {
         "imagegen_width": DEFAULT_WIDTH,
         "imagegen_height": DEFAULT_HEIGHT,
+        "imagegen_size": DEFAULT_IMAGE_SIZE,
+        "imagegen_frequency": DEFAULT_IMAGE_FREQUENCY,
         "imagegen_steps": DEFAULT_STEPS,
         "imagegen_cfg_scale": DEFAULT_CFG,
         "imagegen_seed": DEFAULT_SEED,
@@ -938,6 +1038,7 @@ def _default_generation() -> Dict[str, Any]:
         "last_markers": [],
         "reference_image_path": "",
         "project_label": "",
+        "last_image_gen_seconds": 0.0,
     }
 
 
