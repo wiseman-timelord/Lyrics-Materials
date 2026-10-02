@@ -1227,11 +1227,14 @@ def analyze_song_and_sections(
         "You are a music-video art director preparing notes for still-image generation.\n"
         "Read the full lyrics and the section list. Reply in this exact structure:\n\n"
         "OVERALL:\n"
-        "<2-4 sentences: narrative, mood, setting, visual tone of the whole song>\n\n"
+        "<3-6 sentences: narrative arc, mood, setting, colour palette, visual tone of the whole song. "
+        "Be concrete and cinematic — this drives theme stills.>\n\n"
         f"{char_block}\n"
         "SECTIONS:\n"
-        "<one short paragraph per section, labelled exactly as given, describing "
-        "visual approach for that section in context of the whole song>\n\n"
+        "For EVERY section listed below write one non-empty paragraph "
+        "(2-4 sentences) labelled exactly as given. Describe the visual approach, "
+        "camera energy, and how this section differs from the others. "
+        "Do NOT leave any section blank.\n\n"
         f"Sections detected:\n{section_summary}\n\n"
         f"Full lyrics:\n{lyrics[:6000]}\n\n"
         "Notes:"
@@ -2361,6 +2364,194 @@ def regenerate_single_still(
 # Cover image + Theme images (assessment-driven)
 # ---------------------------------------------------------------------------
 
+
+def _analysis_is_usable(analysis: Optional[Dict[str, Any]]) -> bool:
+    if not analysis or not isinstance(analysis, dict):
+        return False
+    if (analysis.get("overall") or "").strip():
+        return True
+    secs = analysis.get("sections") or {}
+    if isinstance(secs, dict) and any((v or "").strip() for v in secs.values()):
+        return True
+    return False
+
+
+def _write_analysis_file(project_dir: Path, analysis: Dict[str, Any]) -> None:
+    try:
+        (project_dir / "analysis.txt").write_text(
+            "OVERALL\n"
+            + (analysis.get("overall") or "")
+            + "\n\nCHARACTER\n"
+            + (analysis.get("character_guidance") or "")
+            + "\n\nCHARACTER_MAP\n"
+            + "\n".join(
+                f"{k}: {v}"
+                for k, v in (analysis.get("character_presence") or {}).items()
+            )
+            + "\n\nSECTIONS\n"
+            + "\n".join(
+                f"{k}: {v}" for k, v in (analysis.get("sections") or {}).items()
+            ),
+            encoding="utf-8",
+        )
+    except OSError as e:
+        print(f"[analysis] could not write analysis.txt: {e}", flush=True)
+
+
+def ensure_project_assessment(
+    project_dir: Path,
+    lyrics: str,
+    cfg: Dict[str, Any],
+    *,
+    has_character_ref: bool = False,
+    progress_callback: Optional[Callable] = None,
+    force: bool = False,
+) -> Dict[str, Any]:
+    """
+    Load analysis.txt if usable; otherwise run song/section assessment and save it.
+    All three generation modes (cover / theme / lyrics) call this before acting.
+    """
+    project_dir = Path(project_dir)
+    project_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        (project_dir / "lyrics.txt").write_text(lyrics or "", encoding="utf-8")
+    except OSError:
+        pass
+
+    if not force:
+        disk = _load_analysis_from_disk(project_dir)
+        if _analysis_is_usable(disk):
+            print("[analysis] RESUME — usable analysis.txt on disk", flush=True)
+            if progress_callback:
+                progress_callback("Using existing song assessment", 0.08, {"phase": "analysis"})
+            return disk
+
+    if not (lyrics or "").strip():
+        print("[analysis] no lyrics — cannot run full assessment", flush=True)
+        return {
+            "overall": "",
+            "sections": {},
+            "character_guidance": "",
+            "character_presence": {},
+        }
+
+    parsed = parse_lyrics(lyrics)
+    if progress_callback:
+        progress_callback("Assessing song & sections…", 0.06, {"phase": "analysis"})
+    analysis = analyze_song_and_sections(
+        lyrics, parsed, cfg,
+        has_character_ref=has_character_ref,
+        progress_callback=progress_callback,
+    )
+    _write_analysis_file(project_dir, analysis)
+    maybe_bleep_section()
+    return analysis
+
+
+def generate_theme_prompts_from_assessment(
+    analysis: Dict[str, Any],
+    cfg: Dict[str, Any],
+    n_prompts: int,
+    *,
+    song_name: str = "",
+    progress_callback: Optional[Callable] = None,
+) -> List[str]:
+    """
+    Thinking/Encoder writes `n_prompts` distinct visual prompts from the OVERALL
+    assessment (and character notes). These drive Theme Thumbnails.
+    """
+    n = max(1, min(8, int(n_prompts or 1)))
+    overall = (analysis.get("overall") or "").strip()
+    character = (analysis.get("character_guidance") or "").strip()
+    sections = analysis.get("sections") or {}
+    sec_blob = ""
+    if isinstance(sections, dict):
+        sec_blob = "\n".join(
+            f"- {k}: {(v or '').strip()}"
+            for k, v in sections.items()
+            if (v or "").strip()
+        )
+    if not overall and not sec_blob:
+        return []
+
+    model_path, role = _resolve_prompt_model(cfg)
+    if not model_path:
+        # Fallback: split overall into n crude prompts
+        base = overall or sec_blob
+        return [base] * n
+
+    style = str(cfg.get("style") or configure.STYLE_LIGHT)
+    title = (song_name or "").replace("_", " ").strip()
+    prompt = (
+        "You are writing visual prompts for music-video THEME stills "
+        "(not per-lyric line stills).\n"
+        f"Song title: {title or '(untitled)'}\n"
+        f"Visual style preference: {style}\n\n"
+        "ASSESSMENT — OVERALL:\n"
+        f"{overall or '(none)'}\n\n"
+        "ASSESSMENT — CHARACTER:\n"
+        f"{character or '(none)'}\n\n"
+        "ASSESSMENT — SECTIONS (context only):\n"
+        f"{sec_blob or '(none)'}\n\n"
+        f"Write exactly {n} distinct image prompts, numbered 1..{n}.\n"
+        "Each prompt must:\n"
+        "- Be a single dense paragraph of visual description for one theme still\n"
+        "- Explore a different aspect of the OVERALL assessment "
+        "(mood, setting, character, symbol, colour, scale, …)\n"
+        "- Work as a Flux image prompt (concrete subjects, lighting, composition)\n"
+        "- Contain NO quotes around the whole prompt, NO 'Prompt:' labels, NO lyrics\n"
+        "- Avoid readable text, logos, watermarks in the image\n\n"
+        "Output format ONLY:\n"
+        "1. <prompt>\n"
+        "2. <prompt>\n"
+        f"…\n{n}. <prompt>\n"
+    )
+    if progress_callback:
+        progress_callback(
+            f"Writing {n} theme prompt(s) from assessment…",
+            0.18,
+            {"phase": "theme_prompts"},
+        )
+    print(f"[theme] generating {n} theme prompt(s) via {role}", flush=True)
+    try:
+        raw = _run_llama_completion(
+            prompt, cfg, role=role, model_path=model_path,
+            n_predict=max(_PROMPT_PREDICT, 120 * n),
+            ctx_size=_PROMPT_CTX + 1024,
+            temperature=0.7,
+            timeout=_TIMEOUT_PROMPT * max(1, n // 2),
+        )
+    except Exception as e:
+        print(f"[theme] prompt generation failed: {e}", flush=True)
+        raw = ""
+
+    prompts: List[str] = []
+    if raw:
+        for m in re.finditer(
+            r"(?m)^\s*(?:\*\*)?(\d+)(?:\*\*)?[.)\:\-]\s*(.+?)(?=^\s*(?:\*\*)?\d+(?:\*\*)?[.)\:\-]|\Z)",
+            raw,
+            re.S,
+        ):
+            body = re.sub(r"\s+", " ", m.group(2)).strip().strip('"').strip()
+            if len(body) > 20:
+                prompts.append(body)
+        if not prompts:
+            # Fallback: split non-empty lines
+            for line in raw.splitlines():
+                t = re.sub(r"^\s*\d+[.)\:\-]\s*", "", line).strip()
+                if len(t) > 40:
+                    prompts.append(t)
+
+    # Pad / trim to exact n
+    if not prompts and overall:
+        prompts = [overall]
+    while len(prompts) < n and prompts:
+        prompts.append(prompts[-1])
+    prompts = prompts[:n]
+    print(f"[theme] got {len(prompts)} theme prompt(s)", flush=True)
+    return prompts
+
+
 def _theme_topics_from_analysis(analysis: Dict[str, Any]) -> List[Dict[str, str]]:
     """
     Flatten analysis notes into ordered theme topics for still generation.
@@ -2528,9 +2719,10 @@ def generate_cover_image(
     reference_image: str = "",
     progress_callback: Optional[Callable] = None,
     resume_folder: str = "",
+    lyrics: str = "",
 ) -> Dict[str, Any]:
     """
-    One cover still derived from the song name (and style / optional reference).
+    Cover still from song name; runs song assessment first when lyrics are present.
     Writes cover-<slug>.png into the project folder.
     """
     clear_cancel_state()
@@ -2564,20 +2756,6 @@ def generate_cover_image(
         result["session_id"] = project_dir.name
         configure.APP_STATE["active_session_id"] = project_dir.name
 
-        style = str(cfg.get("style") or configure.STYLE_LIGHT)
-        style_hint = configure.prompt_template_for_style(style)
-        # Cover prompt: song title as subject, style template as framing
-        title = (song_name or label).replace("_", " ").strip() or label
-        cover_prompt = (
-            f"{style_hint.replace('{line}', title)} "
-            f"Album-style cover art for the song titled \"{title}\". "
-            "Bold, iconic composition suitable as a single cover image. "
-            "No readable text, no logos, no watermarks."
-        )
-        if progress_callback:
-            progress_callback(f"Cover image for “{title}”…", 0.2, {"phase": "cover"})
-
-        # Fail fast on models
         _diff = (cfg.get("imagegen_model_path") or "").strip()
         _enc = (cfg.get("encoder_model_path") or "").strip()
         if not _diff or not Path(_diff).is_file() or not _enc or not Path(_enc).is_file():
@@ -2600,11 +2778,50 @@ def generate_cover_image(
             except OSError:
                 pass
 
-        # Phase barrier not needed (no prior text phase); still unload any leftover workers
+        analysis: Dict[str, Any] = {}
+        if (lyrics or "").strip():
+            analysis = ensure_project_assessment(
+                project_dir,
+                lyrics,
+                cfg,
+                has_character_ref=has_ref,
+                progress_callback=progress_callback,
+            )
+            if is_cancel_requested():
+                configure.APP_STATE["session_status"] = "stopped"
+                result["message"] = "Cancelled during analysis."
+                return result
+        else:
+            disk = _load_analysis_from_disk(project_dir) or {}
+            if _analysis_is_usable(disk):
+                analysis = disk
+            else:
+                print("[cover] no lyrics / assessment; title-only cover prompt", flush=True)
+
+        style = str(cfg.get("style") or configure.STYLE_LIGHT)
+        style_hint = configure.prompt_template_for_style(style)
+        title = (song_name or label).replace("_", " ").strip() or label
+        overall = (analysis.get("overall") or "").strip()
+        character = (analysis.get("character_guidance") or "").strip()
+        assess_bit = ""
+        if overall:
+            assess_bit += f" Assessment mood/setting: {overall[:420]}"
+        if character:
+            assess_bit += f" Central character: {character[:220]}"
+        cover_prompt = (
+            f"{style_hint.replace('{line}', title)} "
+            f"Album-style cover art for the song titled '{title}'. "
+            "Bold, iconic composition suitable as a single cover image. "
+            "No readable text, no logos, no watermarks."
+            f"{assess_bit}"
+        )
+        if progress_callback:
+            progress_callback(f"Cover for '{title}'", 0.2, {"phase": "cover"})
+
         phase_barrier("cover image")
         dest = project_dir / f"cover-{_ascii_line_slug(title, max_len=48) or 'song'}.png"
         if progress_callback:
-            progress_callback("Generating cover still…", 0.45, {"phase": "cover"})
+            progress_callback("Generating cover still…", 0.45, {"phase": "cover", "line": 1, "total": 1})
         out = _generate_named_still(
             dest, cover_prompt, cfg,
             reference_image=reference_image if has_ref else "",
@@ -2632,6 +2849,7 @@ def generate_cover_image(
     return result
 
 
+
 def generate_theme_images(
     lyrics: str,
     cfg: Dict[str, Any],
@@ -2641,9 +2859,10 @@ def generate_theme_images(
     resume_folder: str = "",
 ) -> Dict[str, Any]:
     """
-    Analysis-driven theme stills: one image per assessment paragraph
-    (OVERALL, CHARACTER, each SECTIONS note).
-    Files: theme-01-overall.png, theme-02-character.png, theme-03-<section>.png, …
+    Theme stills from song assessment:
+      1. ensure_project_assessment (OVERALL / CHARACTER / SECTIONS)
+      2. Thinking/Encoder writes Image-Frequency distinct visual prompts from OVERALL
+      3. Each prompt → one Flux still (theme-01-….png …)
     """
     clear_cancel_state()
     configure.APP_STATE["session_status"] = "running"
@@ -2714,109 +2933,93 @@ def generate_theme_images(
         _text_path, _text_role = _resolve_prompt_model(cfg)
         log_phase_plan(cfg, _text_role)
 
-        # Phase 1: analysis (reuse disk when present)
-        analysis = _load_analysis_from_disk(project_dir)
-        if analysis and (analysis.get("overall") or analysis.get("sections")):
-            print("[theme] RESUME — loaded analysis.txt from disk", flush=True)
-            if progress_callback:
-                progress_callback("Resumed analysis from disk", 0.1, {"phase": "analysis"})
-        else:
-            if progress_callback:
-                progress_callback("Analysing song for theme notes…", 0.08, {"phase": "analysis"})
-            analysis = analyze_song_and_sections(
-                lyrics, parsed, cfg, has_character_ref=has_ref, progress_callback=progress_callback,
-            )
-            try:
-                (project_dir / "analysis.txt").write_text(
-                    "OVERALL\n"
-                    + (analysis.get("overall") or "")
-                    + "\n\nCHARACTER\n"
-                    + (analysis.get("character_guidance") or "")
-                    + "\n\nCHARACTER_MAP\n"
-                    + "\n".join(
-                        f"{k}: {v}"
-                        for k, v in (analysis.get("character_presence") or {}).items()
-                    )
-                    + "\n\nSECTIONS\n"
-                    + "\n".join(f"{k}: {v}" for k, v in (analysis.get("sections") or {}).items()),
-                    encoding="utf-8",
-                )
-            except OSError:
-                pass
-            maybe_bleep_section()
 
+        # Phase 1: shared assessment (required before theme stills)
+        analysis = ensure_project_assessment(
+            project_dir,
+            lyrics or "",
+            cfg,
+            has_character_ref=has_ref,
+            progress_callback=progress_callback,
+        )
         if is_cancel_requested():
             configure.APP_STATE["session_status"] = "stopped"
             result["message"] = "Cancelled during analysis."
             return result
 
-        topics = _theme_topics_from_analysis(analysis)
-        if not topics:
-            result["message"] = "Assessment produced no theme paragraphs to illustrate."
+        if not _analysis_is_usable(analysis):
+            result["message"] = (
+                "Song assessment is empty — paste lyrics and ensure the Thinking/Encoder "
+                "model is configured, then try Theme Images again."
+            )
             configure.APP_STATE["session_status"] = "stopped"
             return result
 
-        style = str(cfg.get("style") or configure.STYLE_LIGHT)
-        style_tpl = configure.prompt_template_for_style(style)
         freq = configure.normalize_image_frequency(cfg.get("imagegen_frequency") or 1)
-        seq_hints = configure.image_frequency_hints(freq)
-        print(f"[theme] frequency = {freq} still(s) per assessment aspect", flush=True)
+        style = str(cfg.get("style") or configure.STYLE_LIGHT)
+        print(f"[theme] frequency = {freq} theme still(s) from OVERALL assessment", flush=True)
+
+        # Phase 1b: thinking model writes frequency theme prompts from OVERALL
+        theme_prompts = generate_theme_prompts_from_assessment(
+            analysis, cfg, freq,
+            song_name=song_name or label,
+            progress_callback=progress_callback,
+        )
+        if not theme_prompts:
+            result["message"] = "Could not derive theme prompts from the assessment."
+            configure.APP_STATE["session_status"] = "stopped"
+            return result
+
+        try:
+            with open(project_dir / "theme_prompts.txt", "w", encoding="utf-8") as f:
+                f.write("OVERALL\n" + (analysis.get("overall") or "") + "\n\n")
+                for i, pr in enumerate(theme_prompts, 1):
+                    f.write(f"=== theme {i} ===\n{pr}\n\n")
+        except OSError:
+            pass
+
+        if is_cancel_requested():
+            configure.APP_STATE["session_status"] = "stopped"
+            result["message"] = "Cancelled during theme prompts."
+            return result
 
         phase_barrier("text → theme images")
         if progress_callback:
             progress_callback(
-                f"Generating {len(topics)} theme still(s)…", 0.35, {"phase": "theme"},
+                f"Generating {len(theme_prompts)} theme still(s)…",
+                0.35,
+                {"phase": "theme"},
             )
 
         images: List[Path] = []
-        total = len(topics)
-        work_total = max(1, total * freq)
-        work_done = 0
-        for i, topic in enumerate(topics):
+        total = len(theme_prompts)
+        for i, tprompt in enumerate(theme_prompts):
             if is_cancel_requested():
                 break
-            title = topic["title"]
-            notes = topic["notes"]
-            tid = topic["id"]
-            line_subject = f"{title}: {notes[:280]}"
-            base_prompt = (
-                f"{style_tpl.replace('{line}', line_subject)} "
-                f"Theme still for the music-video assessment note “{title}”. "
-                "Cinematic, coherent with the song’s mood. No readable text."
-            )
-            attach = bool(has_ref and tid == "character")
-            for var in range(1, freq + 1):
-                if is_cancel_requested():
-                    break
-                hint = seq_hints[var - 1] if var - 1 < len(seq_hints) else ""
-                seq_bit = f" [Sequence {var}/{freq}: {hint}.]" if hint else ""
-                prompt = base_prompt + seq_bit
-                if freq <= 1:
-                    fname = f"theme-{i + 1:02d}-{_ascii_line_slug(tid, max_len=40) or 'topic'}.png"
-                else:
-                    fname = (
-                        f"theme-{i + 1:02d}-{var}-"
-                        f"{_ascii_line_slug(tid, max_len=36) or 'topic'}.png"
-                    )
-                dest = project_dir / fname
-                if progress_callback:
-                    progress_callback(
-                        f"Theme {i + 1}/{total} [{var}/{freq}]: {title}",
-                        0.35 + 0.55 * (work_done / work_total),
-                        {"phase": "theme", "line": i + 1, "total": total},
-                    )
-                print(f"[theme] {i + 1}/{total} [{var}/{freq}] — {title}", flush=True)
-                try:
-                    out = _generate_named_still(
-                        dest, prompt, cfg,
-                        reference_image=reference_image if has_ref else "",
-                        attach_ref=attach,
-                    )
-                    images.append(out)
-                    work_done += 1
-                except Exception as e:
-                    print(f"[theme] failed {title} var {var}: {e}", flush=True)
-                    raise
+            style_tpl = configure.prompt_template_for_style(style)
+            # Style template uses {line}; fill with a short theme label
+            filled = style_tpl.replace("{line}", f"theme {i + 1}: {(analysis.get('overall') or '')[:120]}")
+            final = f"{filled} {tprompt}".strip()
+            attach = bool(has_ref and i == 0)  # optional ref on first theme only
+            fname = f"theme-{i + 1:02d}-{_ascii_line_slug(song_name or label, max_len=32) or 'theme'}.png"
+            dest = project_dir / fname
+            if progress_callback:
+                progress_callback(
+                    f"encoding & generating still",
+                    0.35 + 0.55 * (i / max(total, 1)),
+                    {"phase": "theme", "line": i + 1, "total": total},
+                )
+            print(f"[theme] {i + 1}/{total} — {fname}", flush=True)
+            try:
+                out = _generate_named_still(
+                    dest, final, cfg,
+                    reference_image=reference_image if has_ref else "",
+                    attach_ref=attach,
+                )
+                images.append(out)
+            except Exception as e:
+                print(f"[theme] failed theme {i + 1}: {e}", flush=True)
+                raise
 
         elapsed = time.time() - t0
         configure.APP_STATE["session_status"] = "stopped"
@@ -2843,6 +3046,8 @@ def generate_theme_images(
         result["elapsed_seconds"] = round(time.time() - t0, 1)
         configure.APP_STATE["session_status"] = "stopped"
     return result
+
+
 
 
 def run_materials_pipeline(
@@ -3001,35 +3206,15 @@ def run_materials_pipeline(
                 {"phase": "plan"},
             )
 
-        # ── Phase 1: assessment + prompts (text model only) ──────────────
-        # Resume: reuse analysis.txt / prompts.txt when complete
-        analysis = _load_analysis_from_disk(project_dir)
-        if analysis and (analysis.get("overall") or analysis.get("sections")):
-            print("[analysis] RESUME — loaded analysis.txt from disk", flush=True)
-            if progress_callback:
-                progress_callback("Resumed analysis from disk", 0.08, {"phase": "analysis"})
-        else:
-            analysis = analyze_song_and_sections(
-                lyrics, parsed, cfg, has_character_ref=has_ref, progress_callback=progress_callback,
-            )
-            try:
-                (project_dir / "analysis.txt").write_text(
-                    "OVERALL\n"
-                    + (analysis.get("overall") or "")
-                    + "\n\nCHARACTER\n"
-                    + (analysis.get("character_guidance") or "")
-                    + "\n\nCHARACTER_MAP\n"
-                    + "\n".join(
-                        f"{k}: {v}"
-                        for k, v in (analysis.get("character_presence") or {}).items()
-                    )
-                    + "\n\nSECTIONS\n"
-                    + "\n".join(f"{k}: {v}" for k, v in (analysis.get("sections") or {}).items()),
-                    encoding="utf-8",
-                )
-            except OSError:
-                pass
-            maybe_bleep_section()
+                # ── Phase 1: assessment + prompts (text model only) ──────────────
+        # Shared assessment gate (Cover / Theme / Lyrics)
+        analysis = ensure_project_assessment(
+            project_dir,
+            lyrics,
+            cfg,
+            has_character_ref=has_ref,
+            progress_callback=progress_callback,
+        )
 
         _snapshot_session(
             project_dir, lyrics=lyrics, song_name=song_name or label, cfg=cfg,

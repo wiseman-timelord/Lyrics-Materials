@@ -297,27 +297,60 @@ def _lyrics_line_count(text: str) -> int:
 
 
 def _format_progress_line(msg: str, frac: float, info: dict) -> str:
-    phase = (info or {}).get("phase", "")
+    """
+    Status bar, e.g. [ 35%] theme Image 1/4 — establishing wide…
+    Avoids "theme 1/1 Theme 1/1" duplication.
+    """
+    phase = str((info or {}).get("phase", "") or "")
     pct = int(round(max(0.0, min(1.0, float(frac or 0.0))) * 100))
     bits = [f"[{pct:3d}%]"]
-    if phase:
-        bits.append(str(phase))
+    if phase and phase not in ("done",):
+        bits.append(phase)
     line_n = (info or {}).get("line")
     total = (info or {}).get("total")
+    msg_s = (msg or "").replace("\n", " ").strip()
+    already_counted = bool(
+        re.match(r"(?i)^(theme|image|cover|line)\s*\d+\s*/\s*\d+", msg_s)
+        or re.search(r"(?i)\b(theme|image)\s+\d+\s*/\s*\d+", msg_s)
+    )
+    if line_n is not None and total is not None and not already_counted:
+        bits.append(f"Image {int(line_n)}/{int(total)}")
     if line_n is not None and total is not None:
-        bits.append(f"{line_n}/{total}")
-    bits.append(msg)
+        msg_s = re.sub(
+            rf"(?i)^(theme|image|cover|line)\s*{int(line_n)}\s*/\s*{int(total)}\s*[:.\-–—]?\s*",
+            "",
+            msg_s,
+        ).strip()
+    if msg_s:
+        bits.append(msg_s)
     try:
         last = float(
             configure.APP_STATE.get("last_image_gen_seconds")
             or configure.load_generation().get("last_image_gen_seconds")
             or 0
         )
-        if last > 0 and str(phase) in ("images", "regen"):
+        if last > 0 and phase in ("images", "regen", "theme", "cover"):
             bits.append(f"(prev still {last:.0f}s)")
     except (TypeError, ValueError):
         pass
-    return " ".join(bits).replace("\n", " ").strip()[:240]
+    return " ".join(bits).strip()[:240]
+
+
+
+
+def _load_assessment_text(project_dir: str = "") -> str:
+    """Read analysis.txt for the active (or given) project for the Assessment panel."""
+    folder = (project_dir or configure.APP_STATE.get("current_project_folder") or "").strip()
+    if not folder:
+        return "(No project folder — generate Cover / Theme / Lyrics first.)"
+    path = Path(folder) / "analysis.txt"
+    if not path.is_file():
+        return "(No assessment yet — run any Generate button with song name + lyrics.)"
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        return f"(Could not read assessment: {e})"
+
 
 
 # ---------------------------------------------------------------------------
@@ -869,37 +902,47 @@ def _build_create_tab() -> None:
                         )
                         _gen["browse_ref"] = gr.Button("Browse", scale=1, min_width=90)
 
-                with gr.Column(scale=1):
-                    gr.Markdown(
-                        "### Song & lyrics\n"
-                        "Enter a short **song name** (used as the output folder under `output/`). "
-                        "Spaces become underscores. Section headers (`[Intro]`, `[Chorus_1]`, …) "
-                        "are context only — they do **not** get images. Blank lines are skipped.\n\n"
-                        "Select a **session** on the left to resume, or leave blank and click "
-                        "**Generate Lyrics Slideshow** (or Cover / Theme) to start a new one."
+                with gr.Column(scale=1, elem_id="gen-details-col"):
+                    _gen["details_mode"] = gr.Radio(
+                        label="Details Mode",
+                        choices=["Name and Lyrics", "Assessment"],
+                        value="Name and Lyrics",
+                        elem_id="details-mode-radio",
                     )
-                    _gen["song_name"] = gr.Textbox(
-                        label="Song name (required — becomes output folder)",
-                        value=initial_song,
-                        placeholder="e.g. Midnight Drive",
-                        elem_id="song-name-box",
-                    )
-                    _gen["lyrics"] = gr.Textbox(
-                        label="Song Lyrics (one image per non-empty line)",
-                        lines=12,
-                        max_lines=12,
-                        placeholder="Paste full lyrics here…\n[Intro]\nFirst line…\n…",
-                        value=initial_lyrics,
-                        elem_id="lyrics-box",
-                    )
-                    _gen["negative_prompt"] = gr.Textbox(
-                        label="Negative prompt (saved with the project)",
-                        lines=2,
-                        max_lines=4,
-                        value=getattr(configure, "DEFAULT_NEGATIVE_PROMPT", ""),
-                        placeholder="Things to avoid in every still…",
-                        elem_id="negative-prompt-box",
-                    )
+                    with gr.Column(visible=True, elem_id="details-name-lyrics") as _details_nl:
+                        _gen["song_name"] = gr.Textbox(
+                            label="Song name (required — becomes output folder)",
+                            value=initial_song,
+                            placeholder="e.g. Midnight Drive",
+                            elem_id="song-name-box",
+                        )
+                        _gen["lyrics"] = gr.Textbox(
+                            label="Song Lyrics (one image per non-empty line)",
+                            lines=12,
+                            max_lines=12,
+                            placeholder="Paste full lyrics here…\n[Intro]\nFirst line…\n…",
+                            value=initial_lyrics,
+                            elem_id="lyrics-box",
+                        )
+                        _gen["negative_prompt"] = gr.Textbox(
+                            label="Negative prompt (saved with the project)",
+                            lines=2,
+                            max_lines=4,
+                            value=getattr(configure, "DEFAULT_NEGATIVE_PROMPT", ""),
+                            placeholder="Things to avoid in every still…",
+                            elem_id="negative-prompt-box",
+                        )
+                    _gen["details_name_lyrics"] = _details_nl
+                    with gr.Column(visible=False, elem_id="details-assessment") as _details_assess:
+                        _gen["assessment_view"] = gr.Textbox(
+                            label="Song assessment (OVERALL / CHARACTER / SECTIONS)",
+                            lines=18,
+                            max_lines=24,
+                            value="",
+                            interactive=False,
+                            elem_id="assessment-view-box",
+                        )
+                    _gen["details_assessment"] = _details_assess
 
             with gr.Row(elem_id="gen-action-row"):
                 _models_ok0 = _models_configured()
@@ -1049,6 +1092,28 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
         return path or gr.update()
 
     _gen["browse_ref"].click(_browse_ref, outputs=_gen["ref_image"])
+
+    def _details_mode_change(mode: str):
+        show_nl = (mode or "").strip() == "Name and Lyrics"
+        assess = ""
+        if not show_nl:
+            assess = _load_assessment_text()
+        return (
+            gr.update(visible=show_nl),
+            gr.update(visible=not show_nl),
+            gr.update(value=assess) if not show_nl else gr.update(),
+        )
+
+    if _gen.get("details_mode") is not None:
+        _gen["details_mode"].change(
+            _details_mode_change,
+            inputs=[_gen["details_mode"]],
+            outputs=[
+                _gen["details_name_lyrics"],
+                _gen["details_assessment"],
+                _gen["assessment_view"],
+            ],
+        )
 
     def _ready_change(lyrics, song_name):
         cover_u, theme_u, lyrics_u, stop_u = _action_btn_updates(lyrics, song_name, running=False)
@@ -1775,6 +1840,7 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
                     reference_image=ref_image or "",
                     progress_callback=_cb,
                     resume_folder=resume_folder,
+                    lyrics=lyrics or "",
                 )
             except Exception as e:
                 result_holder["r"] = {"success": False, "message": str(e)}
@@ -2796,17 +2862,22 @@ def build_app():
   text-decoration: underline !important;
   opacity: 0.9 !important;
 }
-#materials-gallery {
+.materials-thumbs,
+#materials-gallery,
+#cover-gallery,
+#theme-gallery {
   width: 100% !important;
   min-height: 0;
   overflow-y: auto;
   max-height: 70vh;
   margin-top: 0.35rem;
 }
+.materials-thumbs .thumb-row,
 #materials-gallery .thumb-row {
   margin: 0 !important;
   gap: 0.25rem !important;
 }
+.materials-thumbs .thumb-slot,
 #materials-gallery .thumb-slot {
   display: flex;
   flex-direction: column;
@@ -2814,7 +2885,8 @@ def build_app():
   gap: 0.15rem;
   padding: 0.1rem;
 }
-/* Fit still to thumbnail BOX HEIGHT (768x512 → width follows height) */
+/* Fit still to thumbnail BOX HEIGHT */
+.materials-thumbs .thumb-img,
 #materials-gallery .thumb-img {
   width: auto !important;
   max-width: 100% !important;
@@ -2822,6 +2894,8 @@ def build_app():
   min-height: 0 !important;
   overflow: hidden !important;
 }
+.materials-thumbs .thumb-img img,
+.materials-thumbs .thumb-img button:has(img) img,
 #materials-gallery .thumb-img img,
 #materials-gallery .thumb-img button:has(img) img {
   display: block !important;
@@ -2832,8 +2906,18 @@ def build_app():
   object-fit: contain !important;
   object-position: center !important;
 }
-/* Hide Gradio Image toolbar only — do NOT hide the wrapper that contains <img>
-   (Gradio 6 puts the still inside a button; hiding all buttons blanks the thumbs). */
+/* Hide Gradio Image toolbar on ALL galleries (Cover / Theme / Lyrics) */
+.materials-thumbs .thumb-img .icon-button,
+.materials-thumbs .thumb-img [class*="icon-button"],
+.materials-thumbs .thumb-img .download,
+.materials-thumbs .thumb-img .fullscreen,
+.materials-thumbs .thumb-img .share,
+.materials-thumbs .thumb-img .image-button-row,
+.materials-thumbs .thumb-img .toolbar,
+.materials-thumbs .thumb-img [aria-label="Download"],
+.materials-thumbs .thumb-img [aria-label="Fullscreen"],
+.materials-thumbs .thumb-img [aria-label="Share"],
+.materials-thumbs .thumb-img button:not(:has(img)),
 #materials-gallery .thumb-img .icon-button,
 #materials-gallery .thumb-img [class*="icon-button"],
 #materials-gallery .thumb-img .download,
@@ -2846,6 +2930,7 @@ def build_app():
 #materials-gallery .thumb-img [aria-label="Share"] {
   display: none !important;
 }
+.materials-thumbs .thumb-img button:has(img),
 #materials-gallery .thumb-img button:has(img) {
   display: block !important;
   background: transparent !important;
