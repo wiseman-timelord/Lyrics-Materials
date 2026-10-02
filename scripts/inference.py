@@ -598,14 +598,16 @@ def sections_with_lines(parsed: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 _NAME_CTX = 8192
 _NAME_PREDICT = 32
-_ANALYSIS_CTX = 12288
-_ANALYSIS_PREDICT = 512
+_ANALYSIS_CTX = 16384
+# Full OVERALL + CHARACTER + MAP + multi-paragraph SECTIONS needs room;
+# 512 truncated mid-Intro and left later sections blank.
+_ANALYSIS_PREDICT = 2048
 _PROMPT_CTX = 4096
 _PROMPT_PREDICT = 180
 
-# Generation timeouts (seconds) — doubled for slower GPUs / first load
+# Generation timeouts (seconds) — analysis can run long with large n_predict
 _TIMEOUT_NAME = 120.0
-_TIMEOUT_ANALYSIS = 360.0
+_TIMEOUT_ANALYSIS = 720.0
 _TIMEOUT_PROMPT = 240.0
 _TIMEOUT_SD = 600.0
 
@@ -1249,6 +1251,18 @@ def analyze_song_and_sections(
     except Exception as e:
         print(f"[analysis] failed: {e}", flush=True)
         raw = ""
+
+    if raw:
+        print(f"[analysis] raw reply length = {len(raw)} chars "
+              f"(n_predict budget {_ANALYSIS_PREDICT})", flush=True)
+        # Heuristic: cut off mid-sentence / missing SECTIONS tail
+        if "SECTIONS" in raw.upper():
+            tail = raw[raw.upper().rfind("SECTIONS"):]
+            if tail.rstrip().endswith((",", "—", "-", "…", "...")) or len(tail) < 80:
+                print("[analysis] WARNING: SECTIONS block looks truncated — "
+                      "consider higher n_predict if this persists", flush=True)
+        elif len(raw) > 100:
+            print("[analysis] WARNING: no SECTIONS heading in reply", flush=True)
 
     overall = ""
     character = ""
@@ -2516,10 +2530,10 @@ def generate_theme_prompts_from_assessment(
     try:
         raw = _run_llama_completion(
             prompt, cfg, role=role, model_path=model_path,
-            n_predict=max(_PROMPT_PREDICT, 120 * n),
-            ctx_size=_PROMPT_CTX + 1024,
+            n_predict=max(_PROMPT_PREDICT, 160 * n, 400),
+            ctx_size=_PROMPT_CTX + 2048,
             temperature=0.7,
-            timeout=_TIMEOUT_PROMPT * max(1, n // 2),
+            timeout=max(_TIMEOUT_PROMPT, 120.0 * n),
         )
     except Exception as e:
         print(f"[theme] prompt generation failed: {e}", flush=True)
@@ -2934,13 +2948,14 @@ def generate_theme_images(
         log_phase_plan(cfg, _text_role)
 
 
-        # Phase 1: shared assessment (required before theme stills)
+        # Assessment must already be saved (Run Assessment + optional edit/Save)
         analysis = ensure_project_assessment(
             project_dir,
             lyrics or "",
             cfg,
             has_character_ref=has_ref,
             progress_callback=progress_callback,
+            force=False,
         )
         if is_cancel_requested():
             configure.APP_STATE["session_status"] = "stopped"
@@ -2949,8 +2964,8 @@ def generate_theme_images(
 
         if not _analysis_is_usable(analysis):
             result["message"] = (
-                "Song assessment is empty — paste lyrics and ensure the Thinking/Encoder "
-                "model is configured, then try Theme Images again."
+                "No usable assessment on disk — click Run Assessment first, "
+                "edit if needed, then Save Assessment."
             )
             configure.APP_STATE["session_status"] = "stopped"
             return result

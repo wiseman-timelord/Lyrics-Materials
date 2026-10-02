@@ -145,31 +145,70 @@ def _models_configured() -> bool:
     return True
 
 
+def _assessment_path(project_dir: str = "") -> Optional[Path]:
+    folder = (project_dir or configure.APP_STATE.get("current_project_folder") or "").strip()
+    if not folder:
+        return None
+    return Path(folder) / "analysis.txt"
+
+
+def _assessment_exists(project_dir: str = "") -> bool:
+    """True when analysis.txt exists and has usable content."""
+    path = _assessment_path(project_dir)
+    if path is None or not path.is_file():
+        return False
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return False
+    if len(raw) < 40:
+        return False
+    # Prefer structured content; accept any substantial text the user saved
+    upper = raw.upper()
+    if "OVERALL" in upper or "SECTIONS" in upper or "CHARACTER" in upper:
+        return True
+    return len(raw) >= 80
+
+
+def _can_run_assessment(lyrics: str = "", song_name: str = "") -> bool:
+    if not _models_configured():
+        return False
+    if not (song_name or "").strip():
+        return False
+    if not (lyrics or "").strip():
+        return False
+    return True
+
+
 def _can_create(lyrics: str, song_name: str = "") -> bool:
-    """Full lyrics slideshow: needs song name + lyrics + models."""
+    """Full lyrics slideshow: needs assessment + song name + lyrics + models."""
     if not (lyrics or "").strip():
         return False
     if not (song_name or "").strip():
         return False
     if not _models_configured():
         return False
-    return True
+    return _assessment_exists()
 
 
 def _can_cover(song_name: str = "") -> bool:
-    """Cover image: needs song name + models only."""
+    """Cover image: needs assessment + song name + models."""
     if not (song_name or "").strip():
         return False
-    return _models_configured()
+    if not _models_configured():
+        return False
+    return _assessment_exists()
 
 
 def _can_theme(lyrics: str = "", song_name: str = "") -> bool:
-    """Theme images: needs lyrics assessment material + song name + models."""
+    """Theme images: needs assessment + lyrics + song name + models."""
     if not (lyrics or "").strip():
         return False
     if not (song_name or "").strip():
         return False
-    return _models_configured()
+    if not _models_configured():
+        return False
+    return _assessment_exists()
 
 
 def _partial_project_state(lyrics: str = "") -> bool:
@@ -204,33 +243,46 @@ def _lyrics_btn_label(lyrics: str = "") -> str:
 
 def _action_btn_updates(lyrics: str = "", song_name: str = "", *, running: bool = False):
     """
-    Visibility / interactivity for the three generate buttons + stop.
+    Button visibility:
 
-    Gate on Configuration (models):
-      - Models not set  → only "Configure the Pages First" (run_btn), Cover/Theme hidden.
-      - Models set      → Cover + Theme + Lyrics Slideshow all visible; each enabled when
-                          its own inputs are ready (song name / lyrics).
+      Models not set     → only assess_btn as "Configure the Pages First" (disabled)
+      Models set, no assess → only "Run Assessment" (enabled when name+lyrics)
+      Assessment saved   → "Run Assessment" still shown (re-run) + Cover / Theme / Lyrics
 
-    When running: hide generate buttons, show Emergency Stop.
+    When running: hide action buttons, show Emergency Stop.
 
-    Returns (cover_u, theme_u, lyrics_u, stop_u).
+    Returns (assess_u, cover_u, theme_u, lyrics_u, stop_u).
     """
+    hide = gr.update(visible=False)
     if running:
-        hide = gr.update(visible=False)
-        return hide, hide, hide, gr.update(visible=True)
+        return hide, hide, hide, hide, gr.update(visible=True)
 
     models_ok = _models_configured()
     if not models_ok:
-        # Single gate button until Encoder + Diffuser paths are saved in Configuration
         return (
-            gr.update(visible=False),
-            gr.update(visible=False),
             gr.update(
                 value="Configure the Pages First",
                 interactive=False,
                 variant="secondary",
                 visible=True,
             ),
+            hide, hide, hide,
+            gr.update(visible=False),
+        )
+
+    has_assess = _assessment_exists()
+    can_assess = _can_run_assessment(lyrics, song_name)
+    assess_u = gr.update(
+        value="Re-run Assessment" if has_assess else "Run Assessment",
+        interactive=can_assess,
+        variant="primary" if can_assess else "secondary",
+        visible=True,
+    )
+
+    if not has_assess:
+        return (
+            assess_u,
+            hide, hide, hide,
             gr.update(visible=False),
         )
 
@@ -255,13 +307,12 @@ def _action_btn_updates(lyrics: str = "", song_name: str = "", *, running: bool 
         variant="primary" if lyrics_ok else "secondary",
         visible=True,
     )
-    stop_u = gr.update(visible=False)
-    return cover_u, theme_u, lyrics_u, stop_u
+    return assess_u, cover_u, theme_u, lyrics_u, gr.update(visible=False)
 
 
 def _run_btn_updates(lyrics: str = "", song_name: str = ""):
     """Back-compat: return only the lyrics-slideshow button update."""
-    _, _, lyrics_u, _ = _action_btn_updates(lyrics, song_name, running=False)
+    _, _, _, lyrics_u, _ = _action_btn_updates(lyrics, song_name, running=False)
     return lyrics_u
 
 
@@ -345,7 +396,7 @@ def _load_assessment_text(project_dir: str = "") -> str:
         return "(No project folder — generate Cover / Theme / Lyrics first.)"
     path = Path(folder) / "analysis.txt"
     if not path.is_file():
-        return "(No assessment yet — run any Generate button with song name + lyrics.)"
+        return "(No assessment yet — click Run Assessment with song name + lyrics.)"
     try:
         return path.read_text(encoding="utf-8", errors="replace")
     except OSError as e:
@@ -935,40 +986,62 @@ def _build_create_tab() -> None:
                     _gen["details_name_lyrics"] = _details_nl
                     with gr.Column(visible=False, elem_id="details-assessment") as _details_assess:
                         _gen["assessment_view"] = gr.Textbox(
-                            label="Song assessment (OVERALL / CHARACTER / SECTIONS)",
+                            label="Song assessment (editable — Save before generating)",
                             lines=18,
                             max_lines=24,
                             value="",
-                            interactive=False,
+                            interactive=True,
                             elem_id="assessment-view-box",
                         )
+                        with gr.Row():
+                            _gen["save_assessment_btn"] = gr.Button(
+                                "Save Assessment",
+                                variant="primary",
+                                size="sm",
+                                elem_id="save-assessment-btn",
+                            )
+                            _gen["reload_assessment_btn"] = gr.Button(
+                                "Reload Assessment",
+                                variant="secondary",
+                                size="sm",
+                                elem_id="reload-assessment-btn",
+                            )
                     _gen["details_assessment"] = _details_assess
 
             with gr.Row(elem_id="gen-action-row"):
                 _models_ok0 = _models_configured()
+                _has_assess0 = _assessment_exists()
+                _can_assess0 = _can_run_assessment(initial_lyrics, initial_song)
+                _gen["assess_btn"] = gr.Button(
+                    (
+                        "Configure the Pages First"
+                        if not _models_ok0
+                        else ("Re-run Assessment" if _has_assess0 else "Run Assessment")
+                    ),
+                    variant="primary" if (_models_ok0 and _can_assess0) else "secondary",
+                    interactive=bool(_models_ok0 and _can_assess0),
+                    visible=True,
+                    elem_id="assess-btn",
+                )
                 _gen["cover_btn"] = gr.Button(
                     "Generate Cover Image",
                     variant="primary" if _can_cover(initial_song) else "secondary",
                     interactive=bool(_can_cover(initial_song)),
-                    visible=bool(_models_ok0),
+                    visible=bool(_models_ok0 and _has_assess0),
                     elem_id="cover-btn",
                 )
                 _gen["theme_btn"] = gr.Button(
                     "Generate Theme Images",
                     variant="primary" if _can_theme(initial_lyrics, initial_song) else "secondary",
                     interactive=bool(_can_theme(initial_lyrics, initial_song)),
-                    visible=bool(_models_ok0),
+                    visible=bool(_models_ok0 and _has_assess0),
                     elem_id="theme-btn",
                 )
                 _gen["run_btn"] = gr.Button(
-                    (
-                        _lyrics_btn_label(initial_lyrics)
-                        if _models_ok0
-                        else "Configure the Pages First"
-                    ),
-                    variant="primary" if (can and _models_ok0) else "secondary",
-                    interactive=bool(can and _models_ok0),
-                    visible=True,
+                    _lyrics_btn_label(initial_lyrics),
+                    variant="primary" if (can and _has_assess0) else "secondary",
+                    interactive=bool(can and _has_assess0),
+                    visible=bool(_models_ok0 and _has_assess0),
                     elem_id="run-btn",
                 )
                 _gen["stop_btn"] = gr.Button(
@@ -1115,21 +1188,100 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
             ],
         )
 
+    def _save_assessment(text_val: str, song_name: str, lyrics: str, active_session_id: str):
+        """Write the Assessment panel text to analysis.txt for the active project."""
+        label = (song_name or "").strip()
+        folder = (configure.APP_STATE.get("current_project_folder") or "").strip()
+        if not folder and active_session_id:
+            root = configure.get_output_dir()
+            cand = Path(root) / str(active_session_id)
+            if cand.is_dir():
+                folder = str(cand)
+        if not folder and label:
+            # Ensure project dir exists so Save works before Run Assessment finishes
+            try:
+                from scripts.inference import ensure_project_dir, _slugify_folder_name
+                slug = _slugify_folder_name(label, fallback="")
+                if slug:
+                    folder = str(ensure_project_dir(slug, sequential=False))
+                    configure.APP_STATE["current_project_folder"] = folder
+                    configure.APP_STATE["active_session_id"] = Path(folder).name
+            except Exception as e:
+                return f"Cannot create project folder: {e}", *_action_btn_updates(lyrics, song_name)
+        if not folder:
+            return (
+                "Save Assessment: set a song name (or run assessment first) so a project folder exists.",
+                *_action_btn_updates(lyrics, song_name),
+            )
+        path = Path(folder) / "analysis.txt"
+        body = (text_val or "").strip()
+        if not body:
+            return "Assessment is empty — nothing saved.", *_action_btn_updates(lyrics, song_name)
+        try:
+            path.write_text(body if body.endswith("\n") else body + "\n", encoding="utf-8")
+            try:
+                (Path(folder) / "lyrics.txt").write_text(lyrics or "", encoding="utf-8")
+            except OSError:
+                pass
+            configure.APP_STATE["current_project_folder"] = folder
+            configure.APP_STATE["active_session_id"] = Path(folder).name
+            msg = f"Assessment saved → {path}"
+            return msg, *_action_btn_updates(lyrics, song_name)
+        except OSError as e:
+            return f"Save failed: {e}", *_action_btn_updates(lyrics, song_name)
+
+    def _reload_assessment(lyrics: str, song_name: str):
+        text_val = _load_assessment_text()
+        return text_val, f"Reloaded assessment from disk.", *_action_btn_updates(lyrics, song_name)
+
+    if _gen.get("save_assessment_btn") is not None:
+        _gen["save_assessment_btn"].click(
+            _save_assessment,
+            inputs=[
+                _gen["assessment_view"],
+                _gen["song_name"],
+                _gen["lyrics"],
+                _gen["active_session_id"],
+            ],
+            outputs=[
+                status_box,
+                _gen["assess_btn"],
+                _gen["cover_btn"],
+                _gen["theme_btn"],
+                _gen["run_btn"],
+                _gen["stop_btn"],
+            ],
+        )
+    if _gen.get("reload_assessment_btn") is not None:
+        _gen["reload_assessment_btn"].click(
+            _reload_assessment,
+            inputs=[_gen["lyrics"], _gen["song_name"]],
+            outputs=[
+                _gen["assessment_view"],
+                status_box,
+                _gen["assess_btn"],
+                _gen["cover_btn"],
+                _gen["theme_btn"],
+                _gen["run_btn"],
+                _gen["stop_btn"],
+            ],
+        )
+
     def _ready_change(lyrics, song_name):
-        cover_u, theme_u, lyrics_u, stop_u = _action_btn_updates(lyrics, song_name, running=False)
-        return cover_u, theme_u, lyrics_u
+        assess_u, cover_u, theme_u, lyrics_u, stop_u = _action_btn_updates(lyrics, song_name, running=False)
+        return assess_u, cover_u, theme_u, lyrics_u
 
     for _evt in ("change", "input", "blur"):
         try:
             getattr(_gen["lyrics"], _evt)(
                 _ready_change,
                 inputs=[_gen["lyrics"], _gen["song_name"]],
-                outputs=[_gen["cover_btn"], _gen["theme_btn"], _gen["run_btn"]],
+                outputs=[_gen["assess_btn"], _gen["cover_btn"], _gen["theme_btn"], _gen["run_btn"]],
             )
             getattr(_gen["song_name"], _evt)(
                 _ready_change,
                 inputs=[_gen["lyrics"], _gen["song_name"]],
-                outputs=[_gen["cover_btn"], _gen["theme_btn"], _gen["run_btn"]],
+                outputs=[_gen["assess_btn"], _gen["cover_btn"], _gen["theme_btn"], _gen["run_btn"]],
             )
         except Exception:
             pass
@@ -1331,9 +1483,9 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
             status,
             sid,
         )
-        cover_u, theme_u, lyrics_u, _stop_u = _action_btn_updates(lyrics, song, running=False)
+        assess_u, cover_u, theme_u, lyrics_u, _stop_u = _action_btn_updates(lyrics, song, running=False)
         refresh = _refresh_session_slots(sid)
-        return main + (cover_u, theme_u, lyrics_u) + tuple(_all_gallery_updates(lyric_paths=list(imgs))) + tuple(refresh)
+        return main + (assess_u, cover_u, theme_u, lyrics_u) + tuple(_all_gallery_updates(lyric_paths=list(imgs))) + tuple(refresh)
 
     # Wire each select button with its index
     for i, btn in enumerate(_gen["session_select_btns"]):
@@ -1351,6 +1503,7 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
                 _gen["negative_prompt"],
                 status_box,
                 _gen["active_session_id"],
+                _gen["assess_btn"],
                 _gen["cover_btn"],
                 _gen["theme_btn"],
                 _gen["run_btn"],
@@ -1396,8 +1549,8 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
             "New session — enter song name & lyrics, then Generate.",
             "",
         )
-        cover_u, theme_u, lyrics_u, _stop_u = _action_btn_updates("", "", running=False)
-        return main + (cover_u, theme_u, lyrics_u) + tuple(_all_gallery_updates(lyric_paths=[])) + tuple(
+        assess_u, cover_u, theme_u, lyrics_u, _stop_u = _action_btn_updates("", "", running=False)
+        return main + (assess_u, cover_u, theme_u, lyrics_u) + tuple(_all_gallery_updates(lyric_paths=[])) + tuple(
             _refresh_session_slots("")
         )
 
@@ -1414,6 +1567,7 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
             _gen["negative_prompt"],
             status_box,
             _gen["active_session_id"],
+            _gen["assess_btn"],
             _gen["cover_btn"],
             _gen["theme_btn"],
             _gen["run_btn"],
@@ -1746,6 +1900,7 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
 
     _run_outputs = [
         status_box,
+        _gen["assess_btn"],
         _gen["cover_btn"],
         _gen["theme_btn"],
         _gen["run_btn"],
@@ -1977,6 +2132,138 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
         yield (
             msg, *idle_btns, sid,
         ) + tuple(_all_gallery_updates()) + tuple(_refresh_session_slots(sid))
+
+
+    def _run_assessment(
+        lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale, ref_image, negative_prompt, active_session_id,
+        progress=gr.Progress(track_tqdm=False),
+    ):
+        """Run song assessment only; enable generate buttons when analysis.txt is saved."""
+        idle_btns = _action_btn_updates(lyrics, song_name, running=False)
+        run_btns = _action_btn_updates(lyrics, song_name, running=True)
+        if not _models_configured():
+            yield (
+                "Configure Encoder + Diffuser models on the Configuration tab first.",
+                *idle_btns, active_session_id or "",
+            ) + tuple(_all_gallery_updates()) + tuple(_refresh_session_slots(active_session_id or ""))
+            return
+        if not (song_name or "").strip() or not (lyrics or "").strip():
+            yield (
+                "Song name and lyrics are required to run assessment.",
+                *idle_btns, active_session_id or "",
+            ) + tuple(_all_gallery_updates()) + tuple(_refresh_session_slots(active_session_id or ""))
+            return
+
+        configure.APP_STATE["generating"] = True
+        configure.APP_STATE["session_status"] = "running"
+        yield (
+            "Running song assessment…",
+            *run_btns, active_session_id or "",
+        ) + tuple(_all_gallery_updates()) + tuple(_refresh_session_slots(active_session_id or ""))
+
+        import queue
+        import threading
+        prog_q: queue.Queue = queue.Queue()
+        result_holder: dict = {}
+
+        def _cb(msg, frac=0.0, info=None):
+            try:
+                prog_q.put((_format_progress_line(msg, frac, info or {}), frac, info or {}))
+            except Exception:
+                pass
+
+        def _worker():
+            try:
+                from scripts import inference as inf
+                cfg = configure.load_configuration()
+                size_label = configure.normalize_image_size(str(image_size or configure.DEFAULT_IMAGE_SIZE))
+                w, h = configure.image_size_pixels(size_label)
+                cfg["imagegen_width"] = w
+                cfg["imagegen_height"] = h
+                cfg["imagegen_size"] = size_label
+                cfg["imagegen_frequency"] = configure.normalize_image_frequency(image_frequency)
+                cfg["imagegen_steps"] = int(steps or configure.DEFAULT_STEPS)
+                cfg["imagegen_cfg_scale"] = float(cfg_scale or configure.DEFAULT_CFG)
+                cfg["style"] = style or cfg.get("style") or configure.STYLE_LIGHT
+                cfg["negative_prompt"] = (
+                    (negative_prompt if negative_prompt is not None else configure.DEFAULT_NEGATIVE_PROMPT) or ""
+                )
+                label = (song_name or "").strip()
+                from scripts.inference import ensure_project_dir, _slugify_folder_name, ensure_project_assessment
+                slug = _slugify_folder_name(label, fallback="")
+                resume = ""
+                if active_session_id:
+                    root = configure.get_output_dir()
+                    cand = Path(root) / str(active_session_id)
+                    if cand.is_dir():
+                        resume = str(cand)
+                project_dir = ensure_project_dir(slug, sequential=False, resume_path=resume or None)
+                configure.APP_STATE["current_project_folder"] = str(project_dir)
+                configure.APP_STATE["active_session_id"] = project_dir.name
+                has_ref = bool(ref_image and Path(ref_image).is_file())
+                analysis = ensure_project_assessment(
+                    project_dir,
+                    lyrics or "",
+                    cfg,
+                    has_character_ref=has_ref,
+                    progress_callback=_cb,
+                    force=True,
+                )
+                result_holder["r"] = {
+                    "success": bool(analysis and (analysis.get("overall") or analysis.get("sections"))),
+                    "message": "Assessment complete — edit in Details Mode → Assessment, then Save if you change it.",
+                    "project_folder": str(project_dir),
+                    "session_id": project_dir.name,
+                    "assessment_text": (project_dir / "analysis.txt").read_text(encoding="utf-8", errors="replace")
+                    if (project_dir / "analysis.txt").is_file() else "",
+                }
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                result_holder["r"] = {"success": False, "message": f"Assessment failed: {e}"}
+            finally:
+                try:
+                    prog_q.put(None)
+                except Exception:
+                    pass
+
+        th = threading.Thread(target=_worker, daemon=True)
+        th.start()
+        while True:
+            try:
+                item = prog_q.get(timeout=0.25)
+            except queue.Empty:
+                if not th.is_alive():
+                    break
+                continue
+            if item is None:
+                break
+            status_line, frac, info = item
+            yield (
+                status_line, *run_btns, active_session_id or "",
+            ) + tuple(_all_gallery_updates()) + tuple(_refresh_session_slots(active_session_id or ""))
+
+        th.join(timeout=5)
+        configure.APP_STATE["generating"] = False
+        configure.APP_STATE["session_status"] = "stopped"
+        r = result_holder.get("r") or {}
+        msg = r.get("message") or "Assessment done."
+        sid = r.get("session_id") or configure.APP_STATE.get("active_session_id") or active_session_id or ""
+        if r.get("success") and r.get("project_folder"):
+            configure.APP_STATE["current_project_folder"] = r["project_folder"]
+            configure.update_generation({"last_project_folder": r["project_folder"]})
+        idle_btns = _action_btn_updates(lyrics, song_name, running=False)
+        # Switch user toward Assessment panel content by returning status; assessment_view
+        # is not in _run_outputs — they can open Details Mode → Assessment.
+        yield (
+            msg, *idle_btns, sid,
+        ) + tuple(_all_gallery_updates()) + tuple(_refresh_session_slots(sid))
+
+    _gen["assess_btn"].click(
+        _run_assessment,
+        inputs=_shared_gen_inputs(),
+        outputs=_run_outputs,
+    )
 
     _gen["cover_btn"].click(
         _run_cover,
@@ -2309,6 +2596,7 @@ def _wire_create_events(status_box: gr.Textbox) -> None:
 
     _regen_outputs = [
         status_box,
+        _gen["assess_btn"],
         _gen["cover_btn"],
         _gen["theme_btn"],
         _gen["run_btn"],
