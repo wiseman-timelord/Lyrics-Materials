@@ -171,6 +171,8 @@ def main() -> None:
         str(configure.get_data_dir()),
         str(configure.get_output_dir()),
         str(configure.get_models_dir()),
+        # Placeholder thumbnails (thumbnails_no_image / _qued_for_generation / _generating)
+        str(configure.get_images_dir()),
     ]
     # head: tiny marker so we can confirm custom scripts load in WebEngine console
     _server_app, local_url, _share_url = blocks_app.launch(
