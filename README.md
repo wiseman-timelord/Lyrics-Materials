@@ -1,11 +1,11 @@
 # Lyrics-Materials
-Status: Alpha
+Status: Beta - Basic functioning is done, now developing and improving.
 
 ### Description:
 It will convert lines of lyrics into AI generated images, one for each line. The idea is one could arrange these in a movie editor, and fade in/out between sections of images, to make simple music videos. One could also take the line of lyrics and the generated images, and feed that into AI video generator to make clips, that could then be assembled.
 
 ### Media:
-- Early version, somewhat working...
+- Early version, somewhat working (v0.01)...
 ![Generation_Page](https://github.com/wiseman-timelord/Lyrics-Materials/blob/main/media/Generation_Page.jpg)
 
 ### Features:
