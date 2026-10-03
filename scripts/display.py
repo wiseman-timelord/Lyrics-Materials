@@ -1060,143 +1060,157 @@ def _build_create_tab() -> None:
                 size="sm",
             )
 
-        # ── Right: main generation controls ─────────────────────────────
+        # ── Right: main generation controls (single column + Details Mode) ──
         with gr.Column(scale=4, elem_id="gen-main-col"):
-            with gr.Row():
-                with gr.Column(scale=1):
-                    gr.Markdown("### Project settings")
-                    with gr.Row():
-                        _gen["style"] = gr.Dropdown(
-                            label="Visual Style",
-                            choices=configure.STYLE_CHOICES,
-                            value=initial_style,
-                            info="Influences prompt templates for still generation.",
-                        )
-                    gr.Markdown(
-                        "### Generation Options\n"
-                        "Still size, image frequency preset (**C**over / **T**heme / **L**yrics-per-line), "
-                        "and sampling. Default steps **8** (better eyes / detail on Flux.2)."
-                    )
-                    _g0 = _gcfg()
-                    _init_size = configure.image_size_label_from_wh(
-                        int(_g0.get("imagegen_width") or configure.DEFAULT_WIDTH),
-                        int(_g0.get("imagegen_height") or configure.DEFAULT_HEIGHT),
-                    )
-                    if _g0.get("imagegen_size"):
-                        _init_size = configure.normalize_image_size(str(_g0.get("imagegen_size")))
-                    _init_freq = configure.normalize_image_frequency(
-                        _g0.get("imagegen_frequency") or configure.DEFAULT_IMAGE_FREQUENCY
-                    )
-                    with gr.Row():
-                        _gen["image_size"] = gr.Dropdown(
-                            label="Image size",
-                            choices=configure.IMAGE_SIZE_CHOICES,
-                            value=_init_size,
-                            info="Output still dimensions (width × height).",
-                        )
-                        _gen["image_frequency"] = gr.Dropdown(
-                            label="Image Frequency",
-                            choices=configure.IMAGE_FREQUENCY_CHOICES,
-                            value=_init_freq,
-                            info="C = Cover count · T = Theme (ambient) count · L = stills per lyric line (L2/L3 progressive).",
-                        )
-                    with gr.Row():
-                        _gen["steps"] = gr.Slider(
-                            label="Steps",
-                            minimum=1,
-                            maximum=20,
-                            step=1,
-                            value=int(_g0.get("imagegen_steps") or configure.DEFAULT_STEPS),
-                        )
-                        _gen["cfg"] = gr.Slider(
-                            label="CFG",
-                            minimum=0.5,
-                            maximum=4.0,
-                            step=0.1,
-                            value=float(_g0.get("imagegen_cfg_scale") or configure.DEFAULT_CFG),
-                        )
+            _g0 = _gcfg()
+            _init_size = configure.image_size_label_from_wh(
+                int(_g0.get("imagegen_width") or configure.DEFAULT_WIDTH),
+                int(_g0.get("imagegen_height") or configure.DEFAULT_HEIGHT),
+            )
+            if _g0.get("imagegen_size"):
+                _init_size = configure.normalize_image_size(str(_g0.get("imagegen_size")))
+            _init_freq = configure.normalize_image_frequency(
+                _g0.get("imagegen_frequency") or configure.DEFAULT_IMAGE_FREQUENCY
+            )
 
-                    gr.Markdown(
-                        "### Reference Character (optional)\n"
-                        "The central character(s) in the images, without it only the lyrics/title are used. "
-                        "Hair Style and Outfit Worn are injected into character-bearing prompts when not None."
-                    )
-                    with gr.Row():
-                        _gen["ref_image"] = gr.Textbox(
-                            label="Reference Character (optional)",
-                            value=initial_ref,
-                            interactive=True,
-                            scale=4,
-                        )
-                        _gen["browse_ref"] = gr.Button("Browse", scale=1, min_width=90)
-                    with gr.Row():
-                        _gen["hair_style"] = gr.Dropdown(
-                            label="Hair Style",
-                            choices=configure.HAIR_STYLE_CHOICES,
-                            value=initial_hair,
-                            info="Locked hair description for character consistency. None = omit.",
-                        )
-                        _gen["outfit_worn"] = gr.Dropdown(
-                            label="Outfit Worn",
-                            choices=configure.OUTFIT_CHOICES,
-                            value=initial_outfit,
-                            info="Locked wardrobe for character consistency. None = omit.",
-                        )
+            _gen["details_mode"] = gr.Radio(
+                label="Details Mode",
+                choices=[
+                    "Project Settings",
+                    "Name and Lyrics",
+                    "Song Assessment",
+                    "Reference Character",
+                ],
+                value="Name and Lyrics",
+                elem_id="details-mode-radio",
+            )
 
-                with gr.Column(scale=1, elem_id="gen-details-col"):
-                    _gen["details_mode"] = gr.Radio(
-                        label="Details Mode",
-                        choices=["Name and Lyrics", "Song Assessment"],
-                        value="Name and Lyrics",
-                        elem_id="details-mode-radio",
+            # 1 — Project Settings
+            with gr.Column(visible=False, elem_id="details-project-settings") as _details_settings:
+                gr.Markdown(
+                    "### Project Settings\n"
+                    "Visual style, still size, image frequency "
+                    "(**C**over / **T**heme / **L**yrics-per-line), and sampling. "
+                    "Default steps **8** (better eyes / detail on Flux.2)."
+                )
+                with gr.Row():
+                    _gen["style"] = gr.Dropdown(
+                        label="Visual Style",
+                        choices=configure.STYLE_CHOICES,
+                        value=initial_style,
+                        info="Influences prompt templates for still generation.",
                     )
-                    with gr.Column(visible=True, elem_id="details-name-lyrics") as _details_nl:
-                        _gen["song_name"] = gr.Textbox(
-                            label="Song name (required — becomes output folder)",
-                            value=initial_song,
-                            placeholder="e.g. Midnight Drive",
-                            elem_id="song-name-box",
-                        )
-                        _gen["lyrics"] = gr.Textbox(
-                            label="Song Lyrics (one image per non-empty line)",
-                            lines=12,
-                            max_lines=12,
-                            placeholder="Paste full lyrics here…\n[Intro]\nFirst line…\n…",
-                            value=initial_lyrics,
-                            elem_id="lyrics-box",
-                        )
-                        _gen["negative_prompt"] = gr.Textbox(
-                            label="Negative prompt (saved with the project)",
-                            lines=2,
-                            max_lines=4,
-                            value=getattr(configure, "DEFAULT_NEGATIVE_PROMPT", ""),
-                            placeholder="Things to avoid in every still…",
-                            elem_id="negative-prompt-box",
-                        )
-                    _gen["details_name_lyrics"] = _details_nl
-                    with gr.Column(visible=False, elem_id="details-assessment") as _details_assess:
-                        _gen["assessment_view"] = gr.Textbox(
-                            label="Song assessment (editable — Save before generating)",
-                            lines=18,
-                            max_lines=24,
-                            value="",
-                            interactive=True,
-                            elem_id="assessment-view-box",
-                        )
-                        with gr.Row():
-                            _gen["save_assessment_btn"] = gr.Button(
-                                "Save Assessment",
-                                variant="primary",
-                                size="sm",
-                                elem_id="save-assessment-btn",
-                            )
-                            _gen["reload_assessment_btn"] = gr.Button(
-                                "Reload Assessment",
-                                variant="secondary",
-                                size="sm",
-                                elem_id="reload-assessment-btn",
-                            )
-                    _gen["details_assessment"] = _details_assess
+                with gr.Row():
+                    _gen["image_size"] = gr.Dropdown(
+                        label="Image size",
+                        choices=configure.IMAGE_SIZE_CHOICES,
+                        value=_init_size,
+                        info="Output still dimensions (width × height).",
+                    )
+                    _gen["image_frequency"] = gr.Dropdown(
+                        label="Image Frequency",
+                        choices=configure.IMAGE_FREQUENCY_CHOICES,
+                        value=_init_freq,
+                        info="C = Cover count · T = Theme (ambient) count · L = stills per lyric line (L2/L3 progressive).",
+                    )
+                with gr.Row():
+                    _gen["steps"] = gr.Slider(
+                        label="Steps",
+                        minimum=1,
+                        maximum=20,
+                        step=1,
+                        value=int(_g0.get("imagegen_steps") or configure.DEFAULT_STEPS),
+                    )
+                    _gen["cfg"] = gr.Slider(
+                        label="CFG",
+                        minimum=0.5,
+                        maximum=4.0,
+                        step=0.1,
+                        value=float(_g0.get("imagegen_cfg_scale") or configure.DEFAULT_CFG),
+                    )
+            _gen["details_project_settings"] = _details_settings
+
+            # 2 — Name and Lyrics
+            with gr.Column(visible=True, elem_id="details-name-lyrics") as _details_nl:
+                _gen["song_name"] = gr.Textbox(
+                    label="Song name (required — becomes output folder)",
+                    value=initial_song,
+                    placeholder="e.g. Midnight Drive",
+                    elem_id="song-name-box",
+                )
+                _gen["lyrics"] = gr.Textbox(
+                    label="Song Lyrics (one image per non-empty line)",
+                    lines=12,
+                    max_lines=12,
+                    placeholder="Paste full lyrics here…\n[Intro]\nFirst line…\n…",
+                    value=initial_lyrics,
+                    elem_id="lyrics-box",
+                )
+                _gen["negative_prompt"] = gr.Textbox(
+                    label="Negative prompt (saved with the project)",
+                    lines=2,
+                    max_lines=4,
+                    value=getattr(configure, "DEFAULT_NEGATIVE_PROMPT", ""),
+                    placeholder="Things to avoid in every still…",
+                    elem_id="negative-prompt-box",
+                )
+            _gen["details_name_lyrics"] = _details_nl
+
+            # 3 — Song Assessment
+            with gr.Column(visible=False, elem_id="details-assessment") as _details_assess:
+                _gen["assessment_view"] = gr.Textbox(
+                    label="Song assessment (editable — Save before generating)",
+                    lines=18,
+                    max_lines=24,
+                    value="",
+                    interactive=True,
+                    elem_id="assessment-view-box",
+                )
+                with gr.Row():
+                    _gen["save_assessment_btn"] = gr.Button(
+                        "Save Assessment",
+                        variant="primary",
+                        size="sm",
+                        elem_id="save-assessment-btn",
+                    )
+                    _gen["reload_assessment_btn"] = gr.Button(
+                        "Reload Assessment",
+                        variant="secondary",
+                        size="sm",
+                        elem_id="reload-assessment-btn",
+                    )
+            _gen["details_assessment"] = _details_assess
+
+            # 4 — Reference Character
+            with gr.Column(visible=False, elem_id="details-reference") as _details_ref:
+                gr.Markdown(
+                    "### Reference Character (optional)\n"
+                    "Central character likeness for stills that feature the subject. "
+                    "Hair Style and Outfit Worn are injected only into character-bearing prompts when not None."
+                )
+                with gr.Row():
+                    _gen["ref_image"] = gr.Textbox(
+                        label="Reference image path",
+                        value=initial_ref,
+                        interactive=True,
+                        scale=4,
+                    )
+                    _gen["browse_ref"] = gr.Button("Browse", scale=1, min_width=90)
+                with gr.Row():
+                    _gen["hair_style"] = gr.Dropdown(
+                        label="Hair Style",
+                        choices=configure.HAIR_STYLE_CHOICES,
+                        value=initial_hair,
+                        info="Locked hair description for character consistency. None = omit.",
+                    )
+                with gr.Row():
+                    _gen["outfit_worn"] = gr.Dropdown(
+                        label="Outfit Worn",
+                        choices=configure.OUTFIT_CHOICES,
+                        value=initial_outfit,
+                        info="Locked wardrobe for character consistency. None = omit.",
+                    )
+            _gen["details_reference"] = _details_ref
 
             with gr.Row(elem_id="gen-action-row"):
                 _models_ok0 = _models_configured()
@@ -1388,14 +1402,18 @@ def _wire_create_events(status_box) -> None:
     _gen["browse_ref"].click(_browse_ref, outputs=_gen["ref_image"])
 
     def _details_mode_change(mode: str):
-        show_nl = (mode or "").strip() == "Name and Lyrics"
-        assess = ""
-        if not show_nl:
-            assess = _load_assessment_text()
+        m = (mode or "").strip()
+        show_settings = m == "Project Settings"
+        show_nl = m == "Name and Lyrics"
+        show_assess = m == "Song Assessment"
+        show_ref = m == "Reference Character"
+        assess = _load_assessment_text() if show_assess else gr.update()
         return (
+            gr.update(visible=show_settings),
             gr.update(visible=show_nl),
-            gr.update(visible=not show_nl),
-            gr.update(value=assess) if not show_nl else gr.update(),
+            gr.update(visible=show_assess),
+            gr.update(visible=show_ref),
+            gr.update(value=assess) if show_assess else gr.update(),
         )
 
     if _gen.get("details_mode") is not None:
@@ -1403,8 +1421,10 @@ def _wire_create_events(status_box) -> None:
             _details_mode_change,
             inputs=[_gen["details_mode"]],
             outputs=[
+                _gen["details_project_settings"],
                 _gen["details_name_lyrics"],
                 _gen["details_assessment"],
+                _gen["details_reference"],
                 _gen["assessment_view"],
             ],
         )
@@ -2450,7 +2470,8 @@ def _wire_create_events(status_box) -> None:
         """Run song assessment only; enable generate buttons when analysis.txt is saved."""
         idle_btns = _action_btn_updates(lyrics, song_name, running=False)
         run_btns = _action_btn_updates(lyrics, song_name, running=True)
-        _no_mode = (gr.update(), gr.update(), gr.update(), gr.update())
+        # Pad Details Mode outputs: mode, settings, nl, assess, ref, assess_view
+        _no_mode = (gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update())
         if not _models_configured():
             yield (
                 _status_plain("Configure Encoder + Diffuser models on the Configuration tab first."),
@@ -2576,15 +2597,19 @@ def _wire_create_events(status_box) -> None:
             _status_plain(msg), *idle_btns, sid,
         ) + tuple(_all_gallery_updates()) + tuple(_refresh_session_slots(sid)) + (
             gr.update(value="Song Assessment"),
-            gr.update(visible=False),
-            gr.update(visible=True),
+            gr.update(visible=False),  # Project Settings
+            gr.update(visible=False),  # Name and Lyrics
+            gr.update(visible=True),   # Song Assessment
+            gr.update(visible=False),  # Reference Character
             gr.update(value=assess_text),
         )
 
     _assess_outputs = _run_outputs + [
         _gen["details_mode"],
+        _gen["details_project_settings"],
         _gen["details_name_lyrics"],
         _gen["details_assessment"],
+        _gen["details_reference"],
         _gen["assessment_view"],
     ]
 
