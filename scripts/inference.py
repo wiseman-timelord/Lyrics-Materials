@@ -121,6 +121,51 @@ def clear_cancel_state() -> None:
     configure.APP_STATE["generation_output_paths"] = []
 
 
+def clear_project_image_assets(project_dir: Path) -> int:
+    """
+    Delete Cover / Theme / Lyrics stills from a project folder.
+    Keeps analysis.txt, lyrics.txt, prompts.txt, character_map.txt, session.json, reference.*.
+    Returns number of files removed.
+    """
+    if not project_dir or not Path(project_dir).is_dir():
+        return 0
+    removed = 0
+    root = Path(project_dir)
+    for p in list(root.iterdir()):
+        if not p.is_file():
+            continue
+        low = p.name.lower()
+        suf = p.suffix.lower()
+        if suf not in (".png", ".jpg", ".jpeg", ".webp"):
+            continue
+        if low.startswith("reference"):
+            continue
+        # cover-*, theme-*, numbered stills (001-… / 001 - …)
+        if (
+            low.startswith("cover")
+            or low.startswith("theme")
+            or re.match(r"^\d{3}", p.name)
+        ):
+            try:
+                p.unlink()
+                removed += 1
+            except OSError:
+                pass
+    # Also clear theme_prompts so theme phase rewrites them
+    for name in ("theme_prompts.txt", "prompts.txt"):
+        tp = root / name
+        if tp.is_file():
+            try:
+                tp.unlink()
+            except OSError:
+                pass
+    configure.APP_STATE["generation_output_paths"] = []
+    configure.APP_STATE["thumb_expected_count"] = 0
+    configure.APP_STATE["thumb_generating_line"] = None
+    configure.APP_STATE["thumb_queued_lines"] = []
+    return removed
+
+
 def kill_active_processes() -> int:
     procs = list(configure.APP_STATE.get("active_processes") or [])
     killed = 0
@@ -625,6 +670,89 @@ def _strip_think_tags(text: str) -> str:
     return _THINK_TAG_RE.sub("", text or "").strip()
 
 
+def _wrap_qwen_chat(user_prompt: str, system: str = "") -> str:
+    """
+    Wrap a plain instruction in Qwen2/Qwen3 ChatML so the model continues as
+    the assistant instead of treating the long prompt as already-complete text
+    and emitting EOS immediately (the blank-assessment failure mode).
+    """
+    sys = (system or (
+        "You are a precise music-video art director. "
+        "Follow the user's structure exactly. Write real sentences, not keyword lists."
+    )).strip()
+    user = (user_prompt or "").strip()
+    # End with the assistant header so generation starts in the right role
+    return (
+        f"<|im_start|>system\n{sys}<|im_end|>\n"
+        f"<|im_start|>user\n{user}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
+
+
+def _is_llama_log_line(line: str) -> bool:
+    """True for llama.cpp verbose / ggml noise that is not model text."""
+    s = (line or "").strip()
+    if not s:
+        return True
+    low = s.lower()
+    # Common log / telemetry prefixes
+    if any(
+        low.startswith(p) for p in (
+            "llama_", "ggml_", "gguf_", "print_info", "load_", "llm_",
+            "slot ", "sampler", "sampling:", "prompt eval", "eval time",
+            "total time", "system info", "build:", "log_", "common_",
+            "init:", "loading", "offloaded", "graph splits", "kv cache",
+            "llama_model", "llama_context", "llama_new", "clip_",
+        )
+    ):
+        return True
+    if re.match(r"^[\d./\s%|]+$", s):  # progress bars / pure numbers
+        return True
+    if "tokens/s" in low or "ms/token" in low or "t/s" in low:
+        return True
+    if low in ("[end of text]", "end of text", "<|endoftext|>", "<|im_end|>"):
+        return True
+    return False
+
+
+def _extract_completion_text(raw_out: str, prompt: str) -> str:
+    """
+    Pull the model answer out of interleaved verbose logs + optional prompt echo.
+    Prefers text from the first OVERALL: / CHARACTER: heading onward.
+    """
+    text = (raw_out or "").replace("\r\n", "\n").replace("\r", "\n")
+    # Drop pure log lines
+    kept: List[str] = []
+    for line in text.split("\n"):
+        if _is_llama_log_line(line):
+            continue
+        kept.append(line)
+    text = "\n".join(kept).strip()
+
+    # Strip prompt echo (full or ChatML-wrapped)
+    for candidate in (prompt, prompt.strip()):
+        if candidate and text.startswith(candidate):
+            text = text[len(candidate):].strip()
+            break
+    # Strip leading ChatML debris
+    for marker in ("<|im_start|>assistant", "<|im_start|>assistant\n"):
+        if marker in text:
+            text = text.split(marker, 1)[-1].strip()
+    for end in ("<|im_end|>", "<|endoftext|>", "[end of text]"):
+        if end in text:
+            text = text.split(end)[0].strip()
+
+    # Prefer structured assessment body
+    upper = text.upper()
+    for key in ("OVERALL:", "OVERALL\n", "CHARACTER:", "SECTIONS:"):
+        idx = upper.find(key)
+        if idx >= 0:
+            text = text[idx:].strip()
+            break
+
+    return _strip_think_tags(text)
+
+
 def _run_llama_completion(
     prompt: str,
     cfg: Dict[str, Any],
@@ -645,17 +773,21 @@ def _run_llama_completion(
 
     backend_args = _llama_backend_args(cfg, role, model_path=str(model_path))
     threads = _worker_thread_count(cfg)
+    # Qwen Instruct/Thinking need ChatML; plain -p often yields immediate EOS
+    chat_prompt = _wrap_qwen_chat(prompt)
     cmd = [
         str(exe),
         "-m", str(model_path),
-        "-p", prompt,
+        "-p", chat_prompt,
         "-n", str(int(n_predict)),
         "-c", str(int(ctx_size)),
         "-t", str(threads),
         "--temp", str(temperature),
         # Verbose logging so the console shows load / offload / generate progress
         "-lv", "1",
-        "-no-cnv",  # one-shot completion, no conversation mode
+        "-no-cnv",  # one-shot; template already applied in -p
+        # Discourage instant stop after a long prompt
+        "--repeat-penalty", "1.1",
     ]
     cmd.extend(backend_args)
 
@@ -722,18 +854,19 @@ def _run_llama_completion(
                 continue
             text_line = line.rstrip("\n\r")
             out_lines.append(text_line)
-            # Always echo load / device / error lines; lightly throttle pure token spam
+            # Echo load / device / error lines only — not the full prompt dump
             low = text_line.lower()
             interesting = any(
                 k in low for k in (
                     "load", "layer", "vram", "vulkan", "cuda", "ggml", "offload",
-                    "device", "error", "fail", "warn", "model", "tensor", "mmap",
-                    "mlock", "backend", "rpc", "sampling", "prompt", "eval time",
-                    "tokens", "system info", "build:", "print_info",
+                    "device", "error", "fail", "warn", "tensor", "mmap",
+                    "mlock", "backend", "rpc", "sampling", "eval time",
+                    "tokens/s", "system info", "build:", "print_info",
+                    "model size", "model loaded", "offloaded",
                 )
             )
-            if interesting or (not model_loaded_announced):
-                print(f"[llama] {text_line}", flush=True)
+            if interesting:
+                print(f"[llama] {text_line[:200]}", flush=True)
             _maybe_announce(text_line)
         # Drain remainder
         rest = proc.stdout.read() if proc.stdout else ""
@@ -776,14 +909,22 @@ def _run_llama_completion(
             )
         print(f"[llama] warning: exit={proc.returncode} but output present — continuing", flush=True)
 
-    text = raw_out.strip()
-    stripped_prompt = prompt.strip()
-    if stripped_prompt and text.startswith(stripped_prompt):
-        text = text[len(stripped_prompt):]
-
-    # llama verbose logs interleave with the completion — try to keep the
-    # last non-log paragraph as the answer when possible
-    cleaned = _strip_think_tags(text)
+    cleaned = _extract_completion_text(raw_out, chat_prompt)
+    if len(cleaned) < 40:
+        # Fallback: try extracting against the unwrapped prompt too
+        cleaned2 = _extract_completion_text(raw_out, prompt)
+        if len(cleaned2) > len(cleaned):
+            cleaned = cleaned2
+    if len(cleaned) < 40:
+        print(
+            f"[llama] WARNING: completion very short ({len(cleaned)} chars). "
+            f"raw stdout was {len(raw_out)} chars.",
+            flush=True,
+        )
+        # Last resort: keep any non-log tail from raw_out
+        tail = _extract_completion_text(raw_out, "")
+        if len(tail) > len(cleaned):
+            cleaned = tail
     return cleaned
 
 
@@ -1279,15 +1420,20 @@ def analyze_song_and_sections(
 
     if has_character_ref:
         char_instr = (
-            "CHARACTER: 1-2 sentences on the central character (look, attitude). "
-            "A reference photo will be used on some stills.\n"
+            "CHARACTER: 1-2 sentences on the central character's face, body type, age range, "
+            "expression, and attitude/energy only.\n"
+            "Do NOT mention clothing, outfit, wardrobe, gear, uniform, or hair style — "
+            "those are chosen later in the GUI and must not appear here.\n"
+            "A reference photo will supply likeness on some stills.\n"
             "CHARACTER_MAP: one line per section as  SectionName: none|silhouette|partial|full\n"
             "  none=no character, silhouette=outline only, partial=partly visible, full=clearly present.\n"
             "  Vary presence across the song when the lyrics support it.\n"
         )
     else:
         char_instr = (
-            "CHARACTER: 1-2 sentences inventing a central figure from the lyrics, or 'none specified'.\n"
+            "CHARACTER: 1-2 sentences inventing a central figure from the lyrics "
+            "(face, body type, attitude only), or 'none specified'.\n"
+            "Do NOT mention clothing, outfit, wardrobe, gear, or hair style.\n"
             "CHARACTER_MAP: one line per section as  SectionName: none|silhouette|partial|full\n"
         )
 
@@ -1298,19 +1444,22 @@ def analyze_song_and_sections(
     prompt = (
         "You are a music-video art director. Write structured production notes.\n"
         "Reply with ONLY the four blocks below. Use real sentences, not keyword lists.\n"
-        "Do NOT output slash-separated adjectives. Do NOT repeat the same phrase.\n\n"
+        "Do NOT output slash-separated adjectives. Do NOT repeat the same phrase.\n"
+        "Never describe the character's clothing or hair style in any block — "
+        "wardrobe and hair are configured separately in the UI.\n\n"
         "OVERALL:\n"
         "Write 3-5 complete sentences: narrative arc, mood, setting, colour palette, visual tone.\n\n"
         f"{char_instr}\n"
         "SECTIONS:\n"
         f"For EACH of these section names write one non-empty paragraph (2-3 sentences): {labels_list}.\n"
-        "Label each paragraph with the exact section name followed by a colon.\n\n"
+        "Label each paragraph with the exact section name followed by a colon.\n"
+        "Focus on camera, setting, action, and mood — not wardrobe.\n\n"
         "Example format (replace with content about THIS song):\n"
         "OVERALL:\n"
         "A lone figure moves through cold neon streets at night. The palette is steel blue and amber. "
         "The tone is defiant and intimate, not chaotic.\n\n"
         "CHARACTER:\n"
-        "A sharp-eyed nonconformist in muted techwear, calm and deliberate.\n\n"
+        "A sharp-eyed nonconformist with a calm, deliberate presence; mid-adult, lean build, unreadable expression.\n\n"
         "CHARACTER_MAP:\n"
         f"{ex0}: silhouette\n"
         f"{ex1}: full\n\n"
@@ -1335,6 +1484,41 @@ def analyze_song_and_sections(
     if raw:
         print(f"[analysis] raw reply length = {len(raw)} chars "
               f"(n_predict budget {_ANALYSIS_PREDICT})", flush=True)
+
+    # Retry once with a shorter, stricter prompt if the first pass was empty/stub
+    if len((raw or "").strip()) < 80 or not re.search(r"(?i)\bOVERALL\b", raw or ""):
+        print("[analysis] first pass empty/stub — retrying with compact prompt…", flush=True)
+        retry_prompt = (
+            "Write production notes for this song. Start with OVERALL:\n\n"
+            f"Sections: {labels_list}\n\n"
+            f"Lyrics:\n{lyrics[:3500]}\n\n"
+            "Required format:\n"
+            "OVERALL:\n"
+            "<3-5 sentences on narrative, mood, setting, colour>\n\n"
+            "CHARACTER:\n"
+            "<1-2 sentences on face, body type, attitude only — "
+            "NO clothing, outfit, wardrobe, or hair style>\n\n"
+            "CHARACTER_MAP:\n"
+            + "\n".join(f"{lab}: partial" for lab in (section_labels or ["Body"]))
+            + "\n\nSECTIONS:\n"
+            + "\n".join(
+                f"{lab}: <2 sentences of visual notes for this section>"
+                for lab in (section_labels or ["Body"])
+            )
+            + "\n\nFill every section with real content about these lyrics. "
+            "Do not leave blanks. Never describe clothing or hair."
+        )
+        try:
+            raw2 = _run_llama_completion(
+                retry_prompt, cfg, role=role, model_path=model_path,
+                n_predict=_ANALYSIS_PREDICT, ctx_size=_ANALYSIS_CTX,
+                temperature=0.5, timeout=_TIMEOUT_ANALYSIS,
+            )
+            if len((raw2 or "").strip()) > len((raw or "").strip()):
+                raw = raw2
+                print(f"[analysis] retry reply length = {len(raw)} chars", flush=True)
+        except Exception as e:
+            print(f"[analysis] retry failed: {e}", flush=True)
 
     overall = ""
     character = ""
@@ -1952,6 +2136,14 @@ def _sanitize_visual_prompt(prompt: str, lyric: str, style_hint: str = "") -> st
     return p
 
 
+def _appearance_bit(cfg: Dict[str, Any]) -> str:
+    """Hair + outfit clause from cfg when set (empty when both None)."""
+    return configure.subject_appearance_clause(
+        cfg.get("hair_style") or "",
+        cfg.get("outfit_worn") or "",
+    )
+
+
 def _sd_attempt_succeeded(out: str, rc: int, found: Optional[Path]) -> bool:
     """True when sd-cli actually produced a still — never retry in that case."""
     if found is not None and found.is_file() and found.stat().st_size > 64:
@@ -2027,9 +2219,12 @@ def generate_images_from_prompts(
     if width < 64 or height < 64:
         width, height = configure.DEFAULT_WIDTH, configure.DEFAULT_HEIGHT
     steps = int(cfg.get("imagegen_steps") or configure.DEFAULT_STEPS)
-    freq = configure.normalize_image_frequency(cfg.get("imagegen_frequency") or 1)
-    seq_hints = configure.image_frequency_hints(freq)
-    print(f"[images] frequency = {freq} still(s) per lyric line", flush=True)
+    freq_label = configure.normalize_image_frequency(
+        cfg.get("imagegen_frequency") or configure.DEFAULT_IMAGE_FREQUENCY
+    )
+    freq = configure.frequency_lyrics_per_line(freq_label)
+    seq_hints = configure.image_frequency_hints(freq_label)
+    print(f"[images] frequency = {freq_label} → {freq} still(s) per lyric line", flush=True)
     cfg_scale = float(cfg.get("imagegen_cfg_scale") or configure.DEFAULT_CFG)
     sampler = str(cfg.get("imagegen_sampling") or configure.DEFAULT_SAMPLER)
     seed_val = cfg.get("imagegen_seed")
@@ -2054,7 +2249,12 @@ def generate_images_from_prompts(
 
     style_hint = str(cfg.get("prompt_template") or cfg.get("style") or "")
 
-    def _build_sd_cmd(prompt_text: str, dest: Path, attach_ref: bool) -> List[str]:
+    def _build_sd_cmd(
+        prompt_text: str,
+        dest: Path,
+        attach_ref: bool,
+        ref_override: str = "",
+    ) -> List[str]:
         c = [
             str(exe),
             "--diffusion-model", str(model_path),
@@ -2079,8 +2279,12 @@ def generate_images_from_prompts(
                     break
         except Exception:
             pass
-        if attach_ref and has_ref:
-            c.extend(["-r", str(ref_path)])
+        # Progressive L2/L3: prior still as -r; else character reference photo
+        r_use = (ref_override or "").strip()
+        if not r_use and attach_ref and has_ref:
+            r_use = str(ref_path)
+        if r_use and Path(r_use).is_file():
+            c.extend(["-r", str(r_use)])
         neg = (cfg.get("negative_prompt") or "").strip()
         if neg:
             c.extend(["-n", neg])
@@ -2103,8 +2307,9 @@ def generate_images_from_prompts(
         pres = "none"
         if presence_per_line and i < len(presence_per_line):
             pres = (presence_per_line[i] or "none").lower()
-        use_ref = bool(has_ref and pres != "none")
+        use_char_ref = bool(has_ref and pres != "none")
         clean_prompt = _sanitize_visual_prompt(prompt, line_text, style_hint)
+        prev_still: Optional[Path] = None  # progressive chain within this line
 
         for var in range(1, freq + 1):
             if is_cancel_requested():
@@ -2122,6 +2327,7 @@ def generate_images_from_prompts(
                 if dest.exists() and dest not in images:
                     images.append(dest)
                     configure.APP_STATE.setdefault("generation_output_paths", []).append(str(dest))
+                prev_still = dest if dest.exists() else prev_still
                 print(
                     f"[images] Lyrics Line {line_no}/{total} var {var}/{freq}: SKIP (exists)",
                     flush=True,
@@ -2149,23 +2355,49 @@ def generate_images_from_prompts(
 
             hint = seq_hints[var - 1] if var - 1 < len(seq_hints) else ""
             seq_bit = f" [Sequence {var}/{freq}: {hint}.]" if hint else ""
-            if use_ref:
+
+            # Progressive chain: var>1 uses previous still as visual reference
+            progressive = bool(freq > 1 and var > 1 and prev_still and prev_still.is_file())
+            ref_override = ""
+            attach_ref = False
+            if progressive:
+                ref_override = str(prev_still)
+                attach_ref = True
+                appear = _appearance_bit(cfg) if use_char_ref else ""
+                appear_bit = f" {appear}" if appear else ""
                 final_prompt = (
-                    f"{clean_prompt}{seq_bit} "
+                    f"{clean_prompt}{seq_bit}{appear_bit} "
+                    f"This is beat {var} of {freq} in a continuous moment. "
+                    "Evolve naturally from the provided reference still "
+                    "(same scene, characters, hair, outfit, and lighting language) — "
+                    "show the next beat of the action, not a new unrelated shot."
+                )
+                print(
+                    f"[images] progressive ref ← {prev_still.name} (var {var}/{freq})",
+                    flush=True,
+                )
+            elif use_char_ref:
+                attach_ref = True
+                appear = _appearance_bit(cfg)
+                appear_bit = f" {appear}" if appear else ""
+                final_prompt = (
+                    f"{clean_prompt}{seq_bit}{appear_bit} "
                     f"[Reference character presence: {pres}. "
                     "Match the provided reference image likeness accordingly.]"
                 )
-                if var == 1:
-                    print(f"[images] ref image ATTACHED ({pres})", flush=True)
+                print(f"[images] character ref ATTACHED ({pres})"
+                      f"{' +appearance' if appear else ''}", flush=True)
             else:
-                if has_ref and var == 1:
-                    print("[images] ref image OMITTED (presence=none)", flush=True)
+                if has_ref:
+                    print("[images] character ref OMITTED (presence=none)", flush=True)
                 final_prompt = (
                     f"{clean_prompt}{seq_bit} "
                     "[Do not depict any specific real person from a reference photo.]"
                 ) if has_ref else f"{clean_prompt}{seq_bit}"
 
-            cmd = _build_sd_cmd(final_prompt, img_path, attach_ref=use_ref)
+            cmd = _build_sd_cmd(
+                final_prompt, img_path, attach_ref=attach_ref, ref_override=ref_override,
+            )
             t_img = time.time()
             configure.APP_STATE["image_gen_t0"] = t_img
             out, rc = _run_sd_cli_once(cmd, exe)
@@ -2176,17 +2408,17 @@ def generate_images_from_prompts(
             if not _sd_attempt_succeeded(out, rc, found):
                 log_path = _write_sd_failure_log(
                     out_dir, line_no,
-                    f"var{var} with reference" if use_ref else f"var{var} no reference",
+                    f"var{var} with reference" if attach_ref else f"var{var} no reference",
                     cmd, out, rc,
                 )
 
-            if not _sd_attempt_succeeded(out, rc, found) and use_ref:
+            if not _sd_attempt_succeeded(out, rc, found) and attach_ref:
                 print(
                     f"[images] line {line_no} var {var} failed with ref — "
                     "retrying without reference…",
                     flush=True,
                 )
-                cmd2 = _build_sd_cmd(final_prompt, img_path, attach_ref=False)
+                cmd2 = _build_sd_cmd(final_prompt, img_path, attach_ref=False, ref_override="")
                 out, rc = _run_sd_cli_once(cmd2, exe)
                 found = _find_still_for_line(
                     out_dir, line_no, variant=var if freq > 1 else None,
@@ -2203,12 +2435,13 @@ def generate_images_from_prompts(
                 raise RuntimeError(
                     f"Image generation failed for line {line_no}/{total} "
                     f"variant {var}/{freq}"
-                    f" ({'reference attached' if use_ref else 'no reference'}).\n"
+                    f" ({'reference attached' if attach_ref else 'no reference'}).\n"
                     f"{detail}{where}"
                 )
 
             dest = found if found is not None else img_path
             images.append(dest)
+            prev_still = dest  # feed next variant in this line
             configure.APP_STATE.setdefault("generation_output_paths", []).append(str(dest))
             already.add(line_no)
             existing_vars.add(var)
@@ -2217,6 +2450,8 @@ def generate_images_from_prompts(
             except OSError:
                 sz = 0
             img_elapsed = time.time() - t_img
+            # Always record the *actual* duration so the next still's estimate
+            # reflects recent speed — never pad to match a previous slow run.
             record_last_image_gen_seconds(img_elapsed)
             configure.APP_STATE["image_gen_t0"] = None
             print(
@@ -2224,6 +2459,12 @@ def generate_images_from_prompts(
                 flush=True,
             )
             work_done += 1
+            if progress_callback:
+                progress_callback(
+                    f"Image {line_no}/{total} [{var}/{freq}] done ({img_elapsed:.0f}s)",
+                    0.35 + 0.55 * (work_done / work_total),
+                    {"phase": "images", "line": line_no, "total": total},
+                )
             try:
                 configure.save_session_meta(out_dir, {
                     "phase": "images",
@@ -2427,8 +2668,10 @@ def regenerate_single_still(
     style_hint = str(cfg.get("prompt_template") or cfg.get("style") or "")
     clean_prompt = _sanitize_visual_prompt(prompt, line_text, style_hint)
     if use_ref:
+        appear = _appearance_bit(cfg)
+        appear_bit = f" {appear}" if appear else ""
         final_prompt = (
-            f"{clean_prompt} "
+            f"{clean_prompt}{appear_bit} "
             f"[Reference character presence: {pres}. "
             "Match the provided reference image likeness accordingly.]"
         )
@@ -2666,12 +2909,12 @@ def generate_theme_prompts_from_assessment(
     progress_callback: Optional[Callable] = None,
 ) -> List[str]:
     """
-    Thinking/Encoder writes `n_prompts` distinct visual prompts from the OVERALL
-    assessment (and character notes). These drive Theme Thumbnails.
+    Thinking/Encoder writes `n_prompts` distinct ambient worldspace prompts
+    from the OVERALL assessment only. Theme stills are fillers for non-lyric
+    stretches — no central character, no reference photo.
     """
     n = max(1, min(8, int(n_prompts or 1)))
     overall = (analysis.get("overall") or "").strip()
-    character = (analysis.get("character_guidance") or "").strip()
     sections = analysis.get("sections") or {}
     sec_blob = ""
     if isinstance(sections, dict):
@@ -2685,7 +2928,6 @@ def generate_theme_prompts_from_assessment(
 
     model_path, role = _resolve_prompt_model(cfg)
     if not model_path:
-        # Fallback: split overall into n crude prompts
         base = overall or sec_blob
         return [base] * n
 
@@ -2693,20 +2935,19 @@ def generate_theme_prompts_from_assessment(
     title = (song_name or "").replace("_", " ").strip()
     prompt = (
         "You are writing visual prompts for music-video THEME stills "
-        "(not per-lyric line stills).\n"
+        "(ambient fillers between lyric lines — NOT character or story action).\n"
         f"Song title: {title or '(untitled)'}\n"
         f"Visual style preference: {style}\n\n"
-        "ASSESSMENT — OVERALL:\n"
+        "ASSESSMENT — OVERALL (primary source):\n"
         f"{overall or '(none)'}\n\n"
-        "ASSESSMENT — CHARACTER:\n"
-        f"{character or '(none)'}\n\n"
-        "ASSESSMENT — SECTIONS (context only):\n"
+        "ASSESSMENT — SECTIONS (mood/setting context only):\n"
         f"{sec_blob or '(none)'}\n\n"
         f"Write exactly {n} distinct image prompts, numbered 1..{n}.\n"
         "Each prompt must:\n"
-        "- Be a single dense paragraph of visual description for one theme still\n"
-        "- Explore a different aspect of the OVERALL assessment "
-        "(mood, setting, character, symbol, colour, scale, …)\n"
+        "- Be a single dense paragraph of visual description for one ambient still\n"
+        "- Explore a different aspect of the OVERALL worldspace "
+        "(setting, atmosphere, weather, architecture, landscape, colour, scale, time of day)\n"
+        "- Contain NO central character, NO face close-up, NO specific person\n"
         "- Work as a Flux image prompt (concrete subjects, lighting, composition)\n"
         "- Contain NO quotes around the whole prompt, NO 'Prompt:' labels, NO lyrics\n"
         "- Avoid readable text, logos, watermarks in the image\n\n"
@@ -2924,6 +3165,75 @@ def _generate_named_still(
     return dest_final
 
 
+def classify_cover_strategy(
+    title: str,
+    analysis: Dict[str, Any],
+    cfg: Dict[str, Any],
+    has_ref: bool,
+) -> str:
+    """
+    Decide cover composition strategy:
+      'character' — song title is about the central subject/character;
+                    use CHARACTER assessment + reference image when available.
+      'world'     — title is atmospheric / setting / abstract;
+                    use OVERALL worldspace only, no character / no reference image.
+
+    Uses the Thinking (or Encoder) model when available; falls back to a
+    lightweight heuristic from assessment text.
+    """
+    title = (title or "").strip()
+    overall = (analysis.get("overall") or "").strip()
+    character = (analysis.get("character_guidance") or "").strip()
+    if not has_ref or not character or character.lower() in ("none specified", "none", "n/a", ""):
+        return "world"
+
+    model_path, role = _resolve_prompt_model(cfg)
+    if model_path and Path(model_path).is_file():
+        prompt = (
+            "Classify this song title for album cover art strategy.\n\n"
+            f"Song title: {title}\n\n"
+            f"OVERALL assessment (world/mood):\n{overall[:600] or '(none)'}\n\n"
+            f"CHARACTER guidance:\n{character[:400] or '(none)'}\n\n"
+            "Answer with EXACTLY one word:\n"
+            "  CHARACTER — if the title primarily names, describes, or is about "
+            "the central character/subject (a person, named figure, or the story's protagonist).\n"
+            "  WORLD — if the title is mainly about setting, mood, abstract idea, "
+            "place, time, or atmosphere, not a specific character.\n\n"
+            "Reply with only CHARACTER or WORLD."
+        )
+        try:
+            raw = _run_llama_completion(
+                prompt, cfg, role, model_path,
+                n_predict=16,
+                ctx_size=2048,
+                temperature=0.1,
+                timeout=90.0,
+            )
+            ans = (raw or "").strip().upper()
+            first = ans.replace(".", " ").split()[0] if ans.split() else ""
+            if first.startswith("CHAR"):
+                print(f"[cover] strategy=CHARACTER (LLM: {ans[:40]!r})", flush=True)
+                return "character"
+            if first.startswith("WORLD") or "ATMOSPHER" in ans or "SETTING" in ans:
+                print(f"[cover] strategy=WORLD (LLM: {ans[:40]!r})", flush=True)
+                return "world"
+            print(f"[cover] strategy=WORLD (LLM default from {ans[:40]!r})", flush=True)
+            return "world"
+        except Exception as e:
+            print(f"[cover] LLM classify failed ({e}); using heuristic", flush=True)
+
+    # Heuristic: title words overlapping character notes → character
+    title_tokens = set(re.findall(r"[a-z0-9]+", title.lower()))
+    char_tokens = set(re.findall(r"[a-z0-9]+", character.lower()[:500]))
+    stop = {"the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with", "my", "your", "is", "it"}
+    overlap = (title_tokens - stop) & (char_tokens - stop)
+    if overlap:
+        print(f"[cover] strategy=CHARACTER (heuristic overlap={overlap})", flush=True)
+        return "character"
+    print("[cover] strategy=WORLD (heuristic, no title/character overlap)", flush=True)
+    return "world"
+
+
 def generate_cover_image(
     song_name: str,
     cfg: Dict[str, Any],
@@ -2933,8 +3243,9 @@ def generate_cover_image(
     lyrics: str = "",
 ) -> Dict[str, Any]:
     """
-    Cover still from song name; runs song assessment first when lyrics are present.
-    Writes cover-<slug>.png into the project folder.
+    Cover stills from song title + assessment strategy:
+      CHARACTER → title + character guidance + reference image
+      WORLD     → title + OVERALL worldspace only (no character, no ref)
     """
     clear_cancel_state()
     configure.APP_STATE["session_status"] = "running"
@@ -3014,58 +3325,107 @@ def generate_cover_image(
         title = (song_name or label).replace("_", " ").strip() or label
         overall = (analysis.get("overall") or "").strip()
         character = (analysis.get("character_guidance") or "").strip()
-        assess_bit = ""
-        if overall:
-            assess_bit += f" Assessment mood/setting: {overall[:420]}"
-        if character:
-            assess_bit += f" Central character: {character[:220]}"
-        cover_prompt = (
-            f"{style_hint.replace('{line}', title)} "
-            f"Album-style cover art for the song titled '{title}'. "
-            "Bold, iconic composition suitable as a single cover image. "
-            "No readable text, no logos, no watermarks."
-            f"{assess_bit}"
+        strategy = classify_cover_strategy(title, analysis, cfg, has_ref)
+        use_char_ref = strategy == "character" and has_ref
+        appear = _appearance_bit(cfg) if strategy == "character" else ""
+        if strategy == "character":
+            assess_bit = ""
+            if character:
+                assess_bit += f" Central character: {character[:280]}"
+            if overall:
+                assess_bit += f" Mood context: {overall[:200]}"
+            if appear:
+                assess_bit += f" {appear}"
+            cover_prompt = (
+                f"{style_hint.replace('{line}', title)} "
+                f"Album-style cover art for the song titled '{title}'. "
+                "Feature the central character as the focal subject. "
+                "Bold, iconic composition suitable as a single cover image. "
+                "No readable text, no logos, no watermarks."
+                f"{assess_bit}"
+            )
+        else:
+            # Worldspace cover — no character, no reference image
+            assess_bit = f" World and mood: {overall[:480]}" if overall else ""
+            cover_prompt = (
+                f"{style_hint.replace('{line}', title)} "
+                f"Album-style cover art for the song titled '{title}'. "
+                "Depict the song's world, setting, and atmosphere — "
+                "not a specific character portrait. "
+                "Bold, iconic composition suitable as a single cover image. "
+                "No readable text, no logos, no watermarks."
+                f"{assess_bit}"
+            )
+        print(
+            f"[cover] strategy={strategy}  attach_ref={use_char_ref}  "
+            f"title={title!r}  appearance={'yes' if appear else 'no'}",
+            flush=True,
         )
         if progress_callback:
-            progress_callback(f"Cover for '{title}'", 0.2, {"phase": "cover"})
+            progress_callback(f"Cover for '{title}' ({strategy})", 0.2, {"phase": "cover"})
 
         phase_barrier("cover image")
         slug = _ascii_line_slug(title, max_len=40) or "song"
-        # Accumulate: never overwrite prior covers — next free cover-NN-…
-        idx = 1
-        while True:
-            dest = project_dir / f"cover-{idx:02d}-{slug}.png"
-            if not dest.exists():
-                break
-            idx += 1
-            if idx > 999:
-                dest = project_dir / f"cover-{int(time.time())}-{slug}.png"
-                break
-        if progress_callback:
-            progress_callback(
-                "Generating cover still…",
-                0.45,
-                {"phase": "cover", "line": 1, "total": 1},
-            )
-        out = _generate_named_still(
-            dest, cover_prompt, cfg,
-            reference_image=reference_image if has_ref else "",
-            attach_ref=has_ref,
+        target_n = configure.frequency_cover_count(
+            cfg.get("imagegen_frequency") or configure.DEFAULT_IMAGE_FREQUENCY
         )
+        # Count existing covers so "Complete" only fills the remainder
+        existing_covers = sorted(project_dir.glob("cover-*.png"))
+        have_n = len(existing_covers)
+        cover_n = max(0, target_n - have_n) if have_n > 0 else target_n
+        if cover_n <= 0:
+            # Already at/above target — still allow one fresh when user explicitly re-runs
+            cover_n = target_n
+            have_n = 0  # treat as full regenerate batch starting at next free index
+        images: List[Path] = []
+        # Find next free index so re-runs accumulate rather than overwrite
+        start_idx = 1
+        while (project_dir / f"cover-{start_idx:02d}-{slug}.png").exists():
+            start_idx += 1
+            if start_idx > 999:
+                break
+        print(f"[cover] target={target_n} have={have_n} generating={cover_n}", flush=True)
+        for i in range(cover_n):
+            if is_cancel_requested():
+                break
+            idx = start_idx + i
+            dest = project_dir / f"cover-{idx:02d}-{slug}.png"
+            if progress_callback:
+                progress_callback(
+                    f"Generating cover still {i + 1}/{cover_n}…",
+                    0.35 + 0.55 * (i / max(cover_n, 1)),
+                    {"phase": "cover", "line": i + 1, "total": cover_n},
+                )
+            print(f"[cover] {i + 1}/{cover_n} — {dest.name}", flush=True)
+            var_bit = (
+                f" Variation {i + 1} of {cover_n}: alternate angle or crop emphasis."
+                if cover_n > 1 else ""
+            )
+            out = _generate_named_still(
+                dest, cover_prompt + var_bit, cfg,
+                reference_image=reference_image if use_char_ref else "",
+                attach_ref=use_char_ref,
+            )
+            images.append(out)
         elapsed = time.time() - t0
         configure.APP_STATE["session_status"] = "stopped"
         result.update(
-            success=True,
-            image_count=1,
-            image_paths=[str(out)],
-            message=f"Cover image ready: {out.name} ({int(elapsed)}s)",
+            success=bool(images),
+            image_count=len(images),
+            image_paths=[str(p) for p in images],
+            message=(
+                f"Cover image(s) ready: {len(images)} still(s) in {project_dir.name}/ "
+                f"({int(elapsed)}s)"
+                if images else "No cover images were generated."
+            ),
             elapsed_seconds=round(elapsed, 1),
             session_id=project_dir.name,
             project_folder=str(project_dir),
         )
         if progress_callback:
             progress_callback(result["message"], 1.0, {"phase": "done"})
-        maybe_bleep_done()
+        if images:
+            maybe_bleep_done()
     except Exception as e:
         traceback.print_exc()
         result["message"] = f"Cover generation error: {e}"
@@ -3181,13 +3541,26 @@ def generate_theme_images(
             configure.APP_STATE["session_status"] = "stopped"
             return result
 
-        freq = configure.normalize_image_frequency(cfg.get("imagegen_frequency") or 1)
-        style = str(cfg.get("style") or configure.STYLE_LIGHT)
-        print(f"[theme] frequency = {freq} theme still(s) from OVERALL assessment", flush=True)
+        freq_label = configure.normalize_image_frequency(
+            cfg.get("imagegen_frequency") or configure.DEFAULT_IMAGE_FREQUENCY
+        )
+        target_theme = configure.frequency_theme_count(freq_label)
+        existing_theme_n = len(list(project_dir.glob("theme-*.png")))
+        # Complete: only fill remaining up to target; full run when none exist
+        if existing_theme_n > 0 and existing_theme_n < target_theme:
+            theme_n = target_theme - existing_theme_n
+        else:
+            theme_n = target_theme
+        style = str(cfg.get("style") or configure.STYLE_DEFAULT)
+        print(
+            f"[theme] frequency = {freq_label} → target={target_theme} "
+            f"have={existing_theme_n} generating={theme_n}",
+            flush=True,
+        )
 
         # Phase 1b: thinking model writes frequency theme prompts from OVERALL
         theme_prompts = generate_theme_prompts_from_assessment(
-            analysis, cfg, freq,
+            analysis, cfg, theme_n,
             song_name=song_name or label,
             progress_callback=progress_callback,
         )
@@ -3229,10 +3602,16 @@ def generate_theme_images(
             if is_cancel_requested():
                 break
             style_tpl = configure.prompt_template_for_style(style)
-            # Style template uses {line}; fill with a short theme label
-            filled = style_tpl.replace("{line}", f"theme {i + 1}: {(analysis.get('overall') or '')[:120]}")
-            final = f"{filled} {tprompt}".strip()
-            attach = bool(has_ref and i == 0)  # optional ref on first theme only
+            # Theme = ambient worldspace fillers (no character, no reference image)
+            filled = style_tpl.replace(
+                "{line}",
+                f"ambient theme {i + 1}: {(analysis.get('overall') or '')[:120]}",
+            )
+            final = (
+                f"{filled} {tprompt} "
+                "Atmospheric worldspace still with no central character portrait, "
+                "no specific person, no face close-up — environment and mood only."
+            ).strip()
             theme_no = base_idx + i + 1
             fname = (
                 f"theme-{theme_no:02d}-"
@@ -3245,12 +3624,12 @@ def generate_theme_images(
                     0.35 + 0.55 * (i / max(total, 1)),
                     {"phase": "theme", "line": i + 1, "total": total},
                 )
-            print(f"[theme] {i + 1}/{total} — {fname}", flush=True)
+            print(f"[theme] {i + 1}/{total} — {fname} (no character / no ref)", flush=True)
             try:
                 out = _generate_named_still(
                     dest, final, cfg,
-                    reference_image=reference_image if has_ref else "",
-                    attach_ref=attach,
+                    reference_image="",
+                    attach_ref=False,
                 )
                 images.append(out)
             except Exception as e:

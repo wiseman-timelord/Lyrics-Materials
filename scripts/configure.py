@@ -384,6 +384,129 @@ STYLE_LIGHT = "light and bright"
 STYLE_DARK = "dark and gloomy"
 STYLE_COLORFUL = "colorful and wild"
 STYLE_CHOICES = [STYLE_LIGHT, STYLE_DARK, STYLE_COLORFUL]
+# Default visual style for new projects / fresh installs
+STYLE_DEFAULT = STYLE_DARK
+
+# ---------------------------------------------------------------------------
+# Hair style (subject token — optional via None)
+# Injected into character-bearing prompts when not None.
+# ---------------------------------------------------------------------------
+HAIR_STYLE_SHORT = "Short"
+HAIR_STYLE_NATURAL = "Natural"
+HAIR_STYLE_BOB = "Bob"
+HAIR_STYLE_PONY = "Pony"
+HAIR_STYLE_PIGTAIL = "PigTail"
+HAIR_STYLE_DUDE = "Dude"
+HAIR_STYLE_NONE = "None"
+ALL_HAIR_STYLES = "All Styles"
+HAIR_STYLE_CHOICES = [
+    HAIR_STYLE_SHORT, HAIR_STYLE_NATURAL, HAIR_STYLE_DUDE, HAIR_STYLE_BOB,
+    HAIR_STYLE_PONY, HAIR_STYLE_PIGTAIL, HAIR_STYLE_NONE,
+    ALL_HAIR_STYLES,
+]
+HAIR_STYLE_CONCRETE = [
+    HAIR_STYLE_SHORT, HAIR_STYLE_NATURAL, HAIR_STYLE_DUDE, HAIR_STYLE_BOB,
+    HAIR_STYLE_PONY, HAIR_STYLE_PIGTAIL, HAIR_STYLE_NONE,
+]
+HAIR_STYLE_DEFAULT = HAIR_STYLE_NONE
+HAIR_STYLE_TOKEN = "<hair_style>"
+HAIR_STYLE_WORDS = {
+    HAIR_STYLE_SHORT: "cut short and even, three inches length",
+    HAIR_STYLE_NATURAL: "worn naturally, 3 inches length all over",
+    HAIR_STYLE_DUDE: "center parting, shaggy and shoulder length",
+    HAIR_STYLE_BOB: "styled in a short bob with a fringe",
+    HAIR_STYLE_PONY: "tied-back in a shoulder-length high-ponytail",
+    HAIR_STYLE_PIGTAIL: "tied-back in 2 shoulder-length high-pigtails",
+    HAIR_STYLE_NONE: "",
+}
+
+
+def normalize_hair_style(value: str) -> str:
+    v = (value or "").strip()
+    if v in HAIR_STYLE_CHOICES:
+        return v
+    for c in HAIR_STYLE_CONCRETE:
+        if c.lower() == v.lower():
+            return c
+    return HAIR_STYLE_DEFAULT
+
+
+def hair_style_phrase(value: str) -> str:
+    """Concrete hair description, or empty when None / All Styles."""
+    key = normalize_hair_style(value)
+    if key in (HAIR_STYLE_NONE, ALL_HAIR_STYLES):
+        return ""
+    return (HAIR_STYLE_WORDS.get(key) or "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Outfit worn (subject token — optional via None)
+# ---------------------------------------------------------------------------
+OUTFIT_SMART_SUIT = "Smart Suit"
+OUTFIT_SMART_CASUAL_MALE = "Casual_Male"
+OUTFIT_SMART_CASUAL_FEMALE = "Casual_Female"
+OUTFIT_JOGGERS = "Joggers"
+OUTFIT_ROCKER = "Rocker"
+OUTFIT_SKIMPY = "Skimpy"
+OUTFIT_UNDIES = "Undies"
+OUTFIT_NONE = "None"
+ALL_OUTFITS = "All Outfits"
+OUTFIT_CHOICES = [
+    OUTFIT_SMART_SUIT, OUTFIT_SMART_CASUAL_MALE, OUTFIT_SMART_CASUAL_FEMALE,
+    OUTFIT_JOGGERS, OUTFIT_ROCKER, OUTFIT_SKIMPY, OUTFIT_UNDIES, OUTFIT_NONE,
+    ALL_OUTFITS,
+]
+OUTFIT_CONCRETE = [
+    OUTFIT_SMART_SUIT, OUTFIT_SMART_CASUAL_MALE, OUTFIT_SMART_CASUAL_FEMALE,
+    OUTFIT_JOGGERS, OUTFIT_ROCKER, OUTFIT_SKIMPY, OUTFIT_UNDIES, OUTFIT_NONE,
+]
+OUTFIT_DEFAULT = OUTFIT_NONE
+OUTFIT_TOKEN = "<outfit_worn>"
+OUTFIT_WORDS = {
+    OUTFIT_SMART_SUIT: "smart-suit with unbuttoned-shirt outfit",
+    OUTFIT_SMART_CASUAL_MALE: "black-tshirt with grey-smart-jeans outfit",
+    OUTFIT_SMART_CASUAL_FEMALE: "black-tshirt with grey-short-skirt outfit",
+    OUTFIT_JOGGERS: "black-crop-top with grey-jogging-shorts outfit",
+    OUTFIT_ROCKER: "long-black-leather-coat with black shirt and grey-jeans outfit",
+    OUTFIT_SKIMPY: "skimpy-revealing version of same outfit",
+    OUTFIT_UNDIES: "underwear only",
+    OUTFIT_NONE: "",
+}
+
+
+def normalize_outfit(value: str) -> str:
+    v = (value or "").strip()
+    if v in OUTFIT_CHOICES:
+        return v
+    for c in OUTFIT_CONCRETE:
+        if c.lower() == v.lower():
+            return c
+    return OUTFIT_DEFAULT
+
+
+def outfit_phrase(value: str) -> str:
+    """Concrete outfit noun-phrase, or empty when None / All Outfits."""
+    key = normalize_outfit(value)
+    if key in (OUTFIT_NONE, ALL_OUTFITS):
+        return ""
+    return (OUTFIT_WORDS.get(key) or "").strip()
+
+
+def subject_appearance_clause(hair: str = "", outfit: str = "") -> str:
+    """
+    Build an optional appearance clause for character-bearing prompts.
+    Empty strings are omitted so None leaves the prompt unchanged.
+    """
+    bits: List[str] = []
+    hp = hair_style_phrase(hair)
+    op = outfit_phrase(outfit)
+    if hp:
+        bits.append(f"hair {hp}")
+    if op:
+        bits.append(f"wearing a {op}")
+    if not bits:
+        return ""
+    return "Subject appearance: " + "; ".join(bits) + "."
 
 # Fade colours (RGB 0-255) used for intro/outro and lyric gaps
 STYLE_FADE_RGB = {
@@ -495,11 +618,33 @@ def image_size_label_from_wh(width: int, height: int) -> str:
 
 
 
-# Images per lyric line / assessment aspect (sequence variants)
-IMAGE_FREQUENCY_CHOICES = [1, 2, 3, 4]
-DEFAULT_IMAGE_FREQUENCY = 1
+# Image frequency presets: Cover / Theme / Lyrics-per-line
+# Labels shown in the Generation dropdown.
+#   C = cover stills · T = theme (ambient) stills · L = stills per lyric line
+IMAGE_FREQUENCY_CHOICES = [
+    "C1/T2/L1", "C2/T4/L1", "C3/T6/L1",
+    "C1/T2/L2", "C2/T4/L2", "C3/T6/L2",
+    "C1/T2/L3", "C2/T4/L3", "C3/T6/L3",
+]
+DEFAULT_IMAGE_FREQUENCY = "C1/T2/L1"
 
-# Framing hints when generating multiple stills for one line/aspect
+IMAGE_FREQUENCY_MAP = {
+    "C1/T2/L1": {"cover": 1, "theme": 2, "lyrics": 1},
+    "C2/T4/L1": {"cover": 2, "theme": 4, "lyrics": 1},
+    "C3/T6/L1": {"cover": 3, "theme": 6, "lyrics": 1},
+    "C1/T2/L2": {"cover": 1, "theme": 2, "lyrics": 2},
+    "C2/T4/L2": {"cover": 2, "theme": 4, "lyrics": 2},
+    "C3/T6/L2": {"cover": 3, "theme": 6, "lyrics": 2},
+    "C1/T2/L3": {"cover": 1, "theme": 2, "lyrics": 3},
+    "C2/T4/L3": {"cover": 2, "theme": 4, "lyrics": 3},
+    "C3/T6/L3": {"cover": 3, "theme": 6, "lyrics": 3},
+    # Legacy aliases from v1
+    "C1/T2/LX": {"cover": 1, "theme": 2, "lyrics": 1},
+    "C2/T4/LX": {"cover": 2, "theme": 4, "lyrics": 1},
+    "C3/T6/LX": {"cover": 3, "theme": 6, "lyrics": 1},
+}
+
+# Framing hints when generating multiple stills for one lyric line
 IMAGE_FREQUENCY_SEQUENCE = {
     1: [""],
     2: [
@@ -511,30 +656,64 @@ IMAGE_FREQUENCY_SEQUENCE = {
         "middle / peak of this moment",
         "end of this moment",
     ],
-    4: [
-        "establishing wide view of this moment",
-        "approach / build into the moment",
-        "peak of the moment",
-        "aftermath / trailing beat of the moment",
-    ],
 }
 
 
-def normalize_image_frequency(value) -> int:
+def normalize_image_frequency(value) -> str:
+    """Return a canonical frequency preset label (C1/T2/L1 …). Accepts legacy ints/LX."""
+    v = str(value or "").strip().upper().replace(" ", "")
+    # Normalise LX → L1 for lookup display
+    if v.endswith("/LX"):
+        v = v[:-2] + "L1"
+    if v in IMAGE_FREQUENCY_MAP and not v.endswith("/LX"):
+        # Prefer non-legacy key when both exist
+        if v in IMAGE_FREQUENCY_CHOICES:
+            return v
+    if v in IMAGE_FREQUENCY_MAP:
+        # Map legacy LX keys to L1 display labels
+        legacy = {
+            "C1/T2/LX": "C1/T2/L1",
+            "C2/T4/LX": "C2/T4/L1",
+            "C3/T6/LX": "C3/T6/L1",
+        }
+        return legacy.get(v, v if v in IMAGE_FREQUENCY_CHOICES else DEFAULT_IMAGE_FREQUENCY)
     try:
         n = int(value)
+        if n <= 1:
+            return "C1/T2/L1"
+        if n == 2:
+            return "C2/T4/L2"
+        return "C3/T6/L3"
     except (TypeError, ValueError):
-        return DEFAULT_IMAGE_FREQUENCY
-    if n not in IMAGE_FREQUENCY_CHOICES:
-        return DEFAULT_IMAGE_FREQUENCY
-    return n
+        pass
+    return DEFAULT_IMAGE_FREQUENCY
 
 
-def image_frequency_hints(freq: int) -> list:
-    """Ordered sequence framing strings for the given frequency (length == freq)."""
-    n = normalize_image_frequency(freq)
+def frequency_counts(value) -> Dict[str, int]:
+    """Return {'cover': N, 'theme': M, 'lyrics': K} for a preset or legacy value."""
+    key = normalize_image_frequency(value)
+    # Also try raw string for legacy map keys
+    raw = str(value or "").strip().upper().replace(" ", "")
+    src = IMAGE_FREQUENCY_MAP.get(key) or IMAGE_FREQUENCY_MAP.get(raw) or IMAGE_FREQUENCY_MAP[DEFAULT_IMAGE_FREQUENCY]
+    return dict(src)
+
+
+def frequency_cover_count(value) -> int:
+    return int(frequency_counts(value).get("cover", 1))
+
+
+def frequency_theme_count(value) -> int:
+    return int(frequency_counts(value).get("theme", 2))
+
+
+def frequency_lyrics_per_line(value) -> int:
+    return int(frequency_counts(value).get("lyrics", 1))
+
+
+def image_frequency_hints(freq) -> list:
+    """Ordered sequence framing strings for multi-variant lyric stills (length == lyrics-per-line)."""
+    n = frequency_lyrics_per_line(freq)
     hints = IMAGE_FREQUENCY_SEQUENCE.get(n) or IMAGE_FREQUENCY_SEQUENCE[1]
-    # Ensure exact length
     if len(hints) < n:
         hints = list(hints) + [""] * (n - len(hints))
     return list(hints[:n])
@@ -930,7 +1109,7 @@ PREFERENCES_KEYS = [
 
 def _default_preferences() -> Dict[str, Any]:
     return {
-        "style": STYLE_LIGHT,
+        "style": STYLE_DEFAULT,
         "video_format": VIDEO_MP4,
         "max_thumbnails": DEFAULT_MAX_THUMBNAILS,
         "input_thumbnail_size": DEFAULT_INPUT_THUMBNAIL,
@@ -1015,6 +1194,8 @@ GENERATION_KEYS = [
     "last_project_folder",
     "last_markers",
     "reference_image_path",
+    "hair_style",
+    "outfit_worn",
     "project_label",
     "last_image_gen_seconds",
 ]
@@ -1037,6 +1218,8 @@ def _default_generation() -> Dict[str, Any]:
         "last_project_folder": "",
         "last_markers": [],
         "reference_image_path": "",
+        "hair_style": HAIR_STYLE_DEFAULT,
+        "outfit_worn": OUTFIT_DEFAULT,
         "project_label": "",
         "last_image_gen_seconds": 0.0,
     }
