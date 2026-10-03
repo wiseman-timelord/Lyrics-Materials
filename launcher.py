@@ -40,6 +40,23 @@ SERVER_NAME = "127.0.0.1"
 SERVER_PORT = 7867
 
 
+def _program_icon_path() -> Path | None:
+    """Resolve images/program_icon.ico next to the app root (batch / launcher)."""
+    candidates = [
+        _PROJECT_ROOT / "images" / "program_icon.ico",
+        _PROJECT_ROOT / "Images" / "program_icon.ico",
+        _PROJECT_ROOT / "program_icon.ico",
+        Path.cwd() / "images" / "program_icon.ico",
+    ]
+    for c in candidates:
+        try:
+            if c.is_file():
+                return c.resolve()
+        except OSError:
+            continue
+    return None
+
+
 def _print_banner() -> None:
     cpu = configure.get_cpu_info()
     vk = configure.get_vulkan_info()
@@ -87,6 +104,15 @@ class AppWindow(QMainWindow):
         self._on_close = on_close
         self._closed_once = False
         self.setWindowTitle(APP_TITLE)
+        icon_path = _program_icon_path()
+        if icon_path is not None:
+            icon = QIcon(str(icon_path))
+            self.setWindowIcon(icon)
+            # Taskbar / window chrome (Windows uses this with AppUserModelID)
+            QApplication.instance().setWindowIcon(icon)
+            print(f"  Window icon : {icon_path}")
+        else:
+            print("  Window icon : images/program_icon.ico not found (using default)")
         self._apply_saved_geometry(geometry)
         self.view = QWebEngineView(self)
         self.view.setPage(_QuietPage(self.view))
@@ -163,19 +189,19 @@ def main() -> None:
     blocks_app, _css, _js, _head_script = display.build_app()
 
     import warnings
+    import os
     warnings.filterwarnings("ignore", message=".*HTTP_422_UNPROCESSABLE_ENTITY.*")
+    # Quiet Gradio analytics; avoid share-link pressure when localhost probe is flaky
+    os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
 
     # Gradio only serves files under cwd / temp / allowed_paths.
-    # Preview audio is staged under data/temp_audio/; allow that explicitly.
     _allowed = [
         str(configure.get_data_dir()),
         str(configure.get_output_dir()),
         str(configure.get_models_dir()),
-        # Placeholder thumbnails (thumbnails_no_image / _qued_for_generation / _generating)
         str(configure.get_images_dir()),
     ]
-    # head: tiny marker so we can confirm custom scripts load in WebEngine console
-    _server_app, local_url, _share_url = blocks_app.launch(
+    launch_kwargs = dict(
         server_name=SERVER_NAME,
         server_port=SERVER_PORT,
         share=False,
@@ -185,9 +211,25 @@ def main() -> None:
         theme=gr.themes.Soft(),
         css=_css,
         allowed_paths=_allowed,
-        js=_js,
-        head=_head_script,
     )
+    if _js:
+        launch_kwargs["js"] = _js
+    if _head_script:
+        launch_kwargs["head"] = _head_script
+
+    try:
+        _server_app, local_url, _share_url = blocks_app.launch(**launch_kwargs)
+    except ValueError as e:
+        # Gradio 6 sometimes raises a misleading "localhost not accessible" error
+        # when an internal startup fault occurs — retry once with an explicit URL root.
+        print(f"  WARNING: Gradio launch issue ({e})")
+        print("  Retrying launch…")
+        launch_kwargs["server_name"] = "127.0.0.1"
+        try:
+            _server_app, local_url, _share_url = blocks_app.launch(**launch_kwargs)
+        except Exception as e2:
+            print(f"ERROR: Gradio failed to start: {e2}")
+            raise
 
     if not _wait_for_server(SERVER_NAME, SERVER_PORT):
         print("ERROR: Gradio server did not come up in time.")

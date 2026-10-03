@@ -1157,6 +1157,84 @@ def _snapshot_session(
 # Song + section analysis (overall idea → section notes)
 # ---------------------------------------------------------------------------
 
+
+
+def _parse_labeled_section_notes(sec_blob: str, labels: List[str]) -> Dict[str, str]:
+    """
+    Line-based parse of SECTIONS block. More reliable than a single regex when
+    labels share prefixes (Chorus 1 / Chorus 4) or blank lines separate paragraphs.
+    """
+    notes: Dict[str, str] = {lab: "" for lab in labels}
+    if not sec_blob or not labels:
+        return notes
+    # Longest labels first so "Chorus 11" wins over "Chorus 1" if both exist
+    labels_sorted = sorted(labels, key=lambda s: len(s), reverse=True)
+    current: Optional[str] = None
+    buf: List[str] = []
+
+    def _flush():
+        nonlocal buf, current
+        if current is not None:
+            body = " ".join(x for x in buf if x).strip()
+            body = re.sub(r"\[end of text\]", "", body, flags=re.I).strip()
+            notes[current] = body
+        buf = []
+
+    for raw_line in sec_blob.splitlines():
+        line = raw_line.strip()
+        if not line:
+            if current is not None:
+                buf.append("")  # keep paragraph breaks as spaces later
+            continue
+        matched: Optional[str] = None
+        rest = ""
+        for lab in labels_sorted:
+            # "Chorus 4:" or "Chorus 4 -" at line start
+            m = re.match(
+                rf"^{re.escape(lab)}\s*[:.\-–—]\s*(.*)$",
+                line,
+                re.I,
+            )
+            if m:
+                matched = lab
+                rest = (m.group(1) or "").strip()
+                break
+            m2 = re.match(rf"^{re.escape(lab)}\s*$", line, re.I)
+            if m2:
+                matched = lab
+                rest = ""
+                break
+        if matched is not None:
+            _flush()
+            current = matched
+            if rest:
+                buf.append(rest)
+        elif current is not None:
+            buf.append(line)
+    _flush()
+    return notes
+
+
+def _looks_like_keyword_spam(text: str) -> bool:
+    """Detect slash-separated adjective loops / non-sentence model dumps."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if t.count("/") >= 8:
+        return True
+    # Same short token repeated many times
+    words = re.findall(r"[A-Za-z][A-Za-z\-']{2,}", t.lower())
+    if len(words) >= 20:
+        from collections import Counter
+        common = Counter(words).most_common(1)
+        if common and common[0][1] >= max(8, len(words) // 5):
+            return True
+    # Almost no sentence punctuation in a long blob
+    if len(t) > 200 and t.count(".") + t.count("!") + t.count("?") < 1:
+        return True
+    return False
+
+
 def analyze_song_and_sections(
     lyrics: str,
     parsed: List[Dict[str, Any]],
@@ -1197,56 +1275,58 @@ def analyze_song_and_sections(
         + ("…" if len(s["lines"]) > 3 else "")
         for s in sections
     ) or "(no section headers; treat as continuous Body)"
+    labels_list = ", ".join(section_labels) if section_labels else "Body"
 
     if has_character_ref:
-        char_block = (
-            "A reference photo of the CENTRAL CHARACTER will be attached to some "
-            "stills and deliberately omitted from others.\n"
-            "You MUST decide per section whether that character appears.\n\n"
-            "CHARACTER:\n"
-            "<1-2 sentences: who they are, look, attitude>\n\n"
-            "CHARACTER_MAP:\n"
-            "For EVERY section listed below, output exactly one line:\n"
-            "  SectionName: none|silhouette|partial|full\n"
-            "Rules:\n"
-            "  none       = environment / abstract / crowd only — NO central character\n"
-            "  silhouette = character present as shadow/outline only\n"
-            "  partial    = character partially visible\n"
-            "  full       = character clearly present and recognisable\n"
-            "Vary presence across the song when the lyrics support it "
-            "(e.g. intro abstract → choruses full → outro silhouette).\n"
+        char_instr = (
+            "CHARACTER: 1-2 sentences on the central character (look, attitude). "
+            "A reference photo will be used on some stills.\n"
+            "CHARACTER_MAP: one line per section as  SectionName: none|silhouette|partial|full\n"
+            "  none=no character, silhouette=outline only, partial=partly visible, full=clearly present.\n"
+            "  Vary presence across the song when the lyrics support it.\n"
         )
     else:
-        char_block = (
-            "CHARACTER:\n"
-            "<1-2 sentences on central figure(s) invented from the lyrics, or 'none specified'>\n\n"
-            "CHARACTER_MAP:\n"
-            "For EVERY section, one line: SectionName: none|silhouette|partial|full\n"
-            "(No reference photo is available — this still guides whether a figure appears.)\n"
+        char_instr = (
+            "CHARACTER: 1-2 sentences inventing a central figure from the lyrics, or 'none specified'.\n"
+            "CHARACTER_MAP: one line per section as  SectionName: none|silhouette|partial|full\n"
         )
 
+    # Rigid, example-led prompt — no trailing "Notes:" (models often free-associate after it)
+    example_labels = section_labels[:2] if section_labels else ["Intro", "Chorus 1"]
+    ex0 = example_labels[0]
+    ex1 = example_labels[1] if len(example_labels) > 1 else "Chorus 1"
     prompt = (
-        "You are a music-video art director preparing notes for still-image generation.\n"
-        "Read the full lyrics and the section list. Reply in this exact structure:\n\n"
+        "You are a music-video art director. Write structured production notes.\n"
+        "Reply with ONLY the four blocks below. Use real sentences, not keyword lists.\n"
+        "Do NOT output slash-separated adjectives. Do NOT repeat the same phrase.\n\n"
         "OVERALL:\n"
-        "<3-6 sentences: narrative arc, mood, setting, colour palette, visual tone of the whole song. "
-        "Be concrete and cinematic — this drives theme stills.>\n\n"
-        f"{char_block}\n"
+        "Write 3-5 complete sentences: narrative arc, mood, setting, colour palette, visual tone.\n\n"
+        f"{char_instr}\n"
         "SECTIONS:\n"
-        "For EVERY section listed below write one non-empty paragraph "
-        "(2-4 sentences) labelled exactly as given. Describe the visual approach, "
-        "camera energy, and how this section differs from the others. "
-        "Do NOT leave any section blank.\n\n"
+        f"For EACH of these section names write one non-empty paragraph (2-3 sentences): {labels_list}.\n"
+        "Label each paragraph with the exact section name followed by a colon.\n\n"
+        "Example format (replace with content about THIS song):\n"
+        "OVERALL:\n"
+        "A lone figure moves through cold neon streets at night. The palette is steel blue and amber. "
+        "The tone is defiant and intimate, not chaotic.\n\n"
+        "CHARACTER:\n"
+        "A sharp-eyed nonconformist in muted techwear, calm and deliberate.\n\n"
+        "CHARACTER_MAP:\n"
+        f"{ex0}: silhouette\n"
+        f"{ex1}: full\n\n"
+        "SECTIONS:\n"
+        f"{ex0}: Wide establishing shots of an anonymous crowd. The camera glides; the figure is barely present.\n"
+        f"{ex1}: Closer framing on the figure at the edge of a queue. Gestures are subtle, lighting harder.\n\n"
         f"Sections detected:\n{section_summary}\n\n"
-        f"Full lyrics:\n{lyrics[:6000]}\n\n"
-        "Notes:"
+        f"Full lyrics:\n{lyrics[:5000]}\n\n"
+        "Start your reply with the word OVERALL: and follow the structure exactly."
     )
 
     try:
         raw = _run_llama_completion(
             prompt, cfg, role=role, model_path=model_path,
             n_predict=_ANALYSIS_PREDICT, ctx_size=_ANALYSIS_CTX,
-            temperature=0.65, timeout=_TIMEOUT_ANALYSIS,
+            temperature=0.35, timeout=_TIMEOUT_ANALYSIS,
         )
     except Exception as e:
         print(f"[analysis] failed: {e}", flush=True)
@@ -1255,14 +1335,6 @@ def analyze_song_and_sections(
     if raw:
         print(f"[analysis] raw reply length = {len(raw)} chars "
               f"(n_predict budget {_ANALYSIS_PREDICT})", flush=True)
-        # Heuristic: cut off mid-sentence / missing SECTIONS tail
-        if "SECTIONS" in raw.upper():
-            tail = raw[raw.upper().rfind("SECTIONS"):]
-            if tail.rstrip().endswith((",", "—", "-", "…", "...")) or len(tail) < 80:
-                print("[analysis] WARNING: SECTIONS block looks truncated — "
-                      "consider higher n_predict if this persists", flush=True)
-        elif len(raw) > 100:
-            print("[analysis] WARNING: no SECTIONS heading in reply", flush=True)
 
     overall = ""
     character = ""
@@ -1270,6 +1342,7 @@ def analyze_song_and_sections(
     presence: Dict[str, str] = {}
 
     if raw:
+        # Prefer structured split; fall back to whole text only for overall if needed
         parts = re.split(r"(?i)\b(OVERALL|CHARACTER_MAP|CHARACTER|SECTIONS)\s*:", raw)
         current = None
         buf: List[str] = []
@@ -1286,52 +1359,61 @@ def analyze_song_and_sections(
         if current and buf:
             blocks[current] = "\n".join(buf).strip()
 
-        overall = blocks.get("OVERALL", raw[:400])
-        character = blocks.get("CHARACTER", "")
+        overall = blocks.get("OVERALL", "").strip()
+        character = blocks.get("CHARACTER", "").strip()
         sec_blob = blocks.get("SECTIONS", "")
         map_blob = blocks.get("CHARACTER_MAP", "")
 
+        if not overall:
+            # First paragraph before CHARACTER_MAP if model omitted heading
+            overall = (raw[:500] or "").strip()
+
+        # Reject slash-spam / looping keyword lists
+        if _looks_like_keyword_spam(overall):
+            print("[analysis] OVERALL looks like keyword spam — discarding", flush=True)
+            overall = ""
+        if _looks_like_keyword_spam(character):
+            character = ""
+
+        parsed_notes = _parse_labeled_section_notes(
+            sec_blob, [s["label"] for s in sections],
+        )
         for s in sections:
             lab = s["label"]
-            m = re.search(
-                rf"(?im)^{re.escape(lab)}\s*[:.\-]?\s*(.+?)(?=^(?:{'|'.join(re.escape(x['label']) for x in sections) if sections else 'NEVER'})\s*[:.\-]?|\Z)",
-                sec_blob,
-                re.DOTALL,
-            )
-            if m:
-                section_notes[lab] = m.group(1).strip()[:400]
+            note = (parsed_notes.get(lab) or "").strip()
+            if note and not _looks_like_keyword_spam(note):
+                section_notes[lab] = note
             else:
-                for line in sec_blob.splitlines():
-                    if lab.lower() in line.lower():
-                        section_notes[lab] = line.strip()[:400]
-                        break
-                section_notes.setdefault(lab, "")
+                section_notes[lab] = ""
+                if not note:
+                    print(f"[analysis] missing section notes for: {lab}", flush=True)
 
-            # Parse presence from CHARACTER_MAP
-            pm = re.search(
-                rf"(?im)^{re.escape(lab)}\s*[:.\-]\s*(none|silhouette|partial|full)\b",
-                map_blob,
-            )
-            if pm:
-                presence[lab] = pm.group(1).lower()
-            else:
-                # Fuzzy: any line with label + keyword
-                found = "full" if has_character_ref else "partial"
-                for line in map_blob.splitlines():
-                    if lab.lower() in line.lower():
-                        for kw in ("none", "silhouette", "partial", "full"):
-                            if re.search(rf"\b{kw}\b", line, re.I):
-                                found = kw
-                                break
-                        break
-                presence[lab] = found
+        for s in sections:
+            lab = s["label"]
+            found = "partial"
+            for line in map_blob.splitlines():
+                if re.match(
+                    rf"^{re.escape(lab)}\s*[:.\-–—]",
+                    line.strip(),
+                    re.I,
+                ):
+                    for kw in ("none", "silhouette", "partial", "full"):
+                        if re.search(rf"\b{kw}\b", line, re.I):
+                            found = kw
+                            break
+                    break
+            presence[lab] = found
+
+        if "SECTIONS" not in (raw or "").upper():
+            print("[analysis] WARNING: no SECTIONS heading in reply", flush=True)
+        filled = sum(1 for v in section_notes.values() if (v or "").strip())
+        print(f"[analysis] section notes filled: {filled}/{len(section_labels)}", flush=True)
 
     # Defaults for any section missing a map entry
     for s in sections:
         lab = s["label"]
         section_notes.setdefault(lab, "")
         if lab not in presence:
-            # Sensible defaults when the model skipped the map
             low = lab.lower()
             if any(k in low for k in ("intro", "outro", "fade")):
                 presence[lab] = "silhouette" if has_character_ref else "none"
@@ -1342,8 +1424,9 @@ def analyze_song_and_sections(
     for lab, val in presence.items():
         print(f"[analysis]   {lab}: {val}", flush=True)
 
+    # Do NOT invent a default OVERALL when the model failed — empty signals unusable
     return {
-        "overall": overall or "A music-driven visual narrative matching the lyrics' mood.",
+        "overall": overall,
         "sections": section_notes,
         "character_guidance": character,
         "character_presence": presence,
@@ -2084,6 +2167,7 @@ def generate_images_from_prompts(
 
             cmd = _build_sd_cmd(final_prompt, img_path, attach_ref=use_ref)
             t_img = time.time()
+            configure.APP_STATE["image_gen_t0"] = t_img
             out, rc = _run_sd_cli_once(cmd, exe)
             found = _find_still_for_line(
                 out_dir, line_no, variant=var if freq > 1 else None,
@@ -2134,6 +2218,7 @@ def generate_images_from_prompts(
                 sz = 0
             img_elapsed = time.time() - t_img
             record_last_image_gen_seconds(img_elapsed)
+            configure.APP_STATE["image_gen_t0"] = None
             print(
                 f"[images] saved {dest.name} ({sz} bytes) in {img_elapsed:.1f}s",
                 flush=True,
@@ -2151,6 +2236,84 @@ def generate_images_from_prompts(
 
 
     return images
+
+
+
+def regenerate_named_still(
+    kind: str,
+    path: str,
+    cfg: Dict[str, Any],
+    *,
+    song_name: str = "",
+    lyrics: str = "",
+    reference_image: str = "",
+    theme_index: int = 0,
+) -> Path:
+    """
+    Re-generate one cover or theme still in place (same filename).
+    kind: "cover" | "theme"
+    """
+    dest = Path(path)
+    if not dest.parent.is_dir():
+        raise RuntimeError(f"Project folder missing: {dest.parent}")
+    cfg = _build_cfg_for_imagegen(cfg)
+    has_ref = bool((reference_image or "").strip() and Path(reference_image).is_file())
+    project_dir = dest.parent
+    analysis = _load_analysis_from_disk(project_dir) or {}
+    style = str(cfg.get("style") or configure.STYLE_LIGHT)
+    style_hint = configure.prompt_template_for_style(style)
+    label = (song_name or project_dir.name or "song").strip()
+    title = label.replace("_", " ").strip() or label
+
+    if kind == "cover":
+        overall = (analysis.get("overall") or "").strip()
+        character = (analysis.get("character_guidance") or "").strip()
+        assess_bit = ""
+        if overall:
+            assess_bit += f" Assessment mood/setting: {overall[:420]}"
+        if character:
+            assess_bit += f" Central character: {character[:220]}"
+        prompt = (
+            f"{style_hint.replace('{line}', title)} "
+            f"Album-style cover art for the song titled '{title}'. "
+            "Bold, iconic composition suitable as a single cover image. "
+            "No readable text, no logos, no watermarks."
+            f"{assess_bit}"
+        )
+    else:
+        # Theme: prefer saved prompt line matching this file index
+        prompt = ""
+        prompts_file = project_dir / "theme_prompts.txt"
+        if prompts_file.is_file():
+            try:
+                lines = [
+                    ln.strip() for ln in prompts_file.read_text(encoding="utf-8").splitlines()
+                    if ln.strip() and not ln.strip().startswith("#")
+                ]
+                # theme_prompts.txt lines may be "1. prompt" or plain prompt
+                cleaned = []
+                for ln in lines:
+                    m = re.match(r"^\d+[\.)\-:]\s*(.+)$", ln)
+                    cleaned.append(m.group(1).strip() if m else ln)
+                if 0 <= theme_index < len(cleaned):
+                    prompt = cleaned[theme_index]
+            except OSError:
+                pass
+        if not prompt:
+            overall = (analysis.get("overall") or "").strip()
+            character = (analysis.get("character_guidance") or "").strip()
+            prompt = (
+                f"{style_hint.replace('{line}', overall[:200] or title)} "
+                f"Theme still for '{title}'. {overall[:500]} "
+                f"{('Character: ' + character[:200]) if character else ''} "
+                "Cinematic still, no readable text."
+            )
+
+    return _generate_named_still(
+        dest, prompt, cfg,
+        reference_image=reference_image if has_ref else "",
+        attach_ref=has_ref,
+    )
 
 
 def regenerate_single_still(
@@ -2382,11 +2545,18 @@ def regenerate_single_still(
 def _analysis_is_usable(analysis: Optional[Dict[str, Any]]) -> bool:
     if not analysis or not isinstance(analysis, dict):
         return False
-    if (analysis.get("overall") or "").strip():
+    overall = (analysis.get("overall") or "").strip()
+    if overall and not _looks_like_keyword_spam(overall):
         return True
     secs = analysis.get("sections") or {}
-    if isinstance(secs, dict) and any((v or "").strip() for v in secs.values()):
-        return True
+    if isinstance(secs, dict):
+        good = [
+            (v or "").strip()
+            for v in secs.values()
+            if (v or "").strip() and not _looks_like_keyword_spam(v or "")
+        ]
+        if len(good) >= 1:
+            return True
     return False
 
 
@@ -2439,6 +2609,8 @@ def ensure_project_assessment(
             if progress_callback:
                 progress_callback("Using existing song assessment", 0.08, {"phase": "analysis"})
             return disk
+        if disk:
+            print("[analysis] disk analysis unusable (spam or empty) — re-running", flush=True)
 
     if not (lyrics or "").strip():
         print("[analysis] no lyrics — cannot run full assessment", flush=True)
@@ -2449,6 +2621,15 @@ def ensure_project_assessment(
             "character_presence": {},
         }
 
+    # Drop stale/bad analysis before a forced or recovery run
+    try:
+        stale = project_dir / "analysis.txt"
+        if force and stale.is_file():
+            stale.unlink()
+            print("[analysis] removed prior analysis.txt for re-run", flush=True)
+    except OSError:
+        pass
+
     parsed = parse_lyrics(lyrics)
     if progress_callback:
         progress_callback("Assessing song & sections…", 0.06, {"phase": "analysis"})
@@ -2457,8 +2638,22 @@ def ensure_project_assessment(
         has_character_ref=has_character_ref,
         progress_callback=progress_callback,
     )
-    _write_analysis_file(project_dir, analysis)
-    maybe_bleep_section()
+    if _analysis_is_usable(analysis):
+        _write_analysis_file(project_dir, analysis)
+        maybe_bleep_section()
+    else:
+        print("[analysis] model reply unusable — not saving analysis.txt", flush=True)
+        # Still write a short stub so the Assessment panel shows what went wrong
+        try:
+            (project_dir / "analysis.txt").write_text(
+                "OVERALL\n"
+                "(Assessment failed — model returned unstructured or repetitive text. "
+                "Click Re-run Assessment.)\n\n"
+                "CHARACTER\n\nCHARACTER_MAP\n\nSECTIONS\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
     return analysis
 
 
@@ -2659,13 +2854,14 @@ def _generate_named_still(
     has_ref = bool(ref_path and Path(ref_path).is_file() and attach_ref)
 
     dest.parent.mkdir(parents=True, exist_ok=True)
-    # Remove prior file at this path so we do not leave a stale still
+    # Only replace the exact dest path (unique names accumulate; same path overwrites)
     try:
         if dest.exists():
             dest.unlink()
     except OSError:
         pass
 
+    configure.APP_STATE["image_gen_t0"] = time.time()
     clean = _sanitize_visual_prompt(prompt, "", str(cfg.get("style") or ""))
     cmd = [
         str(exe),
@@ -2718,6 +2914,7 @@ def _generate_named_still(
     dest_final = found if found is not None else dest
     img_elapsed = time.time() - t_img
     record_last_image_gen_seconds(img_elapsed)
+    configure.APP_STATE["image_gen_t0"] = None
     try:
         sz = dest_final.stat().st_size
     except OSError:
@@ -2833,9 +3030,23 @@ def generate_cover_image(
             progress_callback(f"Cover for '{title}'", 0.2, {"phase": "cover"})
 
         phase_barrier("cover image")
-        dest = project_dir / f"cover-{_ascii_line_slug(title, max_len=48) or 'song'}.png"
+        slug = _ascii_line_slug(title, max_len=40) or "song"
+        # Accumulate: never overwrite prior covers — next free cover-NN-…
+        idx = 1
+        while True:
+            dest = project_dir / f"cover-{idx:02d}-{slug}.png"
+            if not dest.exists():
+                break
+            idx += 1
+            if idx > 999:
+                dest = project_dir / f"cover-{int(time.time())}-{slug}.png"
+                break
         if progress_callback:
-            progress_callback("Generating cover still…", 0.45, {"phase": "cover", "line": 1, "total": 1})
+            progress_callback(
+                "Generating cover still…",
+                0.45,
+                {"phase": "cover", "line": 1, "total": 1},
+            )
         out = _generate_named_still(
             dest, cover_prompt, cfg,
             reference_image=reference_image if has_ref else "",
@@ -3008,6 +3219,12 @@ def generate_theme_images(
 
         images: List[Path] = []
         total = len(theme_prompts)
+        # Start numbering after any existing theme-NN files so re-runs accumulate
+        base_idx = 0
+        for p in project_dir.glob("theme-*.png"):
+            m = re.match(r"theme-(\d+)", p.name, re.I)
+            if m:
+                base_idx = max(base_idx, int(m.group(1)))
         for i, tprompt in enumerate(theme_prompts):
             if is_cancel_requested():
                 break
@@ -3016,7 +3233,11 @@ def generate_theme_images(
             filled = style_tpl.replace("{line}", f"theme {i + 1}: {(analysis.get('overall') or '')[:120]}")
             final = f"{filled} {tprompt}".strip()
             attach = bool(has_ref and i == 0)  # optional ref on first theme only
-            fname = f"theme-{i + 1:02d}-{_ascii_line_slug(song_name or label, max_len=32) or 'theme'}.png"
+            theme_no = base_idx + i + 1
+            fname = (
+                f"theme-{theme_no:02d}-"
+                f"{_ascii_line_slug(song_name or label, max_len=32) or 'theme'}.png"
+            )
             dest = project_dir / fname
             if progress_callback:
                 progress_callback(
