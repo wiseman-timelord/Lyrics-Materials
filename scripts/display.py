@@ -2912,7 +2912,7 @@ def _wire_create_events(status_box) -> None:
         # Immediate status so the user sees feedback on click before any I/O
         yield (
             f"Regenerate requested for still slot {int(line_idx) + 1}…",
-            gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), active_session_id or "",
+            gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), active_session_id or "",
         ) + tuple(_all_gallery_updates()) + tuple(
             _refresh_session_slots(active_session_id or "")
         )
@@ -2920,7 +2920,7 @@ def _wire_create_events(status_box) -> None:
         proj = (configure.APP_STATE.get("current_project_folder") or "").strip()
         empty = (
             "No active project folder — load a session or Generate first.",
-            gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), active_session_id or "",
+            gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), active_session_id or "",
         ) + tuple(_all_gallery_updates()) + tuple(
             _refresh_session_slots(active_session_id or "")
         )
@@ -2938,7 +2938,7 @@ def _wire_create_events(status_box) -> None:
             else:
                 yield (
                     "That thumbnail slot is outside the project line count.",
-                    gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), active_session_id or "",
+                    gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), active_session_id or "",
                 ) + tuple(_all_gallery_updates(lyric_paths=paths)) + tuple(
                     _refresh_session_slots(active_session_id or "")
                 )
@@ -2956,7 +2956,7 @@ def _wire_create_events(status_box) -> None:
             if n_lines > 0 and not (0 <= resolved_idx < n_lines):
                 yield (
                     f"Still index {resolved_idx + 1} is out of range (1..{n_lines}).",
-                    gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), active_session_id or "",
+                    gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), active_session_id or "",
                 ) + tuple(_all_gallery_updates(lyric_paths=paths)) + tuple(
                     _refresh_session_slots(active_session_id or "")
                 )
@@ -2998,7 +2998,7 @@ def _wire_create_events(status_box) -> None:
             yield (
                 f"Queued regenerate for still {line_no} "
                 f"(runs after current work finishes).",
-                gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), active_session_id or "",
+                gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), active_session_id or "",
             ) + tuple(_all_gallery_updates(lyric_paths=paths)) + tuple(
                 _refresh_session_slots(active_session_id or "")
             )
@@ -3033,7 +3033,7 @@ def _wire_create_events(status_box) -> None:
         hint = f" (last still ~{last_sec:.0f}s)" if last_sec > 0 else ""
         yield (
             f"Regenerating still {line_no} at {size_label}…{hint}",
-            gr.update(), gr.update(), gr.update(), gr.update(),
+            gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
             active_session_id or "",
         ) + tuple(_all_gallery_updates(lyric_paths=paths)) + tuple(
             _refresh_session_slots(active_session_id or "")
@@ -3177,7 +3177,7 @@ def _wire_create_events(status_box) -> None:
         """Regenerate one cover/theme still in place."""
         yield (
             f"Regenerate requested for {kind} slot {int(slot_idx) + 1}…",
-            gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
+            gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
             active_session_id or "",
         ) + tuple(_all_gallery_updates()) + tuple(
             _refresh_session_slots(active_session_id or "")
@@ -3187,7 +3187,7 @@ def _wire_create_events(status_box) -> None:
         if not proj or not Path(proj).is_dir() or slot_idx < 0 or slot_idx >= len(paths):
             yield (
                 f"No {kind} image in that slot.",
-                gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
+                gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
                 active_session_id or "",
             ) + tuple(_all_gallery_updates()) + tuple(
                 _refresh_session_slots(active_session_id or "")
@@ -3202,7 +3202,7 @@ def _wire_create_events(status_box) -> None:
 
         yield (
             f"Regenerating {kind} {slot_idx + 1}…",
-            gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
+            gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
             active_session_id or "",
         ) + tuple(_all_gallery_updates()) + tuple(
             _refresh_session_slots(active_session_id or "")
@@ -3220,8 +3220,9 @@ def _wire_create_events(status_box) -> None:
         cfg["negative_prompt"] = (
             (negative_prompt if negative_prompt is not None else configure.DEFAULT_NEGATIVE_PROMPT) or ""
         )
-        cfg["hair_style"] = configure.normalize_hair_style(str(hair_style or ""))
-        cfg["outfit_worn"] = configure.normalize_outfit(str(outfit_worn or ""))
+        gnow = configure.load_generation()
+        cfg["hair_style"] = configure.normalize_hair_style(str(gnow.get("hair_style") or ""))
+        cfg["outfit_worn"] = configure.normalize_outfit(str(gnow.get("outfit_worn") or ""))
         song_name = Path(proj).name
         try:
             meta = configure.load_session_meta(Path(proj)) or {}
@@ -3258,7 +3259,7 @@ def _wire_create_events(status_box) -> None:
 
         yield (
             msg,
-            gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
+            gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
             active_session_id or "",
         ) + tuple(_all_gallery_updates()) + tuple(
             _refresh_session_slots(active_session_id or "")
@@ -3267,6 +3268,7 @@ def _wire_create_events(status_box) -> None:
     _regen_outputs = [
         status_box,
         _gen["assess_btn"],
+        _gen["all_assets_btn"],
         _gen["cover_btn"],
         _gen["theme_btn"],
         _gen["run_btn"],
