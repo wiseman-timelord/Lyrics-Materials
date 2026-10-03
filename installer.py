@@ -343,7 +343,7 @@ def write_default_preferences() -> None:
     if _PREFS_PATH.exists():
         return
     data = {
-        "style": "light and bright",
+        "style": "dark and gloomy",
         "video_format": "mp4",
         "max_thumbnails": 50,
         "input_thumbnail_size": 96,
