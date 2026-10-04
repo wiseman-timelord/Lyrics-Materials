@@ -200,6 +200,7 @@ def main() -> None:
         str(configure.get_output_dir()),
         str(configure.get_models_dir()),
         str(configure.get_images_dir()),
+        str(configure.get_ref_cache_dir()),
     ]
     launch_kwargs = dict(
         server_name=SERVER_NAME,
