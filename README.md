@@ -22,6 +22,7 @@ ffmpeg remains installed for utility/probe use only — not used for materials o
 ```
 
 ### Models:
+- Available on [HuggingFace.Co](https://huggingface.co/)... 
 ```
 | Role | File | Used for |
 |------|------|----------|
