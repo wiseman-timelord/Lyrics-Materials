@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import unicodedata
@@ -19,6 +20,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import scripts.configure as configure
 import scripts.utilities as utilities
+
+# Serialize every sd-cli invocation — never load two Diffusers into VRAM at once
+_SD_CLI_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -1735,10 +1739,18 @@ def _run_sd_cli_once(cmd: List[str], exe: Path, timeout: float = 600.0) -> Tuple
     """
     One-shot sd-cli. Returns (captured_tail, returncode).
 
+    Serialized via _SD_CLI_LOCK so two Gradio handlers cannot load Flux twice.
     Keeps only a tail of stdout so verbose Flux logs cannot grow unbounded
     across a 40-line batch. Always closes pipes and collects after the
     process exits so Vulkan/CPU buffers from the child are released.
     """
+    print("[sd-cli] waiting for exclusive image-gen slot…", flush=True)
+    with _SD_CLI_LOCK:
+        print("[sd-cli] acquired image-gen slot", flush=True)
+        return _run_sd_cli_once_unlocked(cmd, exe, timeout=timeout)
+
+
+def _run_sd_cli_once_unlocked(cmd: List[str], exe: Path, timeout: float = 600.0) -> Tuple[str, int]:
     if "-v" not in cmd and "--verbose" not in cmd:
         cmd = list(cmd) + ["-v"]
     print("[sd-cli] " + " ".join(str(c) for c in cmd), flush=True)
@@ -2137,10 +2149,12 @@ def _sanitize_visual_prompt(prompt: str, lyric: str, style_hint: str = "") -> st
 
 
 def _appearance_bit(cfg: Dict[str, Any]) -> str:
-    """Hair + outfit clause from cfg when set (empty when both None)."""
-    return configure.subject_appearance_clause(
-        cfg.get("hair_style") or "",
-        cfg.get("outfit_worn") or "",
+    """Identity + hair/outfit clause from cfg (character-bearing stills only)."""
+    return configure.character_identity_clause(
+        hair=cfg.get("hair_style") or "",
+        outfit=cfg.get("outfit_worn") or "",
+        gender=cfg.get("ref_gender") or "",
+        bodyshape=cfg.get("ref_bodyshape") or "",
     )
 
 
@@ -3293,12 +3307,9 @@ def generate_cover_image(
 
         has_ref = bool(reference_image and Path(reference_image).is_file())
         if has_ref:
-            try:
-                dest_ref = project_dir / f"reference{Path(reference_image).suffix.lower() or '.png'}"
-                if not dest_ref.exists():
-                    shutil.copy2(reference_image, dest_ref)
-            except OSError:
-                pass
+            local_ref = configure.ensure_project_reference(project_dir, reference_image)
+            if local_ref:
+                reference_image = local_ref
 
         analysis: Dict[str, Any] = {}
         if (lyrics or "").strip():
@@ -3369,21 +3380,31 @@ def generate_cover_image(
         target_n = configure.frequency_cover_count(
             cfg.get("imagegen_frequency") or configure.DEFAULT_IMAGE_FREQUENCY
         )
-        # Count existing covers so "Complete" only fills the remainder
+        # Count existing covers so "Complete" only fills the remainder;
+        # when already at target, wipe and fully re-generate.
         existing_covers = sorted(project_dir.glob("cover-*.png"))
         have_n = len(existing_covers)
-        cover_n = max(0, target_n - have_n) if have_n > 0 else target_n
-        if cover_n <= 0:
-            # Already at/above target — still allow one fresh when user explicitly re-runs
+        if have_n >= target_n:
+            for old in existing_covers:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+            have_n = 0
             cover_n = target_n
-            have_n = 0  # treat as full regenerate batch starting at next free index
+            start_idx = 1
+            print(f"[cover] complete set removed — re-generating {cover_n}", flush=True)
+        elif have_n > 0:
+            cover_n = max(0, target_n - have_n)
+            start_idx = 1
+            while (project_dir / f"cover-{start_idx:02d}-{slug}.png").exists():
+                start_idx += 1
+                if start_idx > 999:
+                    break
+        else:
+            cover_n = target_n
+            start_idx = 1
         images: List[Path] = []
-        # Find next free index so re-runs accumulate rather than overwrite
-        start_idx = 1
-        while (project_dir / f"cover-{start_idx:02d}-{slug}.png").exists():
-            start_idx += 1
-            if start_idx > 999:
-                break
         print(f"[cover] target={target_n} have={have_n} generating={cover_n}", flush=True)
         for i in range(cover_n):
             if is_cancel_requested():
@@ -3508,12 +3529,9 @@ def generate_theme_images(
 
         has_ref = bool(reference_image and Path(reference_image).is_file())
         if has_ref:
-            try:
-                dest_ref = project_dir / f"reference{Path(reference_image).suffix.lower() or '.png'}"
-                if not dest_ref.exists():
-                    shutil.copy2(reference_image, dest_ref)
-            except OSError:
-                pass
+            local_ref = configure.ensure_project_reference(project_dir, reference_image)
+            if local_ref:
+                reference_image = local_ref
 
         _text_path, _text_role = _resolve_prompt_model(cfg)
         log_phase_plan(cfg, _text_role)
@@ -3545,9 +3563,19 @@ def generate_theme_images(
             cfg.get("imagegen_frequency") or configure.DEFAULT_IMAGE_FREQUENCY
         )
         target_theme = configure.frequency_theme_count(freq_label)
-        existing_theme_n = len(list(project_dir.glob("theme-*.png")))
-        # Complete: only fill remaining up to target; full run when none exist
-        if existing_theme_n > 0 and existing_theme_n < target_theme:
+        existing_themes = sorted(project_dir.glob("theme-*.png"))
+        existing_theme_n = len(existing_themes)
+        # Complete: fill remainder; already full: wipe and re-generate all
+        if existing_theme_n >= target_theme:
+            for old in existing_themes:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+            existing_theme_n = 0
+            theme_n = target_theme
+            print(f"[theme] complete set removed — re-generating {theme_n}", flush=True)
+        elif existing_theme_n > 0:
             theme_n = target_theme - existing_theme_n
         else:
             theme_n = target_theme
@@ -3804,11 +3832,12 @@ def run_materials_pipeline(
         print(f"[config] vae       = {Path(_vae).name}", flush=True)
 
         if has_ref:
-            try:
-                dest = project_dir / f"reference{Path(reference_image).suffix.lower() or '.png'}"
-                shutil.copy2(reference_image, dest)
-            except OSError as e:
-                print(f"[project] could not copy reference image: {e}", flush=True)
+            local_ref = configure.ensure_project_reference(project_dir, reference_image)
+            if local_ref:
+                reference_image = local_ref
+                print(f"[project] using reference {Path(local_ref).name}", flush=True)
+            else:
+                print("[project] WARNING: could not place reference in project folder", flush=True)
 
         # ── Phase plan (device conflict + M-Lock awareness) ──────────────
         _text_path, _text_role = _resolve_prompt_model(cfg)

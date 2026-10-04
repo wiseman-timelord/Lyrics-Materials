@@ -245,70 +245,104 @@ def _lyrics_have_stills(project_dir: str = "") -> int:
     return len(_list_project_images(project_dir))
 
 
+def _cover_counts() -> tuple:
+    """(have, expected) for cover stills under current frequency."""
+    folder = (configure.APP_STATE.get("current_project_folder") or "").strip()
+    expected = max(1, configure.frequency_cover_count(_current_freq_label()))
+    if not folder or not Path(folder).is_dir():
+        return 0, expected
+    return len(_list_cover_images(folder)), expected
+
+
+def _theme_counts() -> tuple:
+    """(have, expected) for theme stills under current frequency."""
+    folder = (configure.APP_STATE.get("current_project_folder") or "").strip()
+    expected = max(1, configure.frequency_theme_count(_current_freq_label()))
+    if not folder or not Path(folder).is_dir():
+        return 0, expected
+    return len(_list_theme_images(folder)), expected
+
+
+def _lyrics_counts(lyrics: str = "") -> tuple:
+    """(have, expected) for lyric stills under current frequency."""
+    folder = (configure.APP_STATE.get("current_project_folder") or "").strip()
+    expected = _lyrics_expected_stills(lyrics)
+    if expected <= 0:
+        return 0, 0
+    if not folder or not Path(folder).is_dir():
+        return 0, expected
+    return _lyrics_have_stills(folder), expected
+
+
 def _partial_project_state(lyrics: str = "") -> bool:
     """True when the active project has SOME but not ALL lyric stills (incl. L2/L3)."""
-    try:
-        folder = (configure.APP_STATE.get("current_project_folder") or "").strip()
-        if not folder or not Path(folder).is_dir():
-            return False
-        expected = _lyrics_expected_stills(lyrics)
-        if expected <= 0:
-            return False
-        n_have = _lyrics_have_stills(folder)
-        return 0 < n_have < expected
-    except Exception:
-        return False
+    have, expected = _lyrics_counts(lyrics)
+    return expected > 0 and 0 < have < expected
 
 
 def _partial_cover_state() -> bool:
-    """True when some but not all frequency-expected cover stills exist."""
-    try:
-        folder = (configure.APP_STATE.get("current_project_folder") or "").strip()
-        if not folder or not Path(folder).is_dir():
-            return False
-        expected = configure.frequency_cover_count(_current_freq_label())
-        n_have = len(_list_cover_images(folder))
-        return 0 < n_have < expected
-    except Exception:
-        return False
+    have, expected = _cover_counts()
+    return 0 < have < expected
 
 
 def _partial_theme_state() -> bool:
-    """True when some but not all frequency-expected theme stills exist."""
-    try:
-        folder = (configure.APP_STATE.get("current_project_folder") or "").strip()
-        if not folder or not Path(folder).is_dir():
-            return False
-        expected = configure.frequency_theme_count(_current_freq_label())
-        n_have = len(_list_theme_images(folder))
-        return 0 < n_have < expected
-    except Exception:
-        return False
+    have, expected = _theme_counts()
+    return 0 < have < expected
+
+
+def _cover_complete() -> bool:
+    have, expected = _cover_counts()
+    return expected > 0 and have >= expected
+
+
+def _theme_complete() -> bool:
+    have, expected = _theme_counts()
+    return expected > 0 and have >= expected
+
+
+def _lyrics_complete(lyrics: str = "") -> bool:
+    have, expected = _lyrics_counts(lyrics)
+    return expected > 0 and have >= expected
+
+
+def _all_assets_complete(lyrics: str = "") -> bool:
+    """True only when Cover + Theme + Lyrics all meet the current Image Frequency."""
+    return (
+        _cover_complete()
+        and _theme_complete()
+        and _lyrics_complete(lyrics)
+    )
 
 
 def _lyrics_btn_label(lyrics: str = "") -> str:
-    """'Complete Lyrics Images' when resuming a partly finished project."""
-    return (
-        "Complete Lyrics Images"
-        if _partial_project_state(lyrics)
-        else "Generate Lyrics Images"
-    )
+    if _lyrics_complete(lyrics):
+        return "Re-Generate All Lyrics Images"
+    if _partial_project_state(lyrics):
+        return "Complete Lyrics Images"
+    return "Generate Lyrics Images"
 
 
 def _cover_btn_label() -> str:
-    return (
-        "Complete Cover Images"
-        if _partial_cover_state()
-        else "Generate Cover Images"
-    )
+    if _cover_complete():
+        return "Re-Generate All Cover Images"
+    if _partial_cover_state():
+        return "Complete Cover Images"
+    return "Generate Cover Images"
 
 
 def _theme_btn_label() -> str:
-    return (
-        "Complete Theme Images"
-        if _partial_theme_state()
-        else "Generate Theme Images"
-    )
+    if _theme_complete():
+        return "Re-Generate All Theme Images"
+    if _partial_theme_state():
+        return "Complete Theme Images"
+    return "Generate Theme Images"
+
+
+def _all_assets_btn_label(lyrics: str = "") -> str:
+    """Re-Generate only when every type is complete for the current frequency."""
+    if _all_assets_complete(lyrics):
+        return "Re-Generate All Assets"
+    return "Generate All Assets"
 
 
 def _project_has_any_images(project_dir: str = "") -> bool:
@@ -329,8 +363,8 @@ def _action_btn_updates(lyrics: str = "", song_name: str = "", *, running: bool 
       Models set, no assess → only "Run Assessment" (enabled when name+lyrics)
       Assessment saved   → "Run Assessment" + All Assets / Cover / Theme / Lyrics
 
-    "Generate All Assets" shown when assessment exists and project has NO images yet.
-    "Re-Generate All Assets" shown when assessment exists and project HAS any images.
+    "Generate All Assets" when assessment exists and assets are incomplete.
+    "Re-Generate All Assets" only when Cover + Theme + Lyrics all meet frequency.
 
     When running: hide action buttons, show Emergency Stop.
 
@@ -369,14 +403,13 @@ def _action_btn_updates(lyrics: str = "", song_name: str = "", *, running: bool 
             gr.update(visible=False),
         )
 
-    has_images = _project_has_any_images()
     cover_ok = _can_cover(song_name)
     theme_ok = _can_theme(lyrics, song_name)
     lyrics_ok = _can_create(lyrics, song_name)
     all_ok = cover_ok or theme_ok or lyrics_ok
 
     all_assets_u = gr.update(
-        value="Re-Generate All Assets" if has_images else "Generate All Assets",
+        value=_all_assets_btn_label(lyrics),
         interactive=all_ok,
         variant="primary" if all_ok else "secondary",
         visible=True,
@@ -972,6 +1005,12 @@ def _build_create_tab() -> None:
     initial_outfit = configure.normalize_outfit(
         g0_init.get("outfit_worn") or configure.OUTFIT_DEFAULT
     )
+    initial_gender = configure.normalize_gender(
+        g0_init.get("ref_gender") or configure.GENDER_DEFAULT
+    )
+    initial_bodyshape = configure.normalize_bodyshape(
+        g0_init.get("ref_bodyshape") or configure.BODYSHAPE_DEFAULT
+    )
     can = _can_create(initial_lyrics, initial_song)
     expanded = bool(configure.APP_STATE.get("sessions_sidebar_expanded", True))
     configure.APP_STATE["active_session_id"] = ""
@@ -1186,7 +1225,8 @@ def _build_create_tab() -> None:
                 gr.Markdown(
                     "### Reference Character (optional)\n"
                     "Central character likeness for stills that feature the subject. "
-                    "Hair Style and Outfit Worn are injected only into character-bearing prompts when not None."
+                    "Gender, bodyshape, hair, and outfit are injected only into "
+                    "character-bearing prompts (when a reference image is attached)."
                 )
                 with gr.Row():
                     _gen["ref_image"] = gr.Textbox(
@@ -1194,8 +1234,34 @@ def _build_create_tab() -> None:
                         value=initial_ref,
                         interactive=True,
                         scale=4,
+                        placeholder="Enter full path to image or Browse",
                     )
-                    _gen["browse_ref"] = gr.Button("Browse", scale=1, min_width=90)
+                    with gr.Column(scale=1, min_width=100):
+                        _gen["browse_ref"] = gr.Button("Browse", min_width=90)
+                        _gen["remove_ref"] = gr.Button("Remove", min_width=90, variant="secondary")
+                _ref_ok0 = bool(initial_ref and Path(initial_ref).is_file())
+                _gen["ref_preview"] = gr.Image(
+                    label="Reference preview",
+                    value=initial_ref if _ref_ok0 else None,
+                    type="filepath",
+                    height=512,
+                    interactive=False,
+                    visible=_ref_ok0,
+                    elem_id="ref-preview-image",
+                )
+                with gr.Row():
+                    _gen["ref_gender"] = gr.Dropdown(
+                        label="Reference Image Gender",
+                        choices=configure.GENDER_CHOICES,
+                        value=initial_gender,
+                        info="Locks subject gender language in character stills.",
+                    )
+                    _gen["ref_bodyshape"] = gr.Dropdown(
+                        label="Reference Image Bodyshape",
+                        choices=configure.BODYSHAPE_CHOICES,
+                        value=initial_bodyshape,
+                        info="Counters Flux gym-fit prior; applied on character stills.",
+                    )
                 with gr.Row():
                     _gen["hair_style"] = gr.Dropdown(
                         label="Hair Style",
@@ -1203,7 +1269,6 @@ def _build_create_tab() -> None:
                         value=initial_hair,
                         info="Locked hair description for character consistency. None = omit.",
                     )
-                with gr.Row():
                     _gen["outfit_worn"] = gr.Dropdown(
                         label="Outfit Worn",
                         choices=configure.OUTFIT_CHOICES,
@@ -1229,7 +1294,7 @@ def _build_create_tab() -> None:
                     elem_id="assess-btn",
                 )
                 _gen["all_assets_btn"] = gr.Button(
-                    "Re-Generate All Assets" if _has_images0 else "Generate All Assets",
+                    _all_assets_btn_label(initial_lyrics),
                     variant="primary",
                     interactive=bool(_models_ok0 and _has_assess0),
                     visible=bool(_models_ok0 and _has_assess0),
@@ -1394,12 +1459,99 @@ def _build_create_tab() -> None:
             _gen["thumb_rows"].append(trow)
 
 
+
+def _project_local_ref(ref_image: str, project_dir: str = "") -> str:
+    """Copy ref into project when possible; always return app-local path or ''."""
+    proj = (project_dir or configure.APP_STATE.get("current_project_folder") or "").strip()
+    src = (ref_image or "").strip()
+    if proj and Path(proj).is_dir():
+        local = configure.ensure_project_reference(proj, src)
+        if local:
+            configure.update_generation({"reference_image_path": local})
+            return local
+    if src:
+        local = configure.cache_reference_image(src)
+        if local:
+            configure.update_generation({"reference_image_path": local})
+            return local
+    return ""
+
 def _wire_create_events(status_box) -> None:
+    def _resolve_ref_for_ui(path: str):
+        """
+        Resolve a reference path Gradio can serve:
+        1) If a project folder is active → copy into output/<song>/reference.*
+        2) Else → data/ref_cache/ref_<hash>.*
+        Never returns an external path (avoids InvalidPathError).
+        """
+        p = (path or "").strip()
+        if not p or not Path(p).is_file():
+            # Prefer existing project reference when path blank/invalid
+            proj = (configure.APP_STATE.get("current_project_folder") or "").strip()
+            if proj:
+                existing = configure.project_reference_path(proj)
+                if existing:
+                    return existing, True
+            return "", False
+        proj = (configure.APP_STATE.get("current_project_folder") or "").strip()
+        if proj and Path(proj).is_dir():
+            local = configure.ensure_project_reference(proj, p)
+        else:
+            local = configure.cache_reference_image(p)
+        ok = bool(local and Path(local).is_file())
+        return (local if ok else ""), ok
+
     def _browse_ref():
         path = _browse_file(_FILETYPES_IMAGE, "last_image_browse_dir")
-        return path or gr.update()
+        if not path:
+            return gr.update(), gr.update()
+        local, ok = _resolve_ref_for_ui(str(path))
+        if ok:
+            configure.update_generation({"reference_image_path": local})
+        return (
+            gr.update(value=local if ok else "", placeholder="Enter full path to image or Browse"),
+            gr.update(value=local if ok else None, visible=ok),
+        )
 
-    _gen["browse_ref"].click(_browse_ref, outputs=_gen["ref_image"])
+    def _remove_ref():
+        configure.update_generation({"reference_image_path": ""})
+        # Remove project-local reference.* if present
+        proj = (configure.APP_STATE.get("current_project_folder") or "").strip()
+        if proj and Path(proj).is_dir():
+            try:
+                for old in Path(proj).glob("reference.*"):
+                    try:
+                        old.unlink()
+                    except OSError:
+                        pass
+            except OSError:
+                pass
+        return (
+            gr.update(value="", placeholder="Enter full path to image or Browse"),
+            gr.update(value=None, visible=False),
+        )
+
+    def _ref_image_change(path: str):
+        local, ok = _resolve_ref_for_ui(path or "")
+        configure.update_generation({"reference_image_path": local if ok else ""})
+        return (
+            gr.update(value=local if ok else (path or ""), placeholder="Enter full path to image or Browse"),
+            gr.update(value=local if ok else None, visible=ok),
+        )
+
+    _gen["browse_ref"].click(
+        _browse_ref,
+        outputs=[_gen["ref_image"], _gen["ref_preview"]],
+    )
+    _gen["remove_ref"].click(
+        _remove_ref,
+        outputs=[_gen["ref_image"], _gen["ref_preview"]],
+    )
+    _gen["ref_image"].change(
+        _ref_image_change,
+        inputs=[_gen["ref_image"]],
+        outputs=[_gen["ref_image"], _gen["ref_preview"]],
+    )
 
     def _details_mode_change(mode: str):
         m = (mode or "").strip()
@@ -1940,11 +2092,14 @@ def _wire_create_events(status_box) -> None:
         )
         cfg["hair_style"] = configure.normalize_hair_style(str(hair_style or ""))
         cfg["outfit_worn"] = configure.normalize_outfit(str(outfit_worn or ""))
+        _g_sub = configure.load_generation()
+        cfg["ref_gender"] = configure.normalize_gender(str(_g_sub.get("ref_gender") or ""))
+        cfg["ref_bodyshape"] = configure.normalize_bodyshape(str(_g_sub.get("ref_bodyshape") or ""))
 
         configure.update_generation({
             "last_lyrics": lyrics,
             "project_label": (song_name or "").strip(),
-            "reference_image_path": ref_image or "",
+            "reference_image_path": _project_local_ref(ref_image or ""),
             "hair_style": configure.normalize_hair_style(str(hair_style or "")),
             "outfit_worn": configure.normalize_outfit(str(outfit_worn or "")),
             "imagegen_width": w,
@@ -2006,7 +2161,7 @@ def _wire_create_events(status_box) -> None:
                     lyrics=lyrics,
                     cfg=cfg,
                     song_name=song_name or "",
-                    reference_image=ref_image or "",
+                    reference_image=_project_local_ref(ref_image or ""),
                     progress_callback=cb,
                     resume_folder=resume_folder,
                 )
@@ -2148,8 +2303,10 @@ def _wire_create_events(status_box) -> None:
                     )
                     cfg_now["hair_style"] = configure.normalize_hair_style(str(gnow.get("hair_style") or ""))
                     cfg_now["outfit_worn"] = configure.normalize_outfit(str(gnow.get("outfit_worn") or ""))
+                    cfg_now["ref_gender"] = configure.normalize_gender(str(gnow.get("ref_gender") or ""))
+                    cfg_now["ref_bodyshape"] = configure.normalize_bodyshape(str(gnow.get("ref_bodyshape") or ""))
                     inference.regenerate_single_still(
-                        Path(proj), int(line_idx), cfg_now, reference_image=ref_image or "",
+                        Path(proj), int(line_idx), cfg_now, reference_image=_project_local_ref(ref_image or ""),
                     )
                     paths = _list_project_images(proj)
                     yield (
@@ -2201,24 +2358,25 @@ def _wire_create_events(status_box) -> None:
             _gen["active_session_id"],
         ]
 
-    def _persist_subject_tokens(hair_style, outfit_worn):
+    def _persist_subject_tokens(hair_style, outfit_worn, ref_gender, ref_bodyshape):
         configure.update_generation({
             "hair_style": configure.normalize_hair_style(str(hair_style or "")),
             "outfit_worn": configure.normalize_outfit(str(outfit_worn or "")),
+            "ref_gender": configure.normalize_gender(str(ref_gender or "")),
+            "ref_bodyshape": configure.normalize_bodyshape(str(ref_bodyshape or "")),
         })
 
-    if _gen.get("hair_style") is not None:
-        _gen["hair_style"].change(
-            lambda h, o: _persist_subject_tokens(h, o),
-            inputs=[_gen["hair_style"], _gen["outfit_worn"]],
-            outputs=[],
-        )
-    if _gen.get("outfit_worn") is not None:
-        _gen["outfit_worn"].change(
-            lambda h, o: _persist_subject_tokens(h, o),
-            inputs=[_gen["hair_style"], _gen["outfit_worn"]],
-            outputs=[],
-        )
+    _subject_token_inputs = [
+        _gen["hair_style"], _gen["outfit_worn"],
+        _gen["ref_gender"], _gen["ref_bodyshape"],
+    ]
+    for _tok in ("hair_style", "outfit_worn", "ref_gender", "ref_bodyshape"):
+        if _gen.get(_tok) is not None:
+            _gen[_tok].change(
+                _persist_subject_tokens,
+                inputs=_subject_token_inputs,
+                outputs=[],
+            )
 
     _gen["run_btn"].click(
         _run,
@@ -2259,9 +2417,12 @@ def _wire_create_events(status_box) -> None:
         )
         cfg["hair_style"] = configure.normalize_hair_style(str(hair_style or ""))
         cfg["outfit_worn"] = configure.normalize_outfit(str(outfit_worn or ""))
+        _g_sub = configure.load_generation()
+        cfg["ref_gender"] = configure.normalize_gender(str(_g_sub.get("ref_gender") or ""))
+        cfg["ref_bodyshape"] = configure.normalize_bodyshape(str(_g_sub.get("ref_bodyshape") or ""))
         configure.update_generation({
             "project_label": (song_name or "").strip(),
-            "reference_image_path": ref_image or "",
+            "reference_image_path": _project_local_ref(ref_image or ""),
             "hair_style": configure.normalize_hair_style(str(hair_style or "")),
             "outfit_worn": configure.normalize_outfit(str(outfit_worn or "")),
             "imagegen_width": w,
@@ -2297,7 +2458,7 @@ def _wire_create_events(status_box) -> None:
                 result_holder["r"] = inference.generate_cover_image(
                     song_name or "",
                     cfg,
-                    reference_image=ref_image or "",
+                    reference_image=_project_local_ref(ref_image or ""),
                     progress_callback=_cb,
                     resume_folder=resume_folder,
                     lyrics=lyrics or "",
@@ -2376,10 +2537,13 @@ def _wire_create_events(status_box) -> None:
         )
         cfg["hair_style"] = configure.normalize_hair_style(str(hair_style or ""))
         cfg["outfit_worn"] = configure.normalize_outfit(str(outfit_worn or ""))
+        _g_sub = configure.load_generation()
+        cfg["ref_gender"] = configure.normalize_gender(str(_g_sub.get("ref_gender") or ""))
+        cfg["ref_bodyshape"] = configure.normalize_bodyshape(str(_g_sub.get("ref_bodyshape") or ""))
         configure.update_generation({
             "last_lyrics": lyrics,
             "project_label": (song_name or "").strip(),
-            "reference_image_path": ref_image or "",
+            "reference_image_path": _project_local_ref(ref_image or ""),
             "hair_style": configure.normalize_hair_style(str(hair_style or "")),
             "outfit_worn": configure.normalize_outfit(str(outfit_worn or "")),
             "imagegen_width": w,
@@ -2420,7 +2584,7 @@ def _wire_create_events(status_box) -> None:
                     lyrics or "",
                     cfg,
                     song_name=song_name or "",
-                    reference_image=ref_image or "",
+                    reference_image=_project_local_ref(ref_image or ""),
                     progress_callback=_cb,
                     resume_folder=resume_folder,
                 )
@@ -2651,8 +2815,8 @@ def _wire_create_events(status_box) -> None:
 
         configure.APP_STATE["generating"] = True
         configure.APP_STATE["session_status"] = "running"
-        has_images = _project_has_any_images()
-        label = "Re-Generate All Assets" if has_images else "Generate All Assets"
+        assets_complete = _all_assets_complete(lyrics)
+        label = "Re-Generate All Assets" if assets_complete else "Generate All Assets"
         yield (
             _status_plain(f"{label}…"),
             *run_btns, active_session_id or "",
@@ -2673,6 +2837,8 @@ def _wire_create_events(status_box) -> None:
             "negative_prompt": negative_prompt or configure.DEFAULT_NEGATIVE_PROMPT,
             "hair_style": configure.normalize_hair_style(str(hair_style or "")),
             "outfit_worn": configure.normalize_outfit(str(outfit_worn or "")),
+            "ref_gender": configure.normalize_gender(str(configure.load_generation().get("ref_gender") or "")),
+            "ref_bodyshape": configure.normalize_bodyshape(str(configure.load_generation().get("ref_bodyshape") or "")),
         })
         configure.update_generation({
             "imagegen_size": cfg["imagegen_size"],
@@ -2692,7 +2858,8 @@ def _wire_create_events(status_box) -> None:
             cand = configure.get_output_dir() / str(active_session_id)
             if cand.is_dir():
                 folder = str(cand)
-        if has_images and folder:
+        # Only wipe existing stills when every type is already complete (true re-gen)
+        if assets_complete and folder:
             n_del = inference.clear_project_image_assets(Path(folder))
             print(f"[all-assets] cleared {n_del} image asset(s) from {folder}", flush=True)
             yield (
@@ -2720,7 +2887,7 @@ def _wire_create_events(status_box) -> None:
                 r1 = inference.generate_cover_image(
                     song_name=song_name or "",
                     cfg=cfg,
-                    reference_image=ref_image or "",
+                    reference_image=_project_local_ref(ref_image or ""),
                     progress_callback=_cb,
                     resume_folder=folder or "",
                     lyrics=lyrics or "",
@@ -2737,7 +2904,7 @@ def _wire_create_events(status_box) -> None:
                     lyrics=lyrics or "",
                     cfg=cfg,
                     song_name=song_name or "",
-                    reference_image=ref_image or "",
+                    reference_image=_project_local_ref(ref_image or ""),
                     progress_callback=_cb,
                     resume_folder=folder or configure.APP_STATE.get("current_project_folder") or "",
                 )
@@ -2750,7 +2917,7 @@ def _wire_create_events(status_box) -> None:
                     lyrics=lyrics or "",
                     cfg=cfg,
                     song_name=song_name or "",
-                    reference_image=ref_image or "",
+                    reference_image=_project_local_ref(ref_image or ""),
                     progress_callback=_cb,
                     resume_folder=folder or configure.APP_STATE.get("current_project_folder") or "",
                 )
@@ -3052,6 +3219,8 @@ def _wire_create_events(status_box) -> None:
             cfg_now["imagegen_size"] = size_label
             cfg_now["hair_style"] = configure.normalize_hair_style(str(gnow.get("hair_style") or ""))
             cfg_now["outfit_worn"] = configure.normalize_outfit(str(gnow.get("outfit_worn") or ""))
+            cfg_now["ref_gender"] = configure.normalize_gender(str(gnow.get("ref_gender") or ""))
+            cfg_now["ref_bodyshape"] = configure.normalize_bodyshape(str(gnow.get("ref_bodyshape") or ""))
             cfg_now["imagegen_frequency"] = freq
             cfg_now["negative_prompt"] = neg
             configure.update_generation({
@@ -3066,7 +3235,7 @@ def _wire_create_events(status_box) -> None:
                 Path(proj),
                 int(resolved_idx),
                 cfg_now,
-                reference_image=ref_image or "",
+                reference_image=_project_local_ref(ref_image or ""),
             )
             configure.APP_STATE["session_status"] = "stopped"
             try:
@@ -3116,7 +3285,7 @@ def _wire_create_events(status_box) -> None:
                 cfg_now["imagegen_size"] = size_label
                 cfg_now["negative_prompt"] = neg
                 inference.regenerate_single_still(
-                    Path(proj), qi, cfg_now, reference_image=ref_image or "",
+                    Path(proj), qi, cfg_now, reference_image=_project_local_ref(ref_image or ""),
                 )
                 extra += f" Also regenerated {q_line}."
             except Exception as e:
@@ -3124,6 +3293,59 @@ def _wire_create_events(status_box) -> None:
             finally:
                 configure.APP_STATE["generating"] = False
                 _mark_busy(q_line, False)
+
+        # Drain cover/theme named queue as well (serial; never parallel sd-cli)
+        nq = list(configure.APP_STATE.get("named_regen_queue") or [])
+        configure.APP_STATE["named_regen_queue"] = []
+        for job in nq:
+            if inference.is_cancel_requested():
+                break
+            jk = str(job.get("kind") or "theme")
+            ji = int(job.get("slot_idx", 0))
+            key = f"{jk}:{ji}"
+            busy = set(str(x) for x in (configure.APP_STATE.get("named_regen_busy") or []))
+            busy.add(key)
+            configure.APP_STATE["named_regen_busy"] = sorted(busy)
+            paths = _list_project_images(proj)
+            yield (
+                f"Regenerating queued {jk} slot {ji + 1}…",
+                *_action_btn_updates(running=True),
+                active_session_id or "",
+            ) + tuple(_all_gallery_updates(lyric_paths=paths)) + tuple(
+                _refresh_session_slots(active_session_id or "")
+            )
+            try:
+                configure.APP_STATE["generating"] = True
+                cfg_n = dict(cfg_now)
+                gnow = configure.load_generation()
+                cfg_n["hair_style"] = configure.normalize_hair_style(str(gnow.get("hair_style") or ""))
+                cfg_n["outfit_worn"] = configure.normalize_outfit(str(gnow.get("outfit_worn") or ""))
+                cfg_n["ref_gender"] = configure.normalize_gender(str(gnow.get("ref_gender") or ""))
+                cfg_n["ref_bodyshape"] = configure.normalize_bodyshape(str(gnow.get("ref_bodyshape") or ""))
+                cfg_n["imagegen_steps"] = steps
+                cfg_n["imagegen_cfg_scale"] = cfg_scale
+                cfg_n["imagegen_width"] = w
+                cfg_n["imagegen_height"] = h
+                cfg_n["imagegen_size"] = size_label
+                cfg_n["negative_prompt"] = neg
+                paths_n = _list_cover_images(proj) if jk == "cover" else _list_theme_images(proj)
+                if 0 <= ji < len(paths_n):
+                    inference.regenerate_named_still(
+                        jk, paths_n[ji], cfg_n,
+                        song_name=Path(proj).name,
+                        reference_image=_project_local_ref(ref_image or ""),
+                        theme_index=ji if jk == "theme" else 0,
+                    )
+                    extra += f" Also regenerated {jk} {ji + 1}."
+            except Exception as e:
+                extra += f" Queued {jk} {ji + 1} failed: {e}."
+                print(f"[regen-{jk}] {e}", flush=True)
+            finally:
+                configure.APP_STATE["generating"] = False
+                busy = set(str(x) for x in (configure.APP_STATE.get("named_regen_busy") or []))
+                busy.discard(key)
+                configure.APP_STATE["named_regen_busy"] = sorted(busy)
+                configure.APP_STATE["image_gen_t0"] = None
 
         configure.APP_STATE["thumb_queued_lines"] = []
         paths = _list_project_images(proj)
@@ -3163,51 +3385,28 @@ def _wire_create_events(status_box) -> None:
             _refresh_session_slots(active_session_id or "")
         )
 
-    def _do_regen_named(
-        kind: str,
-        slot_idx: int,
-        image_size,
-        image_frequency,
-        steps,
-        cfg_scale,
-        ref_image,
-        negative_prompt,
-        active_session_id,
-    ):
-        """Regenerate one cover/theme still in place."""
-        yield (
-            f"Regenerate requested for {kind} slot {int(slot_idx) + 1}…",
-            gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
-            active_session_id or "",
-        ) + tuple(_all_gallery_updates()) + tuple(
-            _refresh_session_slots(active_session_id or "")
-        )
-        proj = (configure.APP_STATE.get("current_project_folder") or "").strip()
-        paths = _list_cover_images(proj) if kind == "cover" else _list_theme_images(proj)
-        if not proj or not Path(proj).is_dir() or slot_idx < 0 or slot_idx >= len(paths):
-            yield (
-                f"No {kind} image in that slot.",
-                gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
-                active_session_id or "",
-            ) + tuple(_all_gallery_updates()) + tuple(
-                _refresh_session_slots(active_session_id or "")
-            )
-            return
+    def _named_slot_key(kind: str, slot_idx: int) -> str:
+        return f"{kind}:{int(slot_idx)}"
 
-        path = paths[slot_idx]
-        slot_key = f"{kind}_regen_btns:{slot_idx}"
+    def _mark_named_busy(kind: str, slot_idx: int, on: bool) -> None:
+        key = _named_slot_key(kind, slot_idx)
         busy = set(str(x) for x in (configure.APP_STATE.get("named_regen_busy") or []))
-        busy.add(slot_key)
+        if on:
+            busy.add(key)
+        else:
+            busy.discard(key)
         configure.APP_STATE["named_regen_busy"] = sorted(busy)
 
-        yield (
-            f"Regenerating {kind} {slot_idx + 1}…",
-            gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
-            active_session_id or "",
-        ) + tuple(_all_gallery_updates()) + tuple(
-            _refresh_session_slots(active_session_id or "")
-        )
+    def _enqueue_named_regen(kind: str, slot_idx: int) -> None:
+        q = list(configure.APP_STATE.get("named_regen_queue") or [])
+        item = {"kind": kind, "slot_idx": int(slot_idx)}
+        # De-dupe exact slot
+        q = [x for x in q if not (x.get("kind") == kind and int(x.get("slot_idx", -1)) == int(slot_idx))]
+        q.append(item)
+        configure.APP_STATE["named_regen_queue"] = q
+        _mark_named_busy(kind, slot_idx, True)
 
+    def _build_named_cfg(image_size, steps, cfg_scale, negative_prompt):
         c = _cfg()
         cfg = dict(c)
         size_label = configure.normalize_image_size(str(image_size or configure.DEFAULT_IMAGE_SIZE))
@@ -3223,6 +3422,15 @@ def _wire_create_events(status_box) -> None:
         gnow = configure.load_generation()
         cfg["hair_style"] = configure.normalize_hair_style(str(gnow.get("hair_style") or ""))
         cfg["outfit_worn"] = configure.normalize_outfit(str(gnow.get("outfit_worn") or ""))
+        cfg["ref_gender"] = configure.normalize_gender(str(gnow.get("ref_gender") or ""))
+        cfg["ref_bodyshape"] = configure.normalize_bodyshape(str(gnow.get("ref_bodyshape") or ""))
+        return cfg
+
+    def _run_one_named_regen(kind: str, slot_idx: int, cfg, ref_image: str, proj: str) -> str:
+        paths = _list_cover_images(proj) if kind == "cover" else _list_theme_images(proj)
+        if slot_idx < 0 or slot_idx >= len(paths):
+            return f"No {kind} image in slot {slot_idx + 1}."
+        path = paths[slot_idx]
         song_name = Path(proj).name
         try:
             meta = configure.load_session_meta(Path(proj)) or {}
@@ -3236,30 +3444,149 @@ def _wire_create_events(status_box) -> None:
                 lyrics = lp.read_text(encoding="utf-8", errors="replace")
         except OSError:
             pass
+        out = inference.regenerate_named_still(
+            kind,
+            path,
+            cfg,
+            song_name=song_name,
+            lyrics=lyrics,
+            reference_image=_project_local_ref(ref_image or ""),
+            theme_index=slot_idx if kind == "theme" else 0,
+        )
+        return f"Regenerated {kind} still: {Path(out).name}"
 
-        try:
-            out = inference.regenerate_named_still(
-                kind,
-                path,
-                cfg,
-                song_name=song_name,
-                lyrics=lyrics,
-                reference_image=ref_image or "",
-                theme_index=slot_idx if kind == "theme" else 0,
+    def _do_regen_named(
+        kind: str,
+        slot_idx: int,
+        image_size,
+        image_frequency,
+        steps,
+        cfg_scale,
+        ref_image,
+        negative_prompt,
+        active_session_id,
+    ):
+        """Regenerate one cover/theme still — queue-aware, never concurrent with other sd-cli."""
+        pad = (
+            gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
+        )
+        yield (
+            f"Regenerate requested for {kind} slot {int(slot_idx) + 1}…",
+            *pad,
+            active_session_id or "",
+        ) + tuple(_all_gallery_updates()) + tuple(
+            _refresh_session_slots(active_session_id or "")
+        )
+        proj = (configure.APP_STATE.get("current_project_folder") or "").strip()
+        paths = _list_cover_images(proj) if kind == "cover" else _list_theme_images(proj)
+        if not proj or not Path(proj).is_dir() or slot_idx < 0 or slot_idx >= len(paths):
+            yield (
+                f"No {kind} image in that slot.",
+                *pad,
+                active_session_id or "",
+            ) + tuple(_all_gallery_updates()) + tuple(
+                _refresh_session_slots(active_session_id or "")
             )
-            msg = f"Regenerated {kind} still: {Path(out).name}"
+            return
+
+        # Busy? Queue and return — active worker drains named_regen_queue
+        if configure.APP_STATE.get("generating") or configure.APP_STATE.get("session_status") == "running":
+            _enqueue_named_regen(kind, slot_idx)
+            nq = len(configure.APP_STATE.get("named_regen_queue") or [])
+            yield (
+                f"Queued {kind} slot {slot_idx + 1} "
+                f"(runs after current image work finishes — {nq} named job(s) waiting).",
+                *pad,
+                active_session_id or "",
+            ) + tuple(_all_gallery_updates()) + tuple(
+                _refresh_session_slots(active_session_id or "")
+            )
+            return
+
+        configure.APP_STATE["generating"] = True
+        configure.APP_STATE["session_status"] = "running"
+        _mark_named_busy(kind, slot_idx, True)
+        yield (
+            f"Regenerating {kind} {slot_idx + 1}…",
+            *pad,
+            active_session_id or "",
+        ) + tuple(_all_gallery_updates()) + tuple(
+            _refresh_session_slots(active_session_id or "")
+        )
+
+        cfg = _build_named_cfg(image_size, steps, cfg_scale, negative_prompt)
+        msgs: list = []
+        try:
+            msgs.append(_run_one_named_regen(kind, slot_idx, cfg, ref_image or "", proj))
         except Exception as e:
-            msg = f"Regenerate {kind} failed: {e}"
+            msgs.append(f"Regenerate {kind} failed: {e}")
             print(f"[regen-{kind}] {e}", flush=True)
         finally:
-            busy = set(str(x) for x in (configure.APP_STATE.get("named_regen_busy") or []))
-            busy.discard(slot_key)
-            configure.APP_STATE["named_regen_busy"] = sorted(busy)
+            _mark_named_busy(kind, slot_idx, False)
             configure.APP_STATE["image_gen_t0"] = None
 
+        # Drain named queue then lyric regen queue (serial — one sd-cli at a time)
+        while True:
+            if inference.is_cancel_requested():
+                break
+            nq = list(configure.APP_STATE.get("named_regen_queue") or [])
+            lq = list(configure.APP_STATE.get("regen_queue") or [])
+            if not nq and not lq:
+                break
+            if nq:
+                job = nq.pop(0)
+                configure.APP_STATE["named_regen_queue"] = nq
+                jk, ji = str(job.get("kind") or kind), int(job.get("slot_idx", 0))
+                _mark_named_busy(jk, ji, True)
+                yield (
+                    f"Regenerating queued {jk} slot {ji + 1}…",
+                    *pad,
+                    active_session_id or "",
+                ) + tuple(_all_gallery_updates()) + tuple(
+                    _refresh_session_slots(active_session_id or "")
+                )
+                try:
+                    msgs.append(_run_one_named_regen(jk, ji, cfg, ref_image or "", proj))
+                except Exception as e:
+                    msgs.append(f"Queued {jk} {ji + 1} failed: {e}")
+                    print(f"[regen-{jk}] {e}", flush=True)
+                finally:
+                    _mark_named_busy(jk, ji, False)
+                    configure.APP_STATE["image_gen_t0"] = None
+                continue
+            # lyric slot from shared queue
+            if lq:
+                qi = int(lq.pop(0))
+                configure.APP_STATE["regen_queue"] = lq
+                q_line = qi + 1
+                _mark_busy(q_line, True)
+                yield (
+                    f"Regenerating queued lyrics still {q_line}…",
+                    *pad,
+                    active_session_id or "",
+                ) + tuple(_all_gallery_updates()) + tuple(
+                    _refresh_session_slots(active_session_id or "")
+                )
+                try:
+                    configure.APP_STATE["generating"] = True
+                    cfg_now = dict(cfg)
+                    inference.regenerate_single_still(
+                        Path(proj), qi, cfg_now, reference_image=_project_local_ref(ref_image or ""),
+                    )
+                    msgs.append(f"Also regenerated lyrics still {q_line}.")
+                except Exception as e:
+                    msgs.append(f"Queued lyrics {q_line} failed: {e}.")
+                finally:
+                    configure.APP_STATE["generating"] = False
+                    _mark_busy(q_line, False)
+                    configure.APP_STATE["image_gen_t0"] = None
+
+        configure.APP_STATE["generating"] = False
+        configure.APP_STATE["session_status"] = "stopped"
+        msg = " ".join(msgs) if msgs else "Done."
         yield (
             msg,
-            gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
+            *pad,
             active_session_id or "",
         ) + tuple(_all_gallery_updates()) + tuple(
             _refresh_session_slots(active_session_id or "")

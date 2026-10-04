@@ -41,6 +41,149 @@ def get_output_dir() -> Path:
     return _get_project_root() / "output"
 
 
+def get_ref_cache_dir() -> Path:
+    """Local folder for reference images so Gradio can serve previews."""
+    return get_data_dir() / "ref_cache"
+
+
+def _is_under_app_root(path: Path) -> bool:
+    try:
+        path.resolve().relative_to(_get_project_root().resolve())
+        return True
+    except Exception:
+        return False
+
+
+def cache_reference_image(src_path: str) -> str:
+    """
+    Ensure a reference image is under the app tree (data/ref_cache).
+
+    Gradio refuses to cache/serve files outside cwd, temp, and allowed_paths.
+    External picks (e.g. G:\\Pictures\\...) are copied once into ref_cache.
+    Never returns a path outside the app tree (empty string on failure).
+    """
+    import hashlib
+    import shutil
+
+    p = Path((src_path or "").strip())
+    if not p.is_file():
+        return ""
+    try:
+        resolved = p.resolve()
+    except Exception:
+        resolved = p
+
+    if _is_under_app_root(resolved):
+        return str(resolved)
+
+    dest_dir = get_ref_cache_dir()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        h = hashlib.sha1()
+        with open(resolved, "rb") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                h.update(chunk)
+        digest = h.hexdigest()[:16]
+    except OSError:
+        digest = hashlib.sha1(str(resolved).encode("utf-8", errors="replace")).hexdigest()[:16]
+    suffix = resolved.suffix.lower() if resolved.suffix else ".png"
+    if suffix not in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"):
+        suffix = ".png"
+    dest = dest_dir / f"ref_{digest}{suffix}"
+    if not dest.is_file() or dest.stat().st_size == 0:
+        try:
+            shutil.copy2(str(resolved), str(dest))
+        except OSError as e:
+            print(f"[ref-cache] copy failed: {e}", flush=True)
+            return ""
+    return str(dest) if dest.is_file() else ""
+
+
+def project_reference_path(project_dir: str | Path) -> str:
+    """Return existing output/<song>/reference.* path, or empty string."""
+    root = Path(project_dir or "")
+    if not root.is_dir():
+        return ""
+    for name in (
+        "reference.jpg", "reference.jpeg", "reference.png",
+        "reference.webp", "reference.bmp", "reference.gif",
+    ):
+        cand = root / name
+        if cand.is_file():
+            return str(cand)
+    # Any reference* with image suffix
+    try:
+        for p in sorted(root.glob("reference.*")):
+            if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif") and p.is_file():
+                return str(p)
+    except OSError:
+        pass
+    return ""
+
+
+def ensure_project_reference(project_dir: str | Path, src_path: str = "") -> str:
+    """
+    Copy a reference image into the project as reference.<ext>.
+
+    Prefer src_path when given; otherwise keep an existing project reference.
+    Always returns a path under the project (or empty). Gradio-safe.
+    """
+    import shutil
+
+    root = Path(project_dir or "")
+    if not root.is_dir():
+        return cache_reference_image(src_path) if src_path else ""
+
+    src = (src_path or "").strip()
+    existing = project_reference_path(root)
+
+    # Already the project file
+    if src and existing and Path(src).resolve() == Path(existing).resolve():
+        return existing
+
+    # No new source — keep existing project ref
+    if not src or not Path(src).is_file():
+        return existing
+
+    # Source already under this project
+    try:
+        if Path(src).resolve().parent.resolve() == root.resolve():
+            return str(Path(src).resolve())
+    except Exception:
+        pass
+
+    suffix = Path(src).suffix.lower() or ".jpg"
+    if suffix not in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"):
+        suffix = ".jpg"
+    # Canonical name: reference.jpg / reference.png
+    if suffix == ".jpeg":
+        suffix = ".jpg"
+    dest = root / f"reference{suffix}"
+
+    # Remove other reference.* variants so only one is active
+    try:
+        for old in root.glob("reference.*"):
+            if old.resolve() != dest.resolve():
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+    try:
+        if not dest.is_file() or Path(src).resolve() != dest.resolve():
+            shutil.copy2(src, dest)
+        print(f"[ref] project reference → {dest}", flush=True)
+        return str(dest)
+    except OSError as e:
+        print(f"[ref] could not copy into project: {e}", flush=True)
+        return existing or cache_reference_image(src)
+
+
 def get_llama_bin_dir() -> Path:
     return get_data_dir() / "llama_cpp_binaries"
 
@@ -84,6 +227,7 @@ def ensure_data_dirs() -> None:
         get_dictionaries_dir(),
         get_data_dir() / "temp_images",
         get_data_dir() / "temp_audio",
+        get_ref_cache_dir(),
     ):
         d.mkdir(parents=True, exist_ok=True)
     # Keep vision projectors out of models/ root so pure-text loads stay clean
@@ -492,12 +636,109 @@ def outfit_phrase(value: str) -> str:
     return (OUTFIT_WORDS.get(key) or "").strip()
 
 
-def subject_appearance_clause(hair: str = "", outfit: str = "") -> str:
+# ---------------------------------------------------------------------------
+# Reference image gender (subject token)
+# ---------------------------------------------------------------------------
+GENDER_MALE = "Mal(s)"
+GENDER_MIXED = "M+F(s)"
+GENDER_SHEFEM = "S+F(s)"
+GENDER_NEUT = "Neut(s)"
+GENDER_TRANS = "Shem(s)"
+GENDER_FEMALE = "Fem(s)"
+GENDER_CHOICES = [
+    GENDER_MALE, GENDER_MIXED, GENDER_SHEFEM, GENDER_NEUT, GENDER_TRANS, GENDER_FEMALE,
+]
+GENDER_DEFAULT = GENDER_MALE
+GENDER_WORDS = {
+    GENDER_MALE: "male",
+    GENDER_MIXED: "mixed-gender",
+    GENDER_SHEFEM: "feminine-presenting",
+    GENDER_NEUT: "androgynous",
+    GENDER_TRANS: "transfeminine",
+    GENDER_FEMALE: "female",
+}
+
+
+def normalize_gender(value: str) -> str:
+    v = (value or "").strip()
+    if v in GENDER_CHOICES:
+        return v
+    for c in GENDER_CHOICES:
+        if c.lower() == v.lower():
+            return c
+    return GENDER_DEFAULT
+
+
+def gender_phrase(value: str) -> str:
+    key = normalize_gender(value)
+    return (GENDER_WORDS.get(key) or "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Reference image bodyshape (subject token)
+# ---------------------------------------------------------------------------
+BODYSHAPE_OVERWEIGHT = "Overweight"
+BODYSHAPE_CURVY = "Curvy"
+BODYSHAPE_SLIM = "Slim"
+BODYSHAPE_SKINNY = "Skinny"
+BODYSHAPE_EXOTIC = "Exotic"
+BODYSHAPE_MUSCULAR = "Muscular"
+ALL_BODYSHAPES = "All Shapes"
+BODYSHAPE_CHOICES = [
+    BODYSHAPE_OVERWEIGHT, BODYSHAPE_CURVY, BODYSHAPE_SLIM,
+    BODYSHAPE_SKINNY, BODYSHAPE_EXOTIC, BODYSHAPE_MUSCULAR,
+    ALL_BODYSHAPES,
+]
+BODYSHAPE_CONCRETE = [
+    BODYSHAPE_OVERWEIGHT, BODYSHAPE_CURVY, BODYSHAPE_SLIM,
+    BODYSHAPE_SKINNY, BODYSHAPE_EXOTIC, BODYSHAPE_MUSCULAR,
+]
+BODYSHAPE_DEFAULT = BODYSHAPE_SLIM
+BODYSHAPE_WORDS = {
+    BODYSHAPE_OVERWEIGHT: "overweight",
+    BODYSHAPE_CURVY: "curvy",
+    BODYSHAPE_SLIM: "slim",
+    BODYSHAPE_SKINNY: "skinny",
+    BODYSHAPE_EXOTIC: "exotic",
+    BODYSHAPE_MUSCULAR: "muscular",
+    ALL_BODYSHAPES: "",
+}
+
+
+def normalize_bodyshape(value: str) -> str:
+    v = (value or "").strip()
+    if v in BODYSHAPE_CHOICES:
+        return v
+    for c in BODYSHAPE_CONCRETE:
+        if c.lower() == v.lower():
+            return c
+    return BODYSHAPE_DEFAULT
+
+
+def bodyshape_phrase(value: str) -> str:
+    key = normalize_bodyshape(value)
+    if key == ALL_BODYSHAPES:
+        return ""
+    return (BODYSHAPE_WORDS.get(key) or "").strip()
+
+
+def subject_appearance_clause(
+    hair: str = "",
+    outfit: str = "",
+    gender: str = "",
+    bodyshape: str = "",
+) -> str:
     """
-    Build an optional appearance clause for character-bearing prompts.
-    Empty strings are omitted so None leaves the prompt unchanged.
+    Build optional identity/appearance text for character-bearing prompts.
+    Hair/outfit omitted when None; gender/bodyshape default to concrete words.
     """
     bits: List[str] = []
+    gp = gender_phrase(gender) if gender else ""
+    bp = bodyshape_phrase(bodyshape) if bodyshape else ""
+    if gp:
+        bits.append(f"{gp} subject")
+    if bp:
+        bits.append(f"{bp} bodyshape")
     hp = hair_style_phrase(hair)
     op = outfit_phrase(outfit)
     if hp:
@@ -507,6 +748,39 @@ def subject_appearance_clause(hair: str = "", outfit: str = "") -> str:
     if not bits:
         return ""
     return "Subject appearance: " + "; ".join(bits) + "."
+
+
+def character_identity_clause(
+    hair: str = "",
+    outfit: str = "",
+    gender: str = "",
+    bodyshape: str = "",
+) -> str:
+    """
+    Strong identity-lock sentence for stills that attach the reference image.
+    Mirrors Image-Glamour's "facial appearance and personal identity match
+    the reference image exactly, other than …" pattern.
+    """
+    gp = gender_phrase(gender) or "person"
+    bp = bodyshape_phrase(bodyshape)
+    hp = hair_style_phrase(hair)
+    op = outfit_phrase(outfit)
+    other: List[str] = []
+    if bp:
+        other.append(f"a {bp} bodyshape")
+    if hp:
+        other.append(f"hair {hp}")
+    if op:
+        other.append(f"wearing a {op}")
+    other_bit = ""
+    if other:
+        other_bit = ", other than the subject being " + ", ".join(other)
+    return (
+        f"Photorealistic depiction of the {gp} whose facial appearance and "
+        f"personal identity match the reference image exactly{other_bit}. "
+        "Preserve the same face, bone structure, eyes, and likeness from the "
+        "reference; anatomically correct hands with five fingers on each hand."
+    )
 
 # Fade colours (RGB 0-255) used for intro/outro and lyric gaps
 STYLE_FADE_RGB = {
@@ -1196,6 +1470,8 @@ GENERATION_KEYS = [
     "reference_image_path",
     "hair_style",
     "outfit_worn",
+    "ref_gender",
+    "ref_bodyshape",
     "project_label",
     "last_image_gen_seconds",
 ]
@@ -1220,6 +1496,8 @@ def _default_generation() -> Dict[str, Any]:
         "reference_image_path": "",
         "hair_style": HAIR_STYLE_DEFAULT,
         "outfit_worn": OUTFIT_DEFAULT,
+        "ref_gender": GENDER_DEFAULT,
+        "ref_bodyshape": BODYSHAPE_DEFAULT,
         "project_label": "",
         "last_image_gen_seconds": 0.0,
     }
