@@ -622,29 +622,67 @@ def _is_numbered_still(path: str | Path) -> bool:
 
 _PLACEHOLDER_WARNED: set = set()
 
-# kind -> file under images/ (user-facing spelling "qued" is intentional)
-_PLACEHOLDER_FILES = {
-    "no_image": "thumbnails_no_image.jpg",
-    "queued": "thumbnails_qued_for_generation.jpg",
-    "generating": "thumbnails_generating.jpg",
+# kind -> base stem under images/ (user-facing spelling "qued" is intentional).
+# Actual files are thumbnails_{stem}_{regular|wide}.jpg
+_PLACEHOLDER_STEMS = {
+    "no_image": "thumbnails_no_image",
+    "queued": "thumbnails_qued_for_generation",
+    "generating": "thumbnails_generating",
 }
 
 
-def _placeholder_thumb(kind: str) -> Optional[str]:
-    """Absolute path to images/<placeholder>.jpg for no_image | queued | generating.
-
-    Returns None if the file is missing (a one-time console warning is printed).
-    """
-    fname = _PLACEHOLDER_FILES.get(kind, f"thumbnails_{kind}.jpg")
+def _current_thumb_aspect() -> str:
+    """regular | wide from the Generation image size setting."""
     try:
-        p = configure.get_images_dir() / fname
-        if p.is_file():
-            return str(p.resolve())
-        if fname not in _PLACEHOLDER_WARNED:
-            _PLACEHOLDER_WARNED.add(fname)
-            print(f"  WARNING: placeholder not found: {p}", flush=True)
+        g = configure.load_generation()
+        size = g.get("imagegen_size") or ""
+        if not size:
+            w = int(g.get("imagegen_width") or configure.DEFAULT_WIDTH)
+            h = int(g.get("imagegen_height") or configure.DEFAULT_HEIGHT)
+            size = configure.image_size_label_from_wh(w, h)
+        return configure.image_size_aspect(str(size))
+    except Exception:
+        return configure.IMAGE_SIZE_ASPECT_REGULAR
+
+
+def _placeholder_thumb(kind: str, aspect: str = "") -> Optional[str]:
+    """Absolute path to images/thumbnails_*_{regular|wide}.jpg."""
+    stem = _PLACEHOLDER_STEMS.get(kind, f"thumbnails_{kind}")
+    asp = (aspect or _current_thumb_aspect() or "regular").strip().lower()
+    if asp not in ("regular", "wide"):
+        asp = "regular"
+    names = [
+        f"{stem}_{asp}.jpg",
+        f"{stem}_{'wide' if asp == 'regular' else 'regular'}.jpg",
+        f"{stem}.jpg",
+    ]
+    roots = []
+    try:
+        roots.append(configure.get_images_dir())
     except Exception:
         pass
+    try:
+        root = Path(configure._get_project_root())
+        roots.append(root / "images")
+        roots.append(root)
+    except Exception:
+        pass
+    roots.append(Path("images"))
+    candidates = []
+    for r in roots:
+        for n in names:
+            candidates.append(r / n)
+    for p in candidates:
+        try:
+            if p.is_file():
+                return str(p.resolve())
+        except Exception:
+            continue
+    warn_key = f"{stem}_{asp}"
+    if warn_key not in _PLACEHOLDER_WARNED:
+        _PLACEHOLDER_WARNED.add(warn_key)
+        tried = ", ".join(str(c) for c in candidates[:4])
+        print(f"  WARNING: placeholder not found: {warn_key} (tried {tried})", flush=True)
     return None
 
 
@@ -776,6 +814,35 @@ def _thumb_expected_count() -> int:
     return max(0, min(int(n), THUMB_SLOTS))
 
 
+def _named_busy_set(kind: str = "") -> set:
+    """Slot indices currently regenerating for kind ('cover'|'theme'), from named_regen_busy."""
+    out: set = set()
+    prefix = f"{kind}:" if kind else ""
+    for x in (configure.APP_STATE.get("named_regen_busy") or []):
+        s = str(x)
+        if prefix and s.startswith(prefix):
+            try:
+                out.add(int(s.split(":", 1)[1]))
+            except (TypeError, ValueError, IndexError):
+                pass
+        elif not prefix:
+            out.add(s)
+    return out
+
+
+def _named_queued_set(kind: str) -> set:
+    """Slot indices waiting in named_regen_queue for this kind."""
+    out: set = set()
+    for job in (configure.APP_STATE.get("named_regen_queue") or []):
+        try:
+            if str(job.get("kind") or "") != kind:
+                continue
+            out.add(int(job.get("slot_idx", -1)))
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
 def _simple_grid_updates(
     paths: List[str],
     n_slots: int,
@@ -784,40 +851,57 @@ def _simple_grid_updates(
     imgs_key: str,
     regen_key: str = "",
     remove_key: str = "",
+    *,
+    kind: str = "",
+    expected: int = 0,
 ) -> List[Any]:
-    """Visibility + image + optional Regenerate/Remove button states."""
+    """
+    Cover/Theme grid updates with the same placeholder stages as Lyrics:
+      real still → image path
+      busy (regenerating) → thumbnails_generating.jpg
+      queued → thumbnails_qued_for_generation.jpg
+      empty expected slot → thumbnails_no_image.jpg
+    """
     th = _thumb_size_px()
     n_rows = len(_gen.get(rows_key) or []) or max(1, (n_slots + THUMB_COLS - 1) // THUMB_COLS)
-    n_show = min(len(paths), n_slots)
+    # Show at least existing files; expand to expected (frequency) while generating
+    n_show = min(max(len(paths), int(expected or 0)), n_slots)
     has_btns = bool(regen_key and remove_key and (_gen.get(regen_key) or []))
-    busy_set = set()
-    for x in (configure.APP_STATE.get("named_regen_busy") or []):
-        try:
-            busy_set.add(str(x))
-        except Exception:
-            pass
+    busy_idx = _named_busy_set(kind) if kind else set()
+    queued_idx = _named_queued_set(kind) if kind else set()
+    no_img = _placeholder_thumb("no_image")
+    que_img = _placeholder_thumb("queued") or no_img
+    gen_img = _placeholder_thumb("generating") or no_img
+
     updates: List[Any] = []
     for r in range(n_rows):
         row_start = r * THUMB_COLS
         updates.append(gr.update(visible=row_start < n_show))
     for i in range(n_slots):
         if i < n_show:
-            path = paths[i]
-            slot_key = f"{regen_key}:{i}"
-            is_busy = slot_key in busy_set
-            updates.append(gr.update(visible=True))
-            if is_busy:
-                gen_img = _placeholder_thumb("generating")
-                updates.append(gr.update(value=gen_img or path, height=th))
+            real = paths[i] if i < len(paths) else None
+            is_busy = i in busy_idx
+            is_queued = (i in queued_idx) and not real and not is_busy
+            if real and not is_busy:
+                value = real
+            elif is_busy:
+                value = gen_img or real
+            elif is_queued:
+                value = que_img
             else:
-                updates.append(gr.update(value=path, height=th))
+                value = no_img if not real else real
+            updates.append(gr.update(visible=True))
+            updates.append(gr.update(value=value, height=th))
             if has_btns:
                 updates.append(gr.update(
                     visible=True,
-                    interactive=not is_busy,
-                    value="…" if is_busy else "Regenerate",
+                    interactive=not is_busy and not is_queued,
+                    value="…" if (is_busy or is_queued) else "Regenerate",
                 ))
-                updates.append(gr.update(visible=True, interactive=not is_busy))
+                updates.append(gr.update(
+                    visible=True,
+                    interactive=bool(real) and not is_busy,
+                ))
         else:
             updates.append(gr.update(visible=False))
             updates.append(gr.update(value=None))
@@ -829,19 +913,50 @@ def _simple_grid_updates(
 
 def _cover_panel_updates(project_dir: str = "") -> List[Any]:
     paths = _list_cover_images(project_dir)
-    show = bool(paths)
+    expected = 0
+    try:
+        expected = configure.frequency_cover_count(_current_freq_label())
+    except Exception:
+        expected = 0
+    # Show section when we have stills, expected covers, or cover jobs in flight
+    busy = _named_busy_set("cover")
+    queued = _named_queued_set("cover")
+    show = bool(paths) or bool(busy) or bool(queued) or (
+        expected > 0 and bool(configure.APP_STATE.get("generating"))
+        and str(configure.APP_STATE.get("session_status") or "") == "running"
+        and (configure.APP_STATE.get("status_last_info") or {}).get("phase") == "cover"
+    )
+    # Also show if any cover still exists or expected and project active
+    if not show and expected > 0 and (configure.APP_STATE.get("current_project_folder") or "").strip():
+        if paths or busy or queued:
+            show = True
+    if paths:
+        show = True
+    n_expected = max(len(paths), expected if (show and expected) else 0)
     return [gr.update(visible=show)] + _simple_grid_updates(
         paths, COVER_SLOTS, "cover_rows", "cover_cols", "cover_imgs",
         "cover_regen_btns", "cover_remove_btns",
+        kind="cover", expected=n_expected if show else 0,
     )
 
 
 def _theme_panel_updates(project_dir: str = "") -> List[Any]:
     paths = _list_theme_images(project_dir)
-    show = bool(paths)
+    expected = 0
+    try:
+        expected = configure.frequency_theme_count(_current_freq_label())
+    except Exception:
+        expected = 0
+    busy = _named_busy_set("theme")
+    queued = _named_queued_set("theme")
+    show = bool(paths) or bool(busy) or bool(queued)
+    if paths:
+        show = True
+    n_expected = max(len(paths), expected if (show and expected) else 0)
     return [gr.update(visible=show)] + _simple_grid_updates(
         paths, THEME_SLOTS, "theme_rows", "theme_cols", "theme_imgs",
         "theme_regen_btns", "theme_remove_btns",
+        kind="theme", expected=n_expected if show else 0,
     )
 
 

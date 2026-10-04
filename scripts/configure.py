@@ -838,8 +838,19 @@ DEFAULT_WIDTH = 768
 DEFAULT_HEIGHT = 512
 DEFAULT_STEPS = 8  # 8 improves eyes / fine detail vs 4 on Flux.2-klein
 DEFAULT_CFG = 1.0
+# Sectioned negative: periods group related terms (style / overlays / quality / anatomy).
 DEFAULT_NEGATIVE_PROMPT = (
-    "cartoon, pixelated, graphical overlay, text overlay, watermark, logo, blurry, low quality, deformed, extra limbs"
+    "cartoon, pixelated, anime, illustration. "
+    "text, letters, words, writing, typography, caption, subtitle, title text, "
+    "graphical overlay, text overlay, UI, HUD, watermark, logo, signature, stamp. "
+    "blurry, low quality, noisy, jpeg artifacts. "
+    "deformed, extra limbs, mutated hands, bad anatomy."
+)
+# Extra negatives always merged into cover stills (Flux 4B loves to write titles).
+COVER_NEGATIVE_EXTRA = (
+    "text, letters, words, writing, typography, alphabet, calligraphy, "
+    "signage, poster text, album title text, readable text, misspelled text, "
+    "graphical overlay, text overlay, watermark, logo, banner, caption."
 )
 DEFAULT_SAMPLER = "euler_a"
 DEFAULT_SEED = -1
@@ -849,19 +860,39 @@ IMAGE_SIZE_768x512 = "768 × 512"
 IMAGE_SIZE_1024x512 = "1024 × 512"
 IMAGE_SIZE_1024x768 = "1024 × 768"
 IMAGE_SIZE_1280x768 = "1280 × 768"
+IMAGE_SIZE_1280x720 = "1280 × 720"
+IMAGE_SIZE_640x360 = "640 × 360"
 IMAGE_SIZE_CHOICES = [
     IMAGE_SIZE_768x512,
     IMAGE_SIZE_1024x512,
     IMAGE_SIZE_1024x768,
     IMAGE_SIZE_1280x768,
+    IMAGE_SIZE_1280x720,
+    IMAGE_SIZE_640x360,
 ]
 IMAGE_SIZE_PIXELS = {
     IMAGE_SIZE_768x512: (768, 512),
     IMAGE_SIZE_1024x512: (1024, 512),
     IMAGE_SIZE_1024x768: (1024, 768),
     IMAGE_SIZE_1280x768: (1280, 768),
+    IMAGE_SIZE_1280x720: (1280, 720),
+    IMAGE_SIZE_640x360: (640, 360),
 }
 DEFAULT_IMAGE_SIZE = IMAGE_SIZE_768x512
+
+# Thumbnail placeholder aspect class for images/thumbnails_*_{regular|wide}.jpg
+# regular: 768×512, 1024×768
+# wide:    1024×512, 1280×768, 1280×720, 640×360
+IMAGE_SIZE_ASPECT_REGULAR = "regular"
+IMAGE_SIZE_ASPECT_WIDE = "wide"
+IMAGE_SIZE_ASPECT = {
+    IMAGE_SIZE_768x512: IMAGE_SIZE_ASPECT_REGULAR,
+    IMAGE_SIZE_1024x768: IMAGE_SIZE_ASPECT_REGULAR,
+    IMAGE_SIZE_1024x512: IMAGE_SIZE_ASPECT_WIDE,
+    IMAGE_SIZE_1280x768: IMAGE_SIZE_ASPECT_WIDE,
+    IMAGE_SIZE_1280x720: IMAGE_SIZE_ASPECT_WIDE,
+    IMAGE_SIZE_640x360: IMAGE_SIZE_ASPECT_WIDE,
+}
 
 
 def normalize_image_size(value: str) -> str:
@@ -889,6 +920,41 @@ def image_size_label_from_wh(width: int, height: int) -> str:
         if int(width) == w and int(height) == h:
             return label
     return DEFAULT_IMAGE_SIZE
+
+
+def image_size_aspect(value: str = "") -> str:
+    """Return 'regular' or 'wide' for thumbnail placeholder selection."""
+    label = normalize_image_size(value) if value else ""
+    if label in IMAGE_SIZE_ASPECT:
+        return IMAGE_SIZE_ASPECT[label]
+    # Infer from pixels when label unknown
+    try:
+        w, h = image_size_pixels(value) if value else (DEFAULT_WIDTH, DEFAULT_HEIGHT)
+        if h > 0 and (float(w) / float(h)) >= 1.6:
+            return IMAGE_SIZE_ASPECT_WIDE
+    except Exception:
+        pass
+    return IMAGE_SIZE_ASPECT_REGULAR
+
+
+def merge_negative_prompt(base: str = "", *, cover: bool = False) -> str:
+    """Combine user/default negative with optional cover-specific anti-text terms."""
+    bits = []
+    b = (base or "").strip() or DEFAULT_NEGATIVE_PROMPT
+    bits.append(b)
+    if cover:
+        bits.append(COVER_NEGATIVE_EXTRA)
+    # De-dupe while preserving order
+    seen = set()
+    out: List[str] = []
+    for chunk in bits:
+        for part in re.split(r"[.,;]+", chunk):
+            t = part.strip().lower()
+            if not t or t in seen:
+                continue
+            seen.add(t)
+            out.append(part.strip())
+    return ", ".join(out)
 
 
 

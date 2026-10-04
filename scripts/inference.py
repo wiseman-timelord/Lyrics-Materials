@@ -2299,7 +2299,10 @@ def generate_images_from_prompts(
             r_use = str(ref_path)
         if r_use and Path(r_use).is_file():
             c.extend(["-r", str(r_use)])
-        neg = (cfg.get("negative_prompt") or "").strip()
+        neg = configure.merge_negative_prompt(
+            (cfg.get("negative_prompt") or "").strip(),
+            cover=bool(cfg.get("cover_mode")),
+        )
         if neg:
             c.extend(["-n", neg])
         c.extend(_sd_placement_args(cfg, use_gpu, vk_idx))
@@ -2521,20 +2524,12 @@ def regenerate_named_still(
     title = label.replace("_", " ").strip() or label
 
     if kind == "cover":
-        overall = (analysis.get("overall") or "").strip()
-        character = (analysis.get("character_guidance") or "").strip()
-        assess_bit = ""
-        if overall:
-            assess_bit += f" Assessment mood/setting: {overall[:420]}"
-        if character:
-            assess_bit += f" Central character: {character[:220]}"
-        prompt = (
-            f"{style_hint.replace('{line}', title)} "
-            f"Album-style cover art for the song titled '{title}'. "
-            "Bold, iconic composition suitable as a single cover image. "
-            "No readable text, no logos, no watermarks."
-            f"{assess_bit}"
+        prompt, strategy, use_char_ref = _build_cover_prompt(
+            title, analysis, cfg, has_ref=has_ref,
         )
+        # use_char_ref applied below via has_ref override
+        if not use_char_ref:
+            has_ref = False
     else:
         # Theme: prefer saved prompt line matching this file index
         prompt = ""
@@ -2564,8 +2559,11 @@ def regenerate_named_still(
                 "Cinematic still, no readable text."
             )
 
+    cfg_run = dict(cfg)
+    if kind == "cover":
+        cfg_run["cover_mode"] = True
     return _generate_named_still(
-        dest, prompt, cfg,
+        dest, prompt, cfg_run,
         reference_image=reference_image if has_ref else "",
         attach_ref=has_ref,
     )
@@ -2736,7 +2734,10 @@ def regenerate_single_still(
             pass
         if attach_ref and has_ref:
             c.extend(["-r", str(ref)])
-        neg = (cfg.get("negative_prompt") or "").strip()
+        neg = configure.merge_negative_prompt(
+            (cfg.get("negative_prompt") or "").strip(),
+            cover=bool(cfg.get("cover_mode")),
+        )
         if neg:
             c.extend(["-n", neg])
         c.extend(_sd_placement_args(cfg, use_gpu, vk_idx))
@@ -3144,7 +3145,10 @@ def _generate_named_still(
         pass
     if has_ref:
         cmd.extend(["-r", str(ref_path)])
-    neg = (cfg.get("negative_prompt") or "").strip()
+    neg = configure.merge_negative_prompt(
+        (cfg.get("negative_prompt") or "").strip(),
+        cover=bool(cfg.get("cover_mode")),
+    )
     if neg:
         cmd.extend(["-n", neg])
     cmd.extend(_sd_placement_args(cfg, use_gpu, vk_idx))
@@ -3177,6 +3181,123 @@ def _generate_named_still(
     print(f"[named] saved {dest_final.name} ({sz} bytes) in {img_elapsed:.1f}s", flush=True)
     gc.collect()
     return dest_final
+
+
+
+def _build_cover_prompt(
+    title: str,
+    analysis: Dict[str, Any],
+    cfg: Dict[str, Any],
+    *,
+    has_ref: bool = False,
+    strategy: str = "",
+) -> Tuple[str, str, bool]:
+    """
+    Title-first album cover prompt.
+
+    The song name is the visual subject. OVERALL assessment is only a short
+    interpretation aid (what the title likely means in this song) — not a
+    license to paint the same ambient worldspace as Theme stills.
+
+    Returns (prompt, strategy, attach_ref).
+    """
+    title = (title or "").strip() or "Untitled"
+    overall = (analysis.get("overall") or "").strip()
+    character = (analysis.get("character_guidance") or "").strip()
+    style = str(cfg.get("style") or configure.STYLE_DEFAULT)
+    style_hint = configure.prompt_template_for_style(style)
+    # Prefer first 1-2 sentences of OVERALL as title interpretation only
+    interpret = ""
+    if overall:
+        parts = re.split(r"(?<=[.!?])\s+", overall)
+        interpret = " ".join(parts[:2]).strip()
+        if len(interpret) > 280:
+            interpret = interpret[:280].rsplit(" ", 1)[0] + "…"
+
+    if not strategy:
+        strategy = classify_cover_strategy(title, analysis, cfg, has_ref)
+    use_char_ref = strategy == "character" and has_ref
+
+    # Optional short LLM concept locked to the title words
+    concept = ""
+    model_path, role = _resolve_prompt_model(cfg)
+    if model_path and Path(model_path).is_file():
+        try:
+            concept_prompt = (
+                "You write ONE album-cover concept sentence for an AI image model.\n"
+                f'Song title (must be the visual subject): "{title}"\n'
+            )
+            if interpret:
+                concept_prompt += (
+                    f"Assessment hint (interpret the title only — do not describe generic scenery): "
+                    f"{interpret}\n"
+                )
+            concept_prompt += (
+                "Rules:\n"
+                "- The image idea must make a viewer think of the song title itself.\n"
+                "- Literal or metaphorical is fine, but the title's meaning must be obvious.\n"
+                "- Do NOT describe a generic ambient corridor, crowd, or mood board.\n"
+                "- No text, letters, logos, or watermarks in the image.\n"
+                "- Describe a single focused subject (close-up or strong symbol), not a busy scene.\n"
+                "- Reply with ONE sentence only. No preamble.\n"
+            )
+            raw = _run_llama_completion(
+                concept_prompt, cfg, role=role, model_path=model_path,
+                n_predict=120, ctx_size=min(_PROMPT_CTX, 4096),
+                temperature=0.4, timeout=120.0,
+            )
+            concept = (raw or "").strip().splitlines()[0].strip()
+            # Drop quotes / length runaway
+            concept = concept.strip(" \"'`")
+            if len(concept) > 320:
+                concept = concept[:320].rsplit(" ", 1)[0]
+            if len(concept) < 20:
+                concept = ""
+            else:
+                print(f"[cover] title concept: {concept[:120]}", flush=True)
+        except Exception as e:
+            print(f"[cover] concept LLM skipped: {e}", flush=True)
+            concept = ""
+
+    appear = _appearance_bit(cfg) if use_char_ref else ""
+    # Do NOT put the title in quotes as on-image text — Flux will try to write it.
+    title_lead = (
+        f"Album cover still inspired by the song name: {title}. "
+        "One significant, isolated subject fills the frame — a close-up or strong "
+        "figurative symbol the eye locks onto immediately. Clean composition, "
+        "shallow depth of field or solid negative space, high visual impact. "
+    )
+    if concept:
+        title_lead += f"Subject concept: {concept} "
+    elif interpret:
+        title_lead += (
+            f"Use this only to interpret what the song name means (not as a scenery brief): "
+            f"{interpret} "
+        )
+
+    no_text = (
+        "Absolutely no text, letters, words, writing, typography, captions, subtitles, "
+        "logos, watermarks, signatures, UI, or graphical overlays anywhere in the image. "
+    )
+    if use_char_ref:
+        char_bit = f" Central figure: {character[:220]}." if character else ""
+        cover_prompt = (
+            f"{style_hint.replace('{line}', title)} "
+            f"{title_lead}"
+            f"Feature the central character as the single focused subject embodying the song name.{char_bit} "
+            f"{appear + ' ' if appear else ''}"
+            "Iconic cover portrait or figure study — not a busy scene. "
+            f"{no_text}"
+        )
+    else:
+        cover_prompt = (
+            f"{style_hint.replace('{line}', title)} "
+            f"{title_lead}"
+            "Bold symbolic or literal object/figure for the song name — not a wide landscape, "
+            "corridor, crowd, or generic mood board. One clear focal subject. "
+            f"{no_text}"
+        )
+    return cover_prompt, strategy, use_char_ref
 
 
 def classify_cover_strategy(
@@ -3331,45 +3452,13 @@ def generate_cover_image(
             else:
                 print("[cover] no lyrics / assessment; title-only cover prompt", flush=True)
 
-        style = str(cfg.get("style") or configure.STYLE_LIGHT)
-        style_hint = configure.prompt_template_for_style(style)
         title = (song_name or label).replace("_", " ").strip() or label
-        overall = (analysis.get("overall") or "").strip()
-        character = (analysis.get("character_guidance") or "").strip()
-        strategy = classify_cover_strategy(title, analysis, cfg, has_ref)
-        use_char_ref = strategy == "character" and has_ref
-        appear = _appearance_bit(cfg) if strategy == "character" else ""
-        if strategy == "character":
-            assess_bit = ""
-            if character:
-                assess_bit += f" Central character: {character[:280]}"
-            if overall:
-                assess_bit += f" Mood context: {overall[:200]}"
-            if appear:
-                assess_bit += f" {appear}"
-            cover_prompt = (
-                f"{style_hint.replace('{line}', title)} "
-                f"Album-style cover art for the song titled '{title}'. "
-                "Feature the central character as the focal subject. "
-                "Bold, iconic composition suitable as a single cover image. "
-                "No readable text, no logos, no watermarks."
-                f"{assess_bit}"
-            )
-        else:
-            # Worldspace cover — no character, no reference image
-            assess_bit = f" World and mood: {overall[:480]}" if overall else ""
-            cover_prompt = (
-                f"{style_hint.replace('{line}', title)} "
-                f"Album-style cover art for the song titled '{title}'. "
-                "Depict the song's world, setting, and atmosphere — "
-                "not a specific character portrait. "
-                "Bold, iconic composition suitable as a single cover image. "
-                "No readable text, no logos, no watermarks."
-                f"{assess_bit}"
-            )
+        cover_prompt, strategy, use_char_ref = _build_cover_prompt(
+            title, analysis, cfg, has_ref=has_ref,
+        )
         print(
             f"[cover] strategy={strategy}  attach_ref={use_char_ref}  "
-            f"title={title!r}  appearance={'yes' if appear else 'no'}",
+            f"title={title!r}",
             flush=True,
         )
         if progress_callback:
@@ -3422,8 +3511,10 @@ def generate_cover_image(
                 f" Variation {i + 1} of {cover_n}: alternate angle or crop emphasis."
                 if cover_n > 1 else ""
             )
+            cfg_cover = dict(cfg)
+            cfg_cover["cover_mode"] = True
             out = _generate_named_still(
-                dest, cover_prompt + var_bit, cfg,
+                dest, cover_prompt + var_bit, cfg_cover,
                 reference_image=reference_image if use_char_ref else "",
                 attach_ref=use_char_ref,
             )
