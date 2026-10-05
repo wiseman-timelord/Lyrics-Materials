@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-installer.py - Standalone setup for Lyrics-Materials.
+installer.py - Standalone setup for Lyrics-Slideshow.
 Detects hardware, creates venv, installs Python deps, downloads (or compiles)
 llama.cpp + stable-diffusion.cpp binaries for CPU or Vulkan, seeds config files,
 and places ffmpeg.
@@ -42,7 +42,7 @@ _GENERATION_PATH = _DATA_DIR / "generation.json"
 _PROMPTING_PATH = _DATA_DIR / "prompting.json"
 _MODELS_DIR = _ROOT / "models"
 _OUTPUT_DIR = _ROOT / "output"
-_BUILD_TEMP = Path(os.environ.get("TEMP", "C:/build_temp")) / "lyrics_materials"
+_BUILD_TEMP = Path(os.environ.get("TEMP", "C:/build_temp")) / "lyrics_slideshow"
 
 LLAMA_BIN_DIR = "data/llama_cpp_binaries"
 SD_BIN_DIR = "data/stable_diffusion_binaries"
@@ -343,7 +343,7 @@ def write_default_preferences() -> None:
     if _PREFS_PATH.exists():
         return
     data = {
-        "style": "dark and gloomy",
+        "style": "light and bright",
         "video_format": "mp4",
         "max_thumbnails": 50,
         "input_thumbnail_size": 96,
@@ -384,18 +384,15 @@ def write_default_generation() -> None:
     if _GENERATION_PATH.exists():
         return
     data = {
-        "imagegen_width": 768,
+        "imagegen_width": 512,
         "imagegen_height": 512,
-        "imagegen_size": "768 × 512",
-        "imagegen_frequency": 1,
-        "imagegen_steps": 8,
+        "imagegen_steps": 4,
         "imagegen_cfg_scale": 1.0,
         "imagegen_seed": -1,
         "imagegen_sampling": "euler_a",
         "song_length_seconds": 180,
         "last_lyrics": "",
         "last_audio_path": "",
-        "last_image_gen_seconds": 0.0,
     }
     with open(_GENERATION_PATH, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
@@ -479,7 +476,7 @@ def _download_with_retry(url: str, dest: Path, label: str) -> None:
                 existing = 0
 
             headers: Dict[str, str] = {
-                "User-Agent": "Lyrics-Materials-Installer/1.0",
+                "User-Agent": "Lyrics-Slideshow-Installer/1.0",
             }
             mode = "wb"
             if existing > 0:
@@ -1164,7 +1161,7 @@ def install_backends(cpu: Dict[str, Any], use_vulkan: bool, force_compile: bool)
 # ---------------------------------------------------------------------------
 def _print_install_banner(cpu: Dict[str, Any], vk: Dict[str, Any]) -> None:
     git, cmake = find_git(), find_cmake()
-    header("Lyrics-Materials — Install Method")
+    header("Lyrics-Slideshow — Install Method")
     print()
     print()
     print("  System detections...")
@@ -1190,7 +1187,7 @@ def _print_install_banner(cpu: Dict[str, Any], vk: Dict[str, Any]) -> None:
 
 
 def _print_backend_banner(vk: Dict[str, Any], missing_tools: List[str]) -> None:
-    header("Lyrics-Materials — Backend Selection")
+    header("Lyrics-Slideshow — Backend Selection")
     compile_suffix = f"   [BLOCKED - missing: {', '.join(missing_tools)}]" if missing_tools else ""
     if vk["available"]:
         print("     1. Download llama.cpp + sd.cpp for CPU")
@@ -1322,12 +1319,12 @@ def run_detection() -> Tuple[Dict[str, Any], Dict[str, Any]]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Lyrics-Materials Installer")
+    parser = argparse.ArgumentParser(description="Lyrics-Slideshow Installer")
     parser.add_argument("--detect-only", action="store_true")
     args = parser.parse_args()
 
     ensure_dirs()
-    header("Lyrics-Materials — Initialize Install")
+    header("Lyrics-Slideshow — Initialize Install")
 
     cpu, vk = run_detection()
 
@@ -1350,7 +1347,7 @@ def main() -> None:
             use_vulkan, force_compile = _choose_backend(vk)
             whisper_size = ""
             method = "compile" if force_compile else "download"
-            header("Lyrics-Materials — Installation")
+            header("Lyrics-Slideshow — Installation")
             _purge_for_clean()
             write_constants(cpu, vk, use_vulkan=use_vulkan,
                             whisper_size=whisper_size, backend_method=method)
@@ -1373,7 +1370,7 @@ def main() -> None:
             use_vulkan, force_compile = _choose_backend(vk)
             whisper_size = ""
             method = "compile" if force_compile else "download"
-            header("Lyrics-Materials — Installation")
+            header("Lyrics-Slideshow — Installation")
             write_constants(cpu, vk, use_vulkan=use_vulkan,
                             whisper_size=whisper_size, backend_method=method)
             section("Python virtual environment...")
@@ -1397,7 +1394,7 @@ def main() -> None:
             use_vulkan, force_compile = _choose_backend(vk)
             whisper_size = ""
             method = "compile" if force_compile else "download"
-            header("Lyrics-Materials — Refresh Configs")
+            header("Lyrics-Slideshow — Refresh Configs")
             section("Re-detecting hardware and GPUs...")
             cpu, vk = run_detection()
             vk = enumerate_devices_post_build(vk, use_vulkan)
