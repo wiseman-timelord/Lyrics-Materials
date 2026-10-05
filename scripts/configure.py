@@ -1,9 +1,9 @@
 """
-configure.py - Constants, paths, settings I/O for Lyrics-Slideshow.
-Simplified for the lyrics → slideshow music-video pipeline.
+configure.py - Constants, paths, settings I/O for Lyrics-Materials.
+Lyrics → per-line visual materials (images) for external AI video use.
 Models:
   Encoder  : Qwen3-VL-4B Instruct / Uncensored (Q4)
-  Thinking : Qwen3-VL-4B Thinking (Q5) — optional, better prompts
+  Thinking : Qwen3-VL-4B Thinking (Q5) — optional, richer prompts + song analysis
   Diffuser : FLUX.2-klein-4B (Q8)
   mmproj quarantined under models/mmproj/ (not used for pure text)
 """
@@ -12,9 +12,10 @@ from __future__ import annotations
 import configparser
 import json
 import os
+import re
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -38,6 +39,149 @@ def get_models_dir() -> Path:
 
 def get_output_dir() -> Path:
     return _get_project_root() / "output"
+
+
+def get_ref_cache_dir() -> Path:
+    """Local folder for reference images so Gradio can serve previews."""
+    return get_data_dir() / "ref_cache"
+
+
+def _is_under_app_root(path: Path) -> bool:
+    try:
+        path.resolve().relative_to(_get_project_root().resolve())
+        return True
+    except Exception:
+        return False
+
+
+def cache_reference_image(src_path: str) -> str:
+    """
+    Ensure a reference image is under the app tree (data/ref_cache).
+
+    Gradio refuses to cache/serve files outside cwd, temp, and allowed_paths.
+    External picks (e.g. G:\\Pictures\\...) are copied once into ref_cache.
+    Never returns a path outside the app tree (empty string on failure).
+    """
+    import hashlib
+    import shutil
+
+    p = Path((src_path or "").strip())
+    if not p.is_file():
+        return ""
+    try:
+        resolved = p.resolve()
+    except Exception:
+        resolved = p
+
+    if _is_under_app_root(resolved):
+        return str(resolved)
+
+    dest_dir = get_ref_cache_dir()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        h = hashlib.sha1()
+        with open(resolved, "rb") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                h.update(chunk)
+        digest = h.hexdigest()[:16]
+    except OSError:
+        digest = hashlib.sha1(str(resolved).encode("utf-8", errors="replace")).hexdigest()[:16]
+    suffix = resolved.suffix.lower() if resolved.suffix else ".png"
+    if suffix not in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"):
+        suffix = ".png"
+    dest = dest_dir / f"ref_{digest}{suffix}"
+    if not dest.is_file() or dest.stat().st_size == 0:
+        try:
+            shutil.copy2(str(resolved), str(dest))
+        except OSError as e:
+            print(f"[ref-cache] copy failed: {e}", flush=True)
+            return ""
+    return str(dest) if dest.is_file() else ""
+
+
+def project_reference_path(project_dir: str | Path) -> str:
+    """Return existing output/<song>/reference.* path, or empty string."""
+    root = Path(project_dir or "")
+    if not root.is_dir():
+        return ""
+    for name in (
+        "reference.jpg", "reference.jpeg", "reference.png",
+        "reference.webp", "reference.bmp", "reference.gif",
+    ):
+        cand = root / name
+        if cand.is_file():
+            return str(cand)
+    # Any reference* with image suffix
+    try:
+        for p in sorted(root.glob("reference.*")):
+            if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif") and p.is_file():
+                return str(p)
+    except OSError:
+        pass
+    return ""
+
+
+def ensure_project_reference(project_dir: str | Path, src_path: str = "") -> str:
+    """
+    Copy a reference image into the project as reference.<ext>.
+
+    Prefer src_path when given; otherwise keep an existing project reference.
+    Always returns a path under the project (or empty). Gradio-safe.
+    """
+    import shutil
+
+    root = Path(project_dir or "")
+    if not root.is_dir():
+        return cache_reference_image(src_path) if src_path else ""
+
+    src = (src_path or "").strip()
+    existing = project_reference_path(root)
+
+    # Already the project file
+    if src and existing and Path(src).resolve() == Path(existing).resolve():
+        return existing
+
+    # No new source — keep existing project ref
+    if not src or not Path(src).is_file():
+        return existing
+
+    # Source already under this project
+    try:
+        if Path(src).resolve().parent.resolve() == root.resolve():
+            return str(Path(src).resolve())
+    except Exception:
+        pass
+
+    suffix = Path(src).suffix.lower() or ".jpg"
+    if suffix not in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"):
+        suffix = ".jpg"
+    # Canonical name: reference.jpg / reference.png
+    if suffix == ".jpeg":
+        suffix = ".jpg"
+    dest = root / f"reference{suffix}"
+
+    # Remove other reference.* variants so only one is active
+    try:
+        for old in root.glob("reference.*"):
+            if old.resolve() != dest.resolve():
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+    try:
+        if not dest.is_file() or Path(src).resolve() != dest.resolve():
+            shutil.copy2(src, dest)
+        print(f"[ref] project reference → {dest}", flush=True)
+        return str(dest)
+    except OSError as e:
+        print(f"[ref] could not copy into project: {e}", flush=True)
+        return existing or cache_reference_image(src)
 
 
 def get_llama_bin_dir() -> Path:
@@ -83,6 +227,7 @@ def ensure_data_dirs() -> None:
         get_dictionaries_dir(),
         get_data_dir() / "temp_images",
         get_data_dir() / "temp_audio",
+        get_ref_cache_dir(),
     ):
         d.mkdir(parents=True, exist_ok=True)
     # Keep vision projectors out of models/ root so pure-text loads stay clean
@@ -99,7 +244,7 @@ ENCODER_MODEL_HINT = (
 THINKING_MODEL_HINT = "Huihui-Qwen3-VL-4B-Thinking-abliterated*.gguf"
 MMPROJ_HINT = "mmproj*.gguf  (quarantined under models/mmproj/ — not used for pure text)"
 DIFFUSER_MODEL_HINT = "flux-2-klein-4b-Q8_0.gguf  OR  diffusion_pytorch_model_4b.safetensors"
-VAE_HINT = "diffusion_pytorch_model.safetensors (Flux.2 VAE)"
+VAE_HINT = "flux2_ae.safetensors (Flux.2 VAE from black-forest-labs/FLUX.2-dev — NOT Flux.1 ae.safetensors)"
 
 # Qwen3-VL-4B backbone (Instruct / Thinking / Uncensored share architecture)
 ENCODER_MAX_LAYERS = 36
@@ -119,7 +264,7 @@ AFFINITY_CORE_OFFSET = 2  # skip cores 0 and 1
 
 # Model weight load mode (per model column: encoder / thinking / diffuser)
 # One-Shot  → mmap / default load (lazy page-in; lower peak RAM)
-# M-Lock    → force model resident in RAM (--mlock) so weights are not swapped
+# M-Lock    → force model resident in RAM (-lm mlock) so weights are not swapped
 LOAD_MODE_ONE_SHOT = "One-Shot"
 LOAD_MODE_MLOCK = "M-Lock"
 LOAD_MODE_CHOICES = [LOAD_MODE_ONE_SHOT, LOAD_MODE_MLOCK]
@@ -383,6 +528,259 @@ STYLE_LIGHT = "light and bright"
 STYLE_DARK = "dark and gloomy"
 STYLE_COLORFUL = "colorful and wild"
 STYLE_CHOICES = [STYLE_LIGHT, STYLE_DARK, STYLE_COLORFUL]
+# Default visual style for new projects / fresh installs
+STYLE_DEFAULT = STYLE_DARK
+
+# ---------------------------------------------------------------------------
+# Hair style (subject token — optional via None)
+# Injected into character-bearing prompts when not None.
+# ---------------------------------------------------------------------------
+HAIR_STYLE_SHORT = "Short"
+HAIR_STYLE_NATURAL = "Natural"
+HAIR_STYLE_BOB = "Bob"
+HAIR_STYLE_PONY = "Pony"
+HAIR_STYLE_PIGTAIL = "PigTail"
+HAIR_STYLE_DUDE = "Dude"
+HAIR_STYLE_NONE = "None"
+ALL_HAIR_STYLES = "All Styles"
+HAIR_STYLE_CHOICES = [
+    HAIR_STYLE_SHORT, HAIR_STYLE_NATURAL, HAIR_STYLE_DUDE, HAIR_STYLE_BOB,
+    HAIR_STYLE_PONY, HAIR_STYLE_PIGTAIL, HAIR_STYLE_NONE,
+    ALL_HAIR_STYLES,
+]
+HAIR_STYLE_CONCRETE = [
+    HAIR_STYLE_SHORT, HAIR_STYLE_NATURAL, HAIR_STYLE_DUDE, HAIR_STYLE_BOB,
+    HAIR_STYLE_PONY, HAIR_STYLE_PIGTAIL, HAIR_STYLE_NONE,
+]
+HAIR_STYLE_DEFAULT = HAIR_STYLE_NONE
+HAIR_STYLE_TOKEN = "<hair_style>"
+HAIR_STYLE_WORDS = {
+    HAIR_STYLE_SHORT: "cut short and even, three inches length",
+    HAIR_STYLE_NATURAL: "worn naturally, 3 inches length all over",
+    HAIR_STYLE_DUDE: "center parting, shaggy and shoulder length",
+    HAIR_STYLE_BOB: "styled in a short bob with a fringe",
+    HAIR_STYLE_PONY: "tied-back in a shoulder-length high-ponytail",
+    HAIR_STYLE_PIGTAIL: "tied-back in 2 shoulder-length high-pigtails",
+    HAIR_STYLE_NONE: "",
+}
+
+
+def normalize_hair_style(value: str) -> str:
+    v = (value or "").strip()
+    if v in HAIR_STYLE_CHOICES:
+        return v
+    for c in HAIR_STYLE_CONCRETE:
+        if c.lower() == v.lower():
+            return c
+    return HAIR_STYLE_DEFAULT
+
+
+def hair_style_phrase(value: str) -> str:
+    """Concrete hair description, or empty when None / All Styles."""
+    key = normalize_hair_style(value)
+    if key in (HAIR_STYLE_NONE, ALL_HAIR_STYLES):
+        return ""
+    return (HAIR_STYLE_WORDS.get(key) or "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Outfit worn (subject token — optional via None)
+# ---------------------------------------------------------------------------
+OUTFIT_SMART_SUIT = "Smart Suit"
+OUTFIT_SMART_CASUAL_MALE = "Casual_Male"
+OUTFIT_SMART_CASUAL_FEMALE = "Casual_Female"
+OUTFIT_JOGGERS = "Joggers"
+OUTFIT_ROCKER = "Rocker"
+OUTFIT_SKIMPY = "Skimpy"
+OUTFIT_UNDIES = "Undies"
+OUTFIT_NONE = "None"
+ALL_OUTFITS = "All Outfits"
+OUTFIT_CHOICES = [
+    OUTFIT_SMART_SUIT, OUTFIT_SMART_CASUAL_MALE, OUTFIT_SMART_CASUAL_FEMALE,
+    OUTFIT_JOGGERS, OUTFIT_ROCKER, OUTFIT_SKIMPY, OUTFIT_UNDIES, OUTFIT_NONE,
+    ALL_OUTFITS,
+]
+OUTFIT_CONCRETE = [
+    OUTFIT_SMART_SUIT, OUTFIT_SMART_CASUAL_MALE, OUTFIT_SMART_CASUAL_FEMALE,
+    OUTFIT_JOGGERS, OUTFIT_ROCKER, OUTFIT_SKIMPY, OUTFIT_UNDIES, OUTFIT_NONE,
+]
+OUTFIT_DEFAULT = OUTFIT_NONE
+OUTFIT_TOKEN = "<outfit_worn>"
+OUTFIT_WORDS = {
+    OUTFIT_SMART_SUIT: "smart-suit with unbuttoned-shirt outfit",
+    OUTFIT_SMART_CASUAL_MALE: "black-tshirt with grey-smart-jeans outfit",
+    OUTFIT_SMART_CASUAL_FEMALE: "black-tshirt with grey-short-skirt outfit",
+    OUTFIT_JOGGERS: "black-crop-top with grey-jogging-shorts outfit",
+    OUTFIT_ROCKER: "long-black-leather-coat with black shirt and grey-jeans outfit",
+    OUTFIT_SKIMPY: "skimpy-revealing version of same outfit",
+    OUTFIT_UNDIES: "underwear only",
+    OUTFIT_NONE: "",
+}
+
+
+def normalize_outfit(value: str) -> str:
+    v = (value or "").strip()
+    if v in OUTFIT_CHOICES:
+        return v
+    for c in OUTFIT_CONCRETE:
+        if c.lower() == v.lower():
+            return c
+    return OUTFIT_DEFAULT
+
+
+def outfit_phrase(value: str) -> str:
+    """Concrete outfit noun-phrase, or empty when None / All Outfits."""
+    key = normalize_outfit(value)
+    if key in (OUTFIT_NONE, ALL_OUTFITS):
+        return ""
+    return (OUTFIT_WORDS.get(key) or "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Reference image gender (subject token)
+# ---------------------------------------------------------------------------
+GENDER_MALE = "Mal(s)"
+GENDER_MIXED = "M+F(s)"
+GENDER_SHEFEM = "S+F(s)"
+GENDER_NEUT = "Neut(s)"
+GENDER_TRANS = "Shem(s)"
+GENDER_FEMALE = "Fem(s)"
+GENDER_CHOICES = [
+    GENDER_MALE, GENDER_MIXED, GENDER_SHEFEM, GENDER_NEUT, GENDER_TRANS, GENDER_FEMALE,
+]
+GENDER_DEFAULT = GENDER_MALE
+GENDER_WORDS = {
+    GENDER_MALE: "male",
+    GENDER_MIXED: "mixed-gender",
+    GENDER_SHEFEM: "feminine-presenting",
+    GENDER_NEUT: "androgynous",
+    GENDER_TRANS: "transfeminine",
+    GENDER_FEMALE: "female",
+}
+
+
+def normalize_gender(value: str) -> str:
+    v = (value or "").strip()
+    if v in GENDER_CHOICES:
+        return v
+    for c in GENDER_CHOICES:
+        if c.lower() == v.lower():
+            return c
+    return GENDER_DEFAULT
+
+
+def gender_phrase(value: str) -> str:
+    key = normalize_gender(value)
+    return (GENDER_WORDS.get(key) or "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Reference image bodyshape (subject token)
+# ---------------------------------------------------------------------------
+BODYSHAPE_OVERWEIGHT = "Overweight"
+BODYSHAPE_CURVY = "Curvy"
+BODYSHAPE_SLIM = "Slim"
+BODYSHAPE_SKINNY = "Skinny"
+BODYSHAPE_EXOTIC = "Exotic"
+BODYSHAPE_MUSCULAR = "Muscular"
+ALL_BODYSHAPES = "All Shapes"
+BODYSHAPE_CHOICES = [
+    BODYSHAPE_OVERWEIGHT, BODYSHAPE_CURVY, BODYSHAPE_SLIM,
+    BODYSHAPE_SKINNY, BODYSHAPE_EXOTIC, BODYSHAPE_MUSCULAR,
+    ALL_BODYSHAPES,
+]
+BODYSHAPE_CONCRETE = [
+    BODYSHAPE_OVERWEIGHT, BODYSHAPE_CURVY, BODYSHAPE_SLIM,
+    BODYSHAPE_SKINNY, BODYSHAPE_EXOTIC, BODYSHAPE_MUSCULAR,
+]
+BODYSHAPE_DEFAULT = BODYSHAPE_SLIM
+BODYSHAPE_WORDS = {
+    BODYSHAPE_OVERWEIGHT: "overweight",
+    BODYSHAPE_CURVY: "curvy",
+    BODYSHAPE_SLIM: "slim",
+    BODYSHAPE_SKINNY: "skinny",
+    BODYSHAPE_EXOTIC: "exotic",
+    BODYSHAPE_MUSCULAR: "muscular",
+    ALL_BODYSHAPES: "",
+}
+
+
+def normalize_bodyshape(value: str) -> str:
+    v = (value or "").strip()
+    if v in BODYSHAPE_CHOICES:
+        return v
+    for c in BODYSHAPE_CONCRETE:
+        if c.lower() == v.lower():
+            return c
+    return BODYSHAPE_DEFAULT
+
+
+def bodyshape_phrase(value: str) -> str:
+    key = normalize_bodyshape(value)
+    if key == ALL_BODYSHAPES:
+        return ""
+    return (BODYSHAPE_WORDS.get(key) or "").strip()
+
+
+def subject_appearance_clause(
+    hair: str = "",
+    outfit: str = "",
+    gender: str = "",
+    bodyshape: str = "",
+) -> str:
+    """
+    Build optional identity/appearance text for character-bearing prompts.
+    Hair/outfit omitted when None; gender/bodyshape default to concrete words.
+    """
+    bits: List[str] = []
+    gp = gender_phrase(gender) if gender else ""
+    bp = bodyshape_phrase(bodyshape) if bodyshape else ""
+    if gp:
+        bits.append(f"{gp} subject")
+    if bp:
+        bits.append(f"{bp} bodyshape")
+    hp = hair_style_phrase(hair)
+    op = outfit_phrase(outfit)
+    if hp:
+        bits.append(f"hair {hp}")
+    if op:
+        bits.append(f"wearing a {op}")
+    if not bits:
+        return ""
+    return "Subject appearance: " + "; ".join(bits) + "."
+
+
+def character_identity_clause(
+    hair: str = "",
+    outfit: str = "",
+    gender: str = "",
+    bodyshape: str = "",
+) -> str:
+    """
+    Strong identity-lock sentence for stills that attach the reference image.
+    Mirrors Image-Glamour's "facial appearance and personal identity match
+    the reference image exactly, other than …" pattern.
+    """
+    gp = gender_phrase(gender) or "person"
+    bp = bodyshape_phrase(bodyshape)
+    hp = hair_style_phrase(hair)
+    op = outfit_phrase(outfit)
+    other: List[str] = []
+    if bp:
+        other.append(f"a {bp} bodyshape")
+    if hp:
+        other.append(f"hair {hp}")
+    if op:
+        other.append(f"wearing a {op}")
+    other_bit = ""
+    if other:
+        other_bit = ", other than the subject being " + ", ".join(other)
+    return (
+        f"Photorealistic depiction of the {gp} whose facial appearance and "
+        f"personal identity match the reference image exactly{other_bit}. "
+        "Preserve the same face, bone structure, eyes, and likeness from the "
+        "reference; anatomically correct hands with five fingers on each hand."
+    )
 
 # Fade colours (RGB 0-255) used for intro/outro and lyric gaps
 STYLE_FADE_RGB = {
@@ -436,12 +834,232 @@ RESOLUTION_PIXELS = {
 }
 
 # Default generation values for Flux.2-klein-4B distilled
-DEFAULT_WIDTH = 512
+DEFAULT_WIDTH = 768
 DEFAULT_HEIGHT = 512
-DEFAULT_STEPS = 4
+DEFAULT_STEPS = 8  # 8 improves eyes / fine detail vs 4 on Flux.2-klein
 DEFAULT_CFG = 1.0
+# Sectioned negative: periods group related terms (style / overlays / quality / anatomy).
+DEFAULT_NEGATIVE_PROMPT = (
+    "cartoon, pixelated, anime, illustration. "
+    "text, letters, words, writing, typography, caption, subtitle, title text, "
+    "graphical overlay, text overlay, UI, HUD, watermark, logo, signature, stamp. "
+    "blurry, low quality, noisy, jpeg artifacts. "
+    "deformed, extra limbs, mutated hands, bad anatomy."
+)
+# Extra negatives always merged into cover stills (Flux 4B loves to write titles).
+COVER_NEGATIVE_EXTRA = (
+    "text, letters, words, writing, typography, alphabet, calligraphy, "
+    "signage, poster text, album title text, readable text, misspelled text, "
+    "graphical overlay, text overlay, watermark, logo, banner, caption."
+)
 DEFAULT_SAMPLER = "euler_a"
 DEFAULT_SEED = -1
+
+# Still output sizes (width × height) — user-selectable in Generation tab
+IMAGE_SIZE_768x512 = "768 × 512"
+IMAGE_SIZE_1024x512 = "1024 × 512"
+IMAGE_SIZE_1024x768 = "1024 × 768"
+IMAGE_SIZE_1280x768 = "1280 × 768"
+IMAGE_SIZE_1280x720 = "1280 × 720"
+IMAGE_SIZE_640x360 = "640 × 360"
+IMAGE_SIZE_CHOICES = [
+    IMAGE_SIZE_768x512,
+    IMAGE_SIZE_1024x512,
+    IMAGE_SIZE_1024x768,
+    IMAGE_SIZE_1280x768,
+    IMAGE_SIZE_1280x720,
+    IMAGE_SIZE_640x360,
+]
+IMAGE_SIZE_PIXELS = {
+    IMAGE_SIZE_768x512: (768, 512),
+    IMAGE_SIZE_1024x512: (1024, 512),
+    IMAGE_SIZE_1024x768: (1024, 768),
+    IMAGE_SIZE_1280x768: (1280, 768),
+    IMAGE_SIZE_1280x720: (1280, 720),
+    IMAGE_SIZE_640x360: (640, 360),
+}
+DEFAULT_IMAGE_SIZE = IMAGE_SIZE_768x512
+
+# Thumbnail placeholder aspect class for images/thumbnails_*_{regular|wide}.jpg
+# regular: 768×512, 1024×768
+# wide:    1024×512, 1280×768, 1280×720, 640×360
+IMAGE_SIZE_ASPECT_REGULAR = "regular"
+IMAGE_SIZE_ASPECT_WIDE = "wide"
+IMAGE_SIZE_ASPECT = {
+    IMAGE_SIZE_768x512: IMAGE_SIZE_ASPECT_REGULAR,
+    IMAGE_SIZE_1024x768: IMAGE_SIZE_ASPECT_REGULAR,
+    IMAGE_SIZE_1024x512: IMAGE_SIZE_ASPECT_WIDE,
+    IMAGE_SIZE_1280x768: IMAGE_SIZE_ASPECT_WIDE,
+    IMAGE_SIZE_1280x720: IMAGE_SIZE_ASPECT_WIDE,
+    IMAGE_SIZE_640x360: IMAGE_SIZE_ASPECT_WIDE,
+}
+
+
+def normalize_image_size(value: str) -> str:
+    """Map a label or 'WxH' string to a canonical IMAGE_SIZE_* choice."""
+    v = (value or "").strip()
+    if v in IMAGE_SIZE_PIXELS:
+        return v
+    # Accept "768x512", "768 × 512", "768*512", etc.
+    compact = re.sub(r"\s+", "", v.lower().replace("×", "x").replace("*", "x"))
+    for label, (w, h) in IMAGE_SIZE_PIXELS.items():
+        if compact == f"{w}x{h}":
+            return label
+    return DEFAULT_IMAGE_SIZE
+
+
+def image_size_pixels(value: str) -> Tuple[int, int]:
+    """Return (width, height) for a size label; falls back to defaults."""
+    label = normalize_image_size(value)
+    return IMAGE_SIZE_PIXELS.get(label, (DEFAULT_WIDTH, DEFAULT_HEIGHT))
+
+
+def image_size_label_from_wh(width: int, height: int) -> str:
+    """Best matching dropdown label for stored width/height."""
+    for label, (w, h) in IMAGE_SIZE_PIXELS.items():
+        if int(width) == w and int(height) == h:
+            return label
+    return DEFAULT_IMAGE_SIZE
+
+
+def image_size_aspect(value: str = "") -> str:
+    """Return 'regular' or 'wide' for thumbnail placeholder selection."""
+    label = normalize_image_size(value) if value else ""
+    if label in IMAGE_SIZE_ASPECT:
+        return IMAGE_SIZE_ASPECT[label]
+    # Infer from pixels when label unknown
+    try:
+        w, h = image_size_pixels(value) if value else (DEFAULT_WIDTH, DEFAULT_HEIGHT)
+        if h > 0 and (float(w) / float(h)) >= 1.6:
+            return IMAGE_SIZE_ASPECT_WIDE
+    except Exception:
+        pass
+    return IMAGE_SIZE_ASPECT_REGULAR
+
+
+def merge_negative_prompt(base: str = "", *, cover: bool = False) -> str:
+    """Combine user/default negative with optional cover-specific anti-text terms."""
+    bits = []
+    b = (base or "").strip() or DEFAULT_NEGATIVE_PROMPT
+    bits.append(b)
+    if cover:
+        bits.append(COVER_NEGATIVE_EXTRA)
+    # De-dupe while preserving order
+    seen = set()
+    out: List[str] = []
+    for chunk in bits:
+        for part in re.split(r"[.,;]+", chunk):
+            t = part.strip().lower()
+            if not t or t in seen:
+                continue
+            seen.add(t)
+            out.append(part.strip())
+    return ", ".join(out)
+
+
+
+# Image frequency presets: Cover / Theme / Lyrics-per-line
+# Labels shown in the Generation dropdown.
+#   C = cover stills · T = theme (ambient) stills · L = stills per lyric line
+IMAGE_FREQUENCY_CHOICES = [
+    "C1/T2/L1", "C2/T4/L1", "C3/T6/L1",
+    "C1/T2/L2", "C2/T4/L2", "C3/T6/L2",
+    "C1/T2/L3", "C2/T4/L3", "C3/T6/L3",
+]
+DEFAULT_IMAGE_FREQUENCY = "C1/T2/L1"
+
+IMAGE_FREQUENCY_MAP = {
+    "C1/T2/L1": {"cover": 1, "theme": 2, "lyrics": 1},
+    "C2/T4/L1": {"cover": 2, "theme": 4, "lyrics": 1},
+    "C3/T6/L1": {"cover": 3, "theme": 6, "lyrics": 1},
+    "C1/T2/L2": {"cover": 1, "theme": 2, "lyrics": 2},
+    "C2/T4/L2": {"cover": 2, "theme": 4, "lyrics": 2},
+    "C3/T6/L2": {"cover": 3, "theme": 6, "lyrics": 2},
+    "C1/T2/L3": {"cover": 1, "theme": 2, "lyrics": 3},
+    "C2/T4/L3": {"cover": 2, "theme": 4, "lyrics": 3},
+    "C3/T6/L3": {"cover": 3, "theme": 6, "lyrics": 3},
+    # Legacy aliases from v1
+    "C1/T2/LX": {"cover": 1, "theme": 2, "lyrics": 1},
+    "C2/T4/LX": {"cover": 2, "theme": 4, "lyrics": 1},
+    "C3/T6/LX": {"cover": 3, "theme": 6, "lyrics": 1},
+}
+
+# Framing hints when generating multiple stills for one lyric line
+IMAGE_FREQUENCY_SEQUENCE = {
+    1: [""],
+    2: [
+        "opening beat of this moment — establish the scene",
+        "closing beat of this moment — resolve the beat",
+    ],
+    3: [
+        "beginning of this moment",
+        "middle / peak of this moment",
+        "end of this moment",
+    ],
+}
+
+
+def normalize_image_frequency(value) -> str:
+    """Return a canonical frequency preset label (C1/T2/L1 …). Accepts legacy ints/LX."""
+    v = str(value or "").strip().upper().replace(" ", "")
+    # Normalise LX → L1 for lookup display
+    if v.endswith("/LX"):
+        v = v[:-2] + "L1"
+    if v in IMAGE_FREQUENCY_MAP and not v.endswith("/LX"):
+        # Prefer non-legacy key when both exist
+        if v in IMAGE_FREQUENCY_CHOICES:
+            return v
+    if v in IMAGE_FREQUENCY_MAP:
+        # Map legacy LX keys to L1 display labels
+        legacy = {
+            "C1/T2/LX": "C1/T2/L1",
+            "C2/T4/LX": "C2/T4/L1",
+            "C3/T6/LX": "C3/T6/L1",
+        }
+        return legacy.get(v, v if v in IMAGE_FREQUENCY_CHOICES else DEFAULT_IMAGE_FREQUENCY)
+    try:
+        n = int(value)
+        if n <= 1:
+            return "C1/T2/L1"
+        if n == 2:
+            return "C2/T4/L2"
+        return "C3/T6/L3"
+    except (TypeError, ValueError):
+        pass
+    return DEFAULT_IMAGE_FREQUENCY
+
+
+def frequency_counts(value) -> Dict[str, int]:
+    """Return {'cover': N, 'theme': M, 'lyrics': K} for a preset or legacy value."""
+    key = normalize_image_frequency(value)
+    # Also try raw string for legacy map keys
+    raw = str(value or "").strip().upper().replace(" ", "")
+    src = IMAGE_FREQUENCY_MAP.get(key) or IMAGE_FREQUENCY_MAP.get(raw) or IMAGE_FREQUENCY_MAP[DEFAULT_IMAGE_FREQUENCY]
+    return dict(src)
+
+
+def frequency_cover_count(value) -> int:
+    return int(frequency_counts(value).get("cover", 1))
+
+
+def frequency_theme_count(value) -> int:
+    return int(frequency_counts(value).get("theme", 2))
+
+
+def frequency_lyrics_per_line(value) -> int:
+    return int(frequency_counts(value).get("lyrics", 1))
+
+
+def image_frequency_hints(freq) -> list:
+    """Ordered sequence framing strings for multi-variant lyric stills (length == lyrics-per-line)."""
+    n = frequency_lyrics_per_line(freq)
+    hints = IMAGE_FREQUENCY_SEQUENCE.get(n) or IMAGE_FREQUENCY_SEQUENCE[1]
+    if len(hints) < n:
+        hints = list(hints) + [""] * (n - len(hints))
+    return list(hints[:n])
+
+
+
 
 # Window geometry defaults
 WINDOW_DEFAULT_WIDTH = 1280
@@ -459,7 +1077,8 @@ MODEL_PATH_PLACEHOLDERS = {
     "thinking": "Huihui-…Thinking-abliterated…Q5_K_M.gguf",
     "mmproj": "mmproj*.gguf (auto-quarantined; not used for pure text)",
     "diffuser": "flux-2-klein-4b-Q8_0.gguf",
-    "vae": "diffusion_pytorch_model.safetensors (Flux.2 VAE)",
+    "llm": "path/to/Qwen3-4B-*.gguf / qwen_3_4b.safetensors (Flux.2 text encoder)",
+    "vae": "flux2_ae.safetensors OR BFL vae/diffusion_pytorch_model.safetensors (~350MB)",
 }
 
 
@@ -484,6 +1103,16 @@ APP_STATE: Dict[str, Any] = {
     "models_unloaded": False,
     "last_image_path": "",
     "current_project_folder": "",
+    # Session management (Generation left column)
+    "active_session_id": "",       # folder name under output/, or "" for blank new
+    "sessions_sidebar_expanded": True,
+    "session_status": "idle",      # idle | running | stopped | done
+    # Per-still regenerate queue (0-based line indices); drained when idle
+    "regen_queue": [],
+    "generating": False,
+    # 1-based lyric line numbers listed for generation but not started yet
+    # (drives thumbnails_qued_for_generation.jpg in the Materials grid)
+    "thumb_queued_lines": [],
 }
 
 
@@ -697,6 +1326,7 @@ CONFIGURATION_KEYS = [
     "thinking_model_path",
     "imagegen_model_path",
     "vae_model_path",
+    "llm_model_path",
     "encoder_backend",
     "thinking_backend",
     "imagegen_backend",
@@ -733,6 +1363,7 @@ def _default_configuration() -> Dict[str, Any]:
         "thinking_model_path": "",
         "imagegen_model_path": "",
         "vae_model_path": "",
+        "llm_model_path": "",
         "encoder_backend": "CPU",
         "thinking_backend": "CPU",
         "imagegen_backend": "CPU",
@@ -818,7 +1449,7 @@ PREFERENCES_KEYS = [
 
 def _default_preferences() -> Dict[str, Any]:
     return {
-        "style": STYLE_LIGHT,
+        "style": STYLE_DEFAULT,
         "video_format": VIDEO_MP4,
         "max_thumbnails": DEFAULT_MAX_THUMBNAILS,
         "input_thumbnail_size": DEFAULT_INPUT_THUMBNAIL,
@@ -890,6 +1521,8 @@ def update_prompting(updates: Dict[str, Any]) -> Dict[str, Any]:
 GENERATION_KEYS = [
     "imagegen_width",
     "imagegen_height",
+    "imagegen_size",
+    "imagegen_frequency",
     "imagegen_steps",
     "imagegen_cfg_scale",
     "imagegen_seed",
@@ -900,6 +1533,13 @@ GENERATION_KEYS = [
     "output_resolution",
     "last_project_folder",
     "last_markers",
+    "reference_image_path",
+    "hair_style",
+    "outfit_worn",
+    "ref_gender",
+    "ref_bodyshape",
+    "project_label",
+    "last_image_gen_seconds",
 ]
 
 
@@ -907,6 +1547,8 @@ def _default_generation() -> Dict[str, Any]:
     return {
         "imagegen_width": DEFAULT_WIDTH,
         "imagegen_height": DEFAULT_HEIGHT,
+        "imagegen_size": DEFAULT_IMAGE_SIZE,
+        "imagegen_frequency": DEFAULT_IMAGE_FREQUENCY,
         "imagegen_steps": DEFAULT_STEPS,
         "imagegen_cfg_scale": DEFAULT_CFG,
         "imagegen_seed": DEFAULT_SEED,
@@ -917,6 +1559,13 @@ def _default_generation() -> Dict[str, Any]:
         "output_resolution": "720p",
         "last_project_folder": "",
         "last_markers": [],
+        "reference_image_path": "",
+        "hair_style": HAIR_STYLE_DEFAULT,
+        "outfit_worn": OUTFIT_DEFAULT,
+        "ref_gender": GENDER_DEFAULT,
+        "ref_bodyshape": BODYSHAPE_DEFAULT,
+        "project_label": "",
+        "last_image_gen_seconds": 0.0,
     }
 
 
@@ -1011,3 +1660,258 @@ def set_last_image_dir(path: str) -> None:
 def get_images_dir() -> Path:
     """Optional icons / banner folder."""
     return _get_project_root() / "images"
+
+
+# ---------------------------------------------------------------------------
+# Session management (project folders under output/)
+# ---------------------------------------------------------------------------
+
+SESSION_META_NAME = "session.json"
+
+# session.json schema (written by pipeline / UI):
+# {
+#   "song_name": str,
+#   "lyrics": str,
+#   "style": str,
+#   "steps": int,
+#   "cfg_scale": float,
+#   "reference_image": str,   # original path or project-relative
+#   "phase": "none"|"analysis"|"prompts"|"images"|"done"|"stopped",
+#   "line_count": int,
+#   "images_done": int,
+#   "created": float,         # unix time
+#   "updated": float,
+# }
+
+
+def _session_meta_path(project_dir: Path) -> Path:
+    return project_dir / SESSION_META_NAME
+
+
+def load_session_meta(project_dir: Path) -> Dict[str, Any]:
+    path = _session_meta_path(project_dir)
+    defaults: Dict[str, Any] = {
+        "song_name": project_dir.name,
+        "lyrics": "",
+        "style": STYLE_LIGHT,
+        "steps": DEFAULT_STEPS,
+        "cfg_scale": DEFAULT_CFG,
+        "reference_image": "",
+        "negative_prompt": DEFAULT_NEGATIVE_PROMPT,
+        "phase": "none",
+        "line_count": 0,
+        "images_done": 0,
+        "created": 0.0,
+        "updated": 0.0,
+    }
+    if not path.exists():
+        return defaults
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            defaults.update(data)
+    except (json.JSONDecodeError, OSError):
+        pass
+    return defaults
+
+
+def save_session_meta(project_dir: Path, updates: Dict[str, Any]) -> Dict[str, Any]:
+    data = load_session_meta(project_dir)
+    data.update(updates or {})
+    import time as _time
+    data["updated"] = _time.time()
+    if not data.get("created"):
+        data["created"] = data["updated"]
+    path = _session_meta_path(project_dir)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        tmp.replace(path)
+    except OSError as e:
+        print(f"[session] could not write meta: {e}", flush=True)
+    return data
+
+
+def list_session_images(project_dir: Path) -> List[str]:
+    """Sorted list of numbered stills only (001-… / 001 - …). Never reference.*."""
+    if not project_dir or not Path(project_dir).is_dir():
+        return []
+    imgs: List[Tuple[int, Path]] = []
+    for p in Path(project_dir).iterdir():
+        if not p.is_file():
+            continue
+        if p.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
+            continue
+        if p.name.lower().startswith("reference"):
+            continue
+        # Accept "001-slug.png", "001 - lyric.png", "001.png"
+        m = re.match(r"^(\d{3})(?:\s*[-–—]|[-.]|$)", p.name)
+        if not m:
+            continue
+        imgs.append((int(m.group(1)), p))
+    imgs.sort(key=lambda t: (t[0], t[1].name))
+    return [str(p) for _, p in imgs]
+
+
+def list_sessions() -> List[Dict[str, Any]]:
+    """
+    Enumerate project folders under output/.
+    Each entry: id (folder name), path, label, phase, images_done, line_count, mtime.
+    Sorted newest-first by updated/mtime.
+    """
+    root = get_output_dir()
+    if not root.is_dir():
+        return []
+    sessions: List[Dict[str, Any]] = []
+    for p in root.iterdir():
+        if not p.is_dir():
+            continue
+        # Skip hidden / temp
+        if p.name.startswith("."):
+            continue
+        meta = load_session_meta(p)
+        images = list_session_images(p)
+        images_done = len(images)
+        # Prefer meta; fall back to counting files / lyrics
+        line_count = int(meta.get("line_count") or 0)
+        if line_count <= 0:
+            lyrics_file = p / "lyrics.txt"
+            if lyrics_file.exists():
+                try:
+                    # rough: non-empty non-header lines
+                    text = lyrics_file.read_text(encoding="utf-8", errors="replace")
+                    n = 0
+                    for raw in text.splitlines():
+                        t = raw.strip()
+                        if not t:
+                            continue
+                        if t.startswith("[") and t.endswith("]"):
+                            continue
+                        n += 1
+                    line_count = n
+                except OSError:
+                    pass
+        phase = str(meta.get("phase") or "none")
+        if phase in ("none", "") and images_done > 0:
+            if line_count > 0 and images_done >= line_count:
+                phase = "done"
+            else:
+                phase = "stopped"
+        elif phase == "images" and line_count > 0 and images_done >= line_count:
+            phase = "done"
+        mtime = float(meta.get("updated") or 0) or p.stat().st_mtime
+        song = (meta.get("song_name") or p.name).strip() or p.name
+        sessions.append({
+            "id": p.name,
+            "path": str(p),
+            "label": p.name,  # folder name already encodes song + serial
+            "song_name": song,
+            "phase": phase,
+            "images_done": images_done,
+            "line_count": line_count,
+            "mtime": mtime,
+            "image_paths": images,
+            "lyrics": meta.get("lyrics") or "",
+            "style": meta.get("style") or STYLE_LIGHT,
+            "steps": meta.get("steps", DEFAULT_STEPS),
+            "cfg_scale": meta.get("cfg_scale", DEFAULT_CFG),
+            "reference_image": meta.get("reference_image") or "",
+            "negative_prompt": meta.get("negative_prompt") if meta.get("negative_prompt") is not None else DEFAULT_NEGATIVE_PROMPT,
+        })
+    sessions.sort(key=lambda s: s["mtime"], reverse=True)
+    return sessions
+
+
+def get_session_by_id(session_id: str) -> Optional[Dict[str, Any]]:
+    if not session_id:
+        return None
+    for s in list_sessions():
+        if s["id"] == session_id:
+            return s
+    # Direct path check
+    p = get_output_dir() / session_id
+    if p.is_dir():
+        meta = load_session_meta(p)
+        images = list_session_images(p)
+        return {
+            "id": p.name,
+            "path": str(p),
+            "label": p.name,
+            "song_name": meta.get("song_name") or p.name,
+            "phase": meta.get("phase") or "none",
+            "images_done": len(images),
+            "line_count": int(meta.get("line_count") or 0),
+            "mtime": float(meta.get("updated") or p.stat().st_mtime),
+            "image_paths": images,
+            "lyrics": meta.get("lyrics") or "",
+            "style": meta.get("style") or STYLE_LIGHT,
+            "steps": meta.get("steps", DEFAULT_STEPS),
+            "cfg_scale": meta.get("cfg_scale", DEFAULT_CFG),
+            "reference_image": meta.get("reference_image") or "",
+            "negative_prompt": meta.get("negative_prompt") if meta.get("negative_prompt") is not None else DEFAULT_NEGATIVE_PROMPT,
+        }
+    return None
+
+
+def delete_session(session_id: str) -> bool:
+    """Remove one project folder under output/. Returns True on success."""
+    if not session_id:
+        return False
+    p = get_output_dir() / session_id
+    if not p.is_dir():
+        return False
+    # Safety: only delete under output/
+    try:
+        p.resolve().relative_to(get_output_dir().resolve())
+    except ValueError:
+        return False
+    try:
+        shutil.rmtree(p)
+        if APP_STATE.get("current_project_folder") == str(p):
+            APP_STATE["current_project_folder"] = ""
+        if APP_STATE.get("active_session_id") == session_id:
+            APP_STATE["active_session_id"] = ""
+            APP_STATE["session_status"] = "idle"
+        return True
+    except OSError:
+        return False
+
+
+def delete_all_sessions() -> int:
+    """Delete every project folder under output/. Returns count removed."""
+    root = get_output_dir()
+    if not root.is_dir():
+        return 0
+    n = 0
+    for p in list(root.iterdir()):
+        if p.is_dir() and not p.name.startswith("."):
+            try:
+                shutil.rmtree(p)
+                n += 1
+            except OSError:
+                pass
+    APP_STATE["current_project_folder"] = ""
+    APP_STATE["active_session_id"] = ""
+    APP_STATE["session_status"] = "idle"
+    APP_STATE["generation_output_paths"] = []
+    return n
+
+
+def session_status_label(phase: str, images_done: int, line_count: int) -> str:
+    """Short UI badge for a session row."""
+    phase = (phase or "none").lower()
+    if phase == "done" or (line_count > 0 and images_done >= line_count):
+        return "done"
+    if phase in ("stopped", "images", "prompts", "analysis") and images_done > 0:
+        return f"{images_done}/{line_count or '?'}"
+    if phase in ("stopped", "images", "prompts", "analysis"):
+        return phase
+    if images_done > 0:
+        return f"{images_done}/{line_count or '?'}"
+    return "new"
+
+
+# end session helpers
