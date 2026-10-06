@@ -42,6 +42,7 @@ Available on [HuggingFace.Co](https://huggingface.co/)...
 
 ### Notation:
 - Ensure that the reference image is not HUGE, and I advise trimming it down to, torso and head, or bust and head, then setting the bodyshape correctly. Limiting the reference image to, smaller body area and full head, assists with facial likeness. 
+- At 8 Steps per image, most things turn out ok, but at 10 steps the eyes will more likely be correct and not weird looking. At 12 steps, its going to take forever, but I assume the eyes will be 100% correct at that point. 
 
 ### Struture:
 ```
