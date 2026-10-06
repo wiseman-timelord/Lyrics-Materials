@@ -61,4 +61,4 @@ Lyrics-Materials/
 ```
 
 ### Development:
-- Working on it, til it works.
+- It works, making first video. Then will decide next steps.
