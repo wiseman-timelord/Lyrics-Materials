@@ -9,17 +9,12 @@ It will convert lines of lyrics into AI generated images, one for each line. The
 ![Generation_Page](https://github.com/wiseman-timelord/Lyrics-Materials/blob/main/media/Generation_Page.jpg)
 
 ### Features:
-- Local Windows tool: paste lyrics → one still per non-marker lyric line → `output/<song_name>/` folder of numbered PNGs for use in external AI video tools.
-- Not a video app: slideshow assembly, section fades, Whisper timing, and audio input were removed when converting from Lyrics-Slideshow.
-- Clever Model Handling; If Thinking and ImageGen share the same Vulkan device and either uses M-Lock, Thinking fully unloads before Flux loads — they are never resident together.
-- Two-phase orchestration: Phase 1 = assessment + prompts (Thinking preferred, else Encoder),  Phase 2 = image generation (Flux on its backend)
-
-### Libraries:
-```
-**llama.cpp** (`llama-completion`) for song analysis + per-line visual prompts.
-**stable-diffusion.cpp** (`sd-cli`) for Flux.2-klein stills.
-ffmpeg remains installed for utility/probe use only — not used for materials output.
-```
+- **Local Tool**; paste lyrics → one still per non-marker lyric line → `output/<song_name>/` folder of numbered PNGs for use in external AI video tools.
+- **Clever Model Handling;** If Thinking and ImageGen share the same Vulkan device and either uses M-Lock, Thinking fully unloads before Flux loads — they are never resident together.
+- **Two-phase orchestration;** Phase 1 = assessment + prompts (Thinking preferred, else Encoder),  Phase 2 = image generation (Flux on its backend)
+- **llama.cpp;**: (`llama-completion`) for song analysis + per-line visual prompts.
+- **stable-diffusion.cpp;** (`sd-cli`) for Flux.2-klein stills.
+- **ffmpeg;** for utility/probe use only — not used for materials output.
 
 ### Models
 Available on [HuggingFace.Co](https://huggingface.co/)...  
