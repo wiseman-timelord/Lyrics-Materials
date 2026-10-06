@@ -1,5 +1,5 @@
 # Lyrics-Materials
-Status: Beta - Basic functioning is done, now developing and improving.
+Status: Beta - Developing and improving. If the Generation page panels relating to Details Mode do not show, try switching back and forth, between Panel Mode's (there are a lot of items). 
 
 ### Description:
 It will convert lines of lyrics into AI generated images, one for each line. The idea is one could arrange these in a movie editor, and fade in/out between sections of images, to make simple music videos. One could also take the line of lyrics and the generated images, and feed that into AI video generator to make clips, that could then be assembled.
@@ -27,23 +27,18 @@ Available on [HuggingFace.Co](https://huggingface.co/)...
 ### Instructions:
 - Usage (needs re-writing)...
 ```
-1. User enters **song name** (folder slug) and pastes lyrics; optional single **reference image** for central character.
-2. Phase 1 — **Thinking** (if set) else **Encoder** (`llama-completion`):
-   - Overall song + section analysis
-   - **CHARACTER_MAP** per section: `none | silhouette | partial | full`
-   - One visual prompt per lyric line (blanks and pure [INTRO/CHORUS/OUTRO] markers skipped)
-3. Explicit unload barrier if Thinking and Flux share a device under M-Lock.
-4. Phase 2 — **FLUX.2-klein** (`sd-cli`):
-   - `--diffusion-model` + `--vae` + `--llm` = Encoder (Qwen3-VL) path
-   - Reference photo attached with `-r` only when that line’s presence ≠ `none`
-   - Hard-coded **768×512** stills named `NNN - lyric line.png`
-5. Project folder: `output/<song_name_with_underscores>/` with images, `lyrics.txt`, `analysis.txt`, `prompts.txt`, `character_map.txt`.
+1. The program will start, you will be in a new project, so collapse the left pane, unless you are going to hop sessions.
+2. User enters **song name** (folder slug) and pastes lyrics; optional (advised) single **reference image** for central character.
+3. Ensure Image frequency and other settings are correct (and not too wild, see notes), then click "Generate All Assets". 
+4. When all assets are generated, then click on "Lyrics Thumbnails", have a look at the images, and regenerate them individually as required.
+5. When images are all how you intended, then copy them to the movie making app you have. For basic/simple editing, possibly you could use "Microsoft Movie Maker" that came with the "Microsoft Essentials 2012" package.
 ```
 
 ### Notation:
 - Ensure that the reference image is not HUGE, and I advise trimming it down to, torso and head, or bust and head, then setting the bodyshape correctly. Limiting the reference image to, smaller body area and full head, assists with facial likeness. 
 - At 8 Steps per image, most things turn out ok, but at 10 steps the eyes will more likely be correct and not weird looking. At 12 steps, its going to take forever, but I assume the eyes will be 100% correct at that point. 
 - Remember by editing `.\scripts\configure.py` script it is possible to have custom hair/clothes/etc. Ie for clothing you would for example search for something unique like "Rocker" in configure script, and then change, prompt detail and relating GUI option, for that one or one of the others you wont use. 
+- When a session is under-way, ensure to collapse the session slots column on the left, with the little "--><--" button. This will optimize the interface a little.
 
 ### Struture:
 ```
