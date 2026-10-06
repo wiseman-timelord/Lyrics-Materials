@@ -21,17 +21,13 @@ It will convert lines of lyrics into AI generated images, one for each line. The
 ffmpeg remains installed for utility/probe use only — not used for materials output.
 ```
 
-### Models:
-- Available on [HuggingFace.Co](https://huggingface.co/)... 
-```
-| Role | File | Used for |
-|------|------|----------|
-| Encoder | `Huihui-Qwen3-VL-4B-Instruct-abliterated*.Q4_K_M.gguf` | Analysis/prompts; also passed as Flux.2 `--llm` text conditioner |
-| Thinking (optional) | `Huihui-Qwen3-VL-4B-Thinking-abliterated*.Q5_K_M.gguf` | Richer analysis + prompts when set (preferred over Encoder for Phase 1) |
-| Diffuser | `flux-2-klein-4b-Q8_0.gguf` | Image generation (`--diffusion-model`) |
-| VAE | `diffusion_pytorch_model.safetensors` |
-| mmproj | not used for pure text — any `mmproj*.gguf` is auto-moved to `models\mmproj\` |
-```
+### Models
+Available on [HuggingFace.Co](https://huggingface.co/)...  
+- Encoder: [Huihui-Qwen3-VL-4B-Instruct-abliterated-GGUF](https://huggingface.co/mradermacher/Huihui-Qwen3-VL-4B-Instruct-abliterated-GGUF/tree/main) for text encoding images
+- Thinking: [Huihui-Qwen3-VL-4B-Thinking-abliterated-GGUF](https://huggingface.co/mradermacher/Huihui-Qwen3-VL-4B-Thinking-abliterated-GGUF) for Rich analysis + prompts when set
+- Diffuser: [flux-2-klein-4b-GGUF](https://huggingface.co/models?search=flux2%204b%20gguf) Image generation (one of those, cant remember which one I used)
+- VAE: [diffusion_pytorch_model.safetensors](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B/resolve/main/vae/diffusion_pytorch_model.safetensors?download=true) the other image generation file.
+- Note the mmproj is not used, and if present then is auto-moved to `models\mmproj\`
 
 ### Instructions:
 - Usage...
