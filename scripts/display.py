@@ -246,12 +246,19 @@ def _lyrics_have_stills(project_dir: str = "") -> int:
 
 
 def _cover_counts() -> tuple:
-    """(have, expected) for cover stills under current frequency."""
+    """(have, expected) for cover stills under current frequency.
+
+    `have` counts only slots within the frequency expected range (cover-01 …
+    cover-N) so raising frequency correctly reports incomplete when higher
+    slots are missing.
+    """
     folder = (configure.APP_STATE.get("current_project_folder") or "").strip()
     expected = max(1, configure.frequency_cover_count(_current_freq_label()))
     if not folder or not Path(folder).is_dir():
         return 0, expected
-    return len(_list_cover_images(folder)), expected
+    smap = _named_slot_map("cover", folder)
+    have = sum(1 for i in range(expected) if smap.get(i))
+    return have, expected
 
 
 def _theme_counts() -> tuple:
@@ -260,7 +267,9 @@ def _theme_counts() -> tuple:
     expected = max(1, configure.frequency_theme_count(_current_freq_label()))
     if not folder or not Path(folder).is_dir():
         return 0, expected
-    return len(_list_theme_images(folder)), expected
+    smap = _named_slot_map("theme", folder)
+    have = sum(1 for i in range(expected) if smap.get(i))
+    return have, expected
 
 
 def _lyrics_counts(lyrics: str = "") -> tuple:
@@ -940,8 +949,13 @@ def _simple_grid_updates(
     """
     th = _thumb_size_px()
     n_rows = len(_gen.get(rows_key) or []) or max(1, (n_slots + THUMB_COLS - 1) // THUMB_COLS)
-    # Show at least existing files; expand to expected (frequency) while generating
-    n_show = min(max(len(paths), int(expected or 0)), n_slots)
+    # Frequency drives slot count: slim when expected drops, expand with no_image when it rises.
+    # Caller passes expected from the current Image Frequency (busy/queued may raise it).
+    exp = int(expected or 0)
+    if exp > 0:
+        n_show = min(exp, n_slots)
+    else:
+        n_show = min(len(paths), n_slots)
     has_btns = bool(regen_key and remove_key and (_gen.get(regen_key) or []))
     busy_idx = _named_busy_set(kind) if kind else set()
     queued_idx = _named_queued_set(kind) if kind else set()
@@ -988,6 +1002,12 @@ def _simple_grid_updates(
 
 
 def _cover_panel_updates(project_dir: str = "") -> List[Any]:
+    """Cover grid sized to the *current* Image Frequency (slim or expand).
+
+    Frequency is the display authority: raise frequency → extra empty slots with
+    no_image placeholders; lower frequency → hide higher slots (files stay on disk).
+    During active generation/regen, busy/queued slots may temporarily expand the grid.
+    """
     busy = _named_busy_set("cover")
     queued = _named_queued_set("cover")
     expected = 0
@@ -995,19 +1015,30 @@ def _cover_panel_updates(project_dir: str = "") -> List[Any]:
         expected = int(configure.APP_STATE.get("cover_slot_expected") or 0)
     except (TypeError, ValueError):
         expected = 0
+    # Prefer live frequency unless a batch run explicitly pinned a higher target
+    try:
+        freq_n = int(configure.frequency_cover_count(_current_freq_label()))
+    except Exception:
+        freq_n = 0
     if expected <= 0:
-        try:
-            expected = configure.frequency_cover_count(_current_freq_label())
-        except Exception:
-            expected = 0
+        expected = freq_n
+    else:
+        # If user raised/lowered frequency after a run, follow the dropdown
+        expected = max(freq_n, expected) if (busy or queued) else freq_n
+    expected = max(0, min(int(expected), COVER_SLOTS))
     paths = _slot_aligned_named_paths(
         "cover", project_dir, COVER_SLOTS, extra_slots=busy | queued,
     )
+    # Show when we have stills, pending work, or frequency asks for slots on an active project
     show = bool(any(paths)) or bool(busy) or bool(queued)
-    n_expected = max(len(paths), expected if show else 0)
+    if not show and expected > 0 and _assessment_exists():
+        show = True
+    # Slim to frequency expected; only expand for busy/queued beyond that
+    n_expected = expected if show else 0
     if busy or queued:
         show = True
         n_expected = max(n_expected, max(busy | queued) + 1)
+    n_expected = min(n_expected, COVER_SLOTS)
     return [gr.update(visible=show)] + _simple_grid_updates(
         paths, COVER_SLOTS, "cover_rows", "cover_cols", "cover_imgs",
         "cover_regen_btns", "cover_remove_btns",
@@ -1016,6 +1047,7 @@ def _cover_panel_updates(project_dir: str = "") -> List[Any]:
 
 
 def _theme_panel_updates(project_dir: str = "") -> List[Any]:
+    """Theme grid sized to the *current* Image Frequency (slim or expand)."""
     busy = _named_busy_set("theme")
     queued = _named_queued_set("theme")
     expected = 0
@@ -1023,19 +1055,26 @@ def _theme_panel_updates(project_dir: str = "") -> List[Any]:
         expected = int(configure.APP_STATE.get("theme_slot_expected") or 0)
     except (TypeError, ValueError):
         expected = 0
+    try:
+        freq_n = int(configure.frequency_theme_count(_current_freq_label()))
+    except Exception:
+        freq_n = 0
     if expected <= 0:
-        try:
-            expected = configure.frequency_theme_count(_current_freq_label())
-        except Exception:
-            expected = 0
+        expected = freq_n
+    else:
+        expected = max(freq_n, expected) if (busy or queued) else freq_n
+    expected = max(0, min(int(expected), THEME_SLOTS))
     paths = _slot_aligned_named_paths(
         "theme", project_dir, THEME_SLOTS, extra_slots=busy | queued,
     )
     show = bool(any(paths)) or bool(busy) or bool(queued)
-    n_expected = max(len(paths), expected if show else 0)
+    if not show and expected > 0 and _assessment_exists():
+        show = True
+    n_expected = expected if show else 0
     if busy or queued:
         show = True
         n_expected = max(n_expected, max(busy | queued) + 1)
+    n_expected = min(n_expected, THEME_SLOTS)
     return [gr.update(visible=show)] + _simple_grid_updates(
         paths, THEME_SLOTS, "theme_rows", "theme_cols", "theme_imgs",
         "theme_regen_btns", "theme_remove_btns",
@@ -2713,6 +2752,71 @@ def _wire_create_events(status_box) -> None:
                 inputs=_subject_token_inputs,
                 outputs=[],
             )
+
+    def _on_image_frequency_change(image_frequency, lyrics, song_name, active_session_id):
+        """Persist frequency and refresh Cover/Theme/Lyrics grids + action labels.
+
+        Raising frequency expands empty no_image slots and switches buttons to
+        "Complete … Images" when existing stills fall short. Lowering frequency
+        slims the grids to the new expected count (extra files remain on disk).
+        """
+        freq = configure.normalize_image_frequency(image_frequency)
+        configure.update_generation({"imagegen_frequency": freq})
+        # Drop batch-pinned expectations so the dropdown is the display authority
+        configure.APP_STATE["cover_slot_expected"] = 0
+        configure.APP_STATE["theme_slot_expected"] = 0
+        try:
+            # Refresh lyrics expected from current lyrics × L
+            n_lines = 0
+            text = (lyrics or "").strip()
+            if not text:
+                proj = (configure.APP_STATE.get("current_project_folder") or "").strip()
+                if proj and (Path(proj) / "lyrics.txt").is_file():
+                    text = (Path(proj) / "lyrics.txt").read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+            if text.strip():
+                from scripts.inference import parse_lyrics, lyric_lines_only
+                n_lines = len(lyric_lines_only(parse_lyrics(text)))
+            if n_lines > 0:
+                per = configure.frequency_lyrics_per_line(freq)
+                configure.APP_STATE["thumb_expected_count"] = n_lines * max(1, per)
+        except Exception:
+            pass
+        pad_status = (
+            f"Image frequency set to {freq} — "
+            f"Cover {configure.frequency_cover_count(freq)}, "
+            f"Theme {configure.frequency_theme_count(freq)}, "
+            f"Lyrics×{configure.frequency_lyrics_per_line(freq)}."
+        )
+        return (
+            pad_status,
+            *_action_btn_updates(lyrics or "", song_name or "", running=False),
+            active_session_id or "",
+        ) + tuple(_all_gallery_updates()) + tuple(
+            _refresh_session_slots(active_session_id or "")
+        )
+
+    if _gen.get("image_frequency") is not None:
+        _gen["image_frequency"].change(
+            _on_image_frequency_change,
+            inputs=[
+                _gen["image_frequency"],
+                _gen["lyrics"],
+                _gen["song_name"],
+                _gen["active_session_id"],
+            ],
+            outputs=[
+                status_box,
+                _gen["assess_btn"],
+                _gen["all_assets_btn"],
+                _gen["cover_btn"],
+                _gen["theme_btn"],
+                _gen["run_btn"],
+                _gen["stop_btn"],
+                _gen["active_session_id"],
+            ] + _thumb_panel_outputs() + _session_refresh_outputs,
+        )
 
     _gen["run_btn"].click(
         _run,

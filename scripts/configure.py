@@ -592,17 +592,18 @@ OUTFIT_SMART_CASUAL_FEMALE = "Casual_Female"
 OUTFIT_JOGGERS = "Joggers"
 OUTFIT_ROCKER = "Rocker"
 OUTFIT_SKIMPY = "Skimpy"
-OUTFIT_UNDIES = "Undies"
 OUTFIT_NONE = "None"
 ALL_OUTFITS = "All Outfits"
+# Legacy label kept only so old sessions/settings map cleanly to None.
+_OUTFIT_LEGACY_UNDIES = "Undies"
 OUTFIT_CHOICES = [
     OUTFIT_SMART_SUIT, OUTFIT_SMART_CASUAL_MALE, OUTFIT_SMART_CASUAL_FEMALE,
-    OUTFIT_JOGGERS, OUTFIT_ROCKER, OUTFIT_SKIMPY, OUTFIT_UNDIES, OUTFIT_NONE,
+    OUTFIT_JOGGERS, OUTFIT_ROCKER, OUTFIT_SKIMPY, OUTFIT_NONE,
     ALL_OUTFITS,
 ]
 OUTFIT_CONCRETE = [
     OUTFIT_SMART_SUIT, OUTFIT_SMART_CASUAL_MALE, OUTFIT_SMART_CASUAL_FEMALE,
-    OUTFIT_JOGGERS, OUTFIT_ROCKER, OUTFIT_SKIMPY, OUTFIT_UNDIES, OUTFIT_NONE,
+    OUTFIT_JOGGERS, OUTFIT_ROCKER, OUTFIT_SKIMPY, OUTFIT_NONE,
 ]
 OUTFIT_DEFAULT = OUTFIT_NONE
 OUTFIT_TOKEN = "<outfit_worn>"
@@ -613,13 +614,15 @@ OUTFIT_WORDS = {
     OUTFIT_JOGGERS: "black-crop-top with grey-jogging-shorts outfit",
     OUTFIT_ROCKER: "long-black-leather-coat with black shirt and grey-jeans outfit",
     OUTFIT_SKIMPY: "skimpy-revealing version of same outfit",
-    OUTFIT_UNDIES: "underwear only",
     OUTFIT_NONE: "",
 }
 
 
 def normalize_outfit(value: str) -> str:
     v = (value or "").strip()
+    # Removed "Undies" option — map any saved value to None.
+    if v.lower() in ("undies", "underwear only", "underwear"):
+        return OUTFIT_NONE
     if v in OUTFIT_CHOICES:
         return v
     for c in OUTFIT_CONCRETE:
