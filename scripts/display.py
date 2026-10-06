@@ -1473,6 +1473,9 @@ def _build_create_tab() -> None:
     initial_bodyshape = configure.normalize_bodyshape(
         g0_init.get("ref_bodyshape") or configure.BODYSHAPE_DEFAULT
     )
+    initial_age = configure.normalize_age(
+        g0_init.get("ref_age", configure.AGE_DEFAULT)
+    )
     can = _can_create(initial_lyrics, initial_song)
     expanded = bool(configure.APP_STATE.get("sessions_sidebar_expanded", True))
     configure.APP_STATE["active_session_id"] = ""
@@ -1686,9 +1689,11 @@ def _build_create_tab() -> None:
             with gr.Column(visible=False, elem_id="details-reference") as _details_ref:
                 gr.Markdown(
                     "### Reference Character (optional)\n"
-                    "Central character likeness for stills that feature the subject. "
-                    "Gender, bodyshape, hair, and outfit are injected only into "
-                    "character-bearing prompts (when a reference image is attached)."
+                    "Settings apply to the **single main/reference character** only. "
+                    "Gender, bodyshape, age, hair, and outfit are injected into "
+                    "character-bearing stills. Secondary people implied by the lyrics "
+                    "get their own distinct outfits from the assessment / prompts — "
+                    "they must not share the reference face or main wardrobe."
                 )
                 with gr.Row():
                     _gen["ref_image"] = gr.Textbox(
@@ -1716,13 +1721,22 @@ def _build_create_tab() -> None:
                         label="Reference Image Gender",
                         choices=configure.GENDER_CHOICES,
                         value=initial_gender,
-                        info="Locks subject gender language in character stills.",
+                        info="Gender of the single main/reference character only.",
                     )
                     _gen["ref_bodyshape"] = gr.Dropdown(
                         label="Reference Image Bodyshape",
                         choices=configure.BODYSHAPE_CHOICES,
                         value=initial_bodyshape,
                         info="Counters Flux gym-fit prior; applied on character stills.",
+                    )
+                with gr.Row():
+                    _gen["ref_age"] = gr.Slider(
+                        label="Physical Age",
+                        minimum=configure.AGE_MIN,
+                        maximum=configure.AGE_MAX,
+                        step=5,
+                        value=initial_age,
+                        info="Named age closes Flux.2 mid-twenties prior. Rounded to nearest 5.",
                     )
                 with gr.Row():
                     _gen["hair_style"] = gr.Dropdown(
@@ -2717,6 +2731,7 @@ def _wire_create_events(status_box) -> None:
         _g_sub = configure.load_generation()
         cfg["ref_gender"] = configure.normalize_gender(str(_g_sub.get("ref_gender") or ""))
         cfg["ref_bodyshape"] = configure.normalize_bodyshape(str(_g_sub.get("ref_bodyshape") or ""))
+        cfg["ref_age"] = configure.normalize_age(_g_sub.get("ref_age", configure.AGE_DEFAULT))
 
         configure.update_generation({
             "last_lyrics": lyrics,
@@ -2936,6 +2951,7 @@ def _wire_create_events(status_box) -> None:
                     cfg_now["outfit_worn"] = configure.normalize_outfit(str(gnow.get("outfit_worn") or ""))
                     cfg_now["ref_gender"] = configure.normalize_gender(str(gnow.get("ref_gender") or ""))
                     cfg_now["ref_bodyshape"] = configure.normalize_bodyshape(str(gnow.get("ref_bodyshape") or ""))
+                    cfg_now["ref_age"] = configure.normalize_age(gnow.get("ref_age", configure.AGE_DEFAULT))
                     inference.regenerate_single_still(
                         Path(proj), line_idx, cfg_now,
                         reference_image=_project_local_ref(ref_image or ""),
@@ -2991,19 +3007,20 @@ def _wire_create_events(status_box) -> None:
             _gen["active_session_id"],
         ]
 
-    def _persist_subject_tokens(hair_style, outfit_worn, ref_gender, ref_bodyshape):
+    def _persist_subject_tokens(hair_style, outfit_worn, ref_gender, ref_bodyshape, ref_age):
         configure.update_generation({
             "hair_style": configure.normalize_hair_style(str(hair_style or "")),
             "outfit_worn": configure.normalize_outfit(str(outfit_worn or "")),
             "ref_gender": configure.normalize_gender(str(ref_gender or "")),
             "ref_bodyshape": configure.normalize_bodyshape(str(ref_bodyshape or "")),
+            "ref_age": configure.normalize_age(ref_age),
         })
 
     _subject_token_inputs = [
         _gen["hair_style"], _gen["outfit_worn"],
-        _gen["ref_gender"], _gen["ref_bodyshape"],
+        _gen["ref_gender"], _gen["ref_bodyshape"], _gen["ref_age"],
     ]
-    for _tok in ("hair_style", "outfit_worn", "ref_gender", "ref_bodyshape"):
+    for _tok in ("hair_style", "outfit_worn", "ref_gender", "ref_bodyshape", "ref_age"):
         if _gen.get(_tok) is not None:
             _gen[_tok].change(
                 _persist_subject_tokens,
@@ -3149,6 +3166,7 @@ def _wire_create_events(status_box) -> None:
         _g_sub = configure.load_generation()
         cfg["ref_gender"] = configure.normalize_gender(str(_g_sub.get("ref_gender") or ""))
         cfg["ref_bodyshape"] = configure.normalize_bodyshape(str(_g_sub.get("ref_bodyshape") or ""))
+        cfg["ref_age"] = configure.normalize_age(_g_sub.get("ref_age", configure.AGE_DEFAULT))
         configure.update_generation({
             "project_label": (song_name or "").strip(),
             "reference_image_path": _project_local_ref(ref_image or ""),
@@ -3269,6 +3287,7 @@ def _wire_create_events(status_box) -> None:
         _g_sub = configure.load_generation()
         cfg["ref_gender"] = configure.normalize_gender(str(_g_sub.get("ref_gender") or ""))
         cfg["ref_bodyshape"] = configure.normalize_bodyshape(str(_g_sub.get("ref_bodyshape") or ""))
+        cfg["ref_age"] = configure.normalize_age(_g_sub.get("ref_age", configure.AGE_DEFAULT))
         configure.update_generation({
             "last_lyrics": lyrics,
             "project_label": (song_name or "").strip(),
@@ -3568,6 +3587,7 @@ def _wire_create_events(status_box) -> None:
             "outfit_worn": configure.normalize_outfit(str(outfit_worn or "")),
             "ref_gender": configure.normalize_gender(str(configure.load_generation().get("ref_gender") or "")),
             "ref_bodyshape": configure.normalize_bodyshape(str(configure.load_generation().get("ref_bodyshape") or "")),
+            "ref_age": configure.normalize_age(configure.load_generation().get("ref_age", configure.AGE_DEFAULT)),
         })
         configure.update_generation({
             "imagegen_size": cfg["imagegen_size"],
@@ -3897,6 +3917,7 @@ def _wire_create_events(status_box) -> None:
         cfg_now["outfit_worn"] = configure.normalize_outfit(str(gnow.get("outfit_worn") or ""))
         cfg_now["ref_gender"] = configure.normalize_gender(str(gnow.get("ref_gender") or ""))
         cfg_now["ref_bodyshape"] = configure.normalize_bodyshape(str(gnow.get("ref_bodyshape") or ""))
+        cfg_now["ref_age"] = configure.normalize_age(gnow.get("ref_age", configure.AGE_DEFAULT))
         cfg_now["imagegen_frequency"] = freq
         cfg_now["negative_prompt"] = neg
         configure.update_generation({
@@ -4065,6 +4086,7 @@ def _wire_create_events(status_box) -> None:
         cfg["outfit_worn"] = configure.normalize_outfit(str(gnow.get("outfit_worn") or ""))
         cfg["ref_gender"] = configure.normalize_gender(str(gnow.get("ref_gender") or ""))
         cfg["ref_bodyshape"] = configure.normalize_bodyshape(str(gnow.get("ref_bodyshape") or ""))
+        cfg["ref_age"] = configure.normalize_age(gnow.get("ref_age", configure.AGE_DEFAULT))
         return cfg
 
     def _run_one_named_regen(

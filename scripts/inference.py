@@ -1131,18 +1131,21 @@ def _load_analysis_from_disk(project_dir: Path) -> Optional[Dict[str, Any]]:
         return None
     overall = ""
     character_guidance = ""
+    other_figures = ""
     character_presence: Dict[str, str] = {}
     sections: Dict[str, str] = {}
     mode = None
     buf: List[str] = []
 
     def _flush():
-        nonlocal overall, character_guidance
+        nonlocal overall, character_guidance, other_figures
         body = "\n".join(buf).strip()
         if mode == "OVERALL":
             overall = body
         elif mode == "CHARACTER":
             character_guidance = body
+        elif mode == "OTHER_FIGURES":
+            other_figures = body
         elif mode == "CHARACTER_MAP":
             for line in body.splitlines():
                 if ":" in line:
@@ -1155,8 +1158,8 @@ def _load_analysis_from_disk(project_dir: Path) -> Optional[Dict[str, Any]]:
                     sections[k.strip()] = v.strip()
 
     for raw in text.splitlines():
-        head = raw.strip().upper()
-        if head in ("OVERALL", "CHARACTER", "CHARACTER_MAP", "SECTIONS"):
+        head = raw.strip().upper().replace(" ", "_")
+        if head in ("OVERALL", "CHARACTER", "OTHER_FIGURES", "CHARACTER_MAP", "SECTIONS"):
             _flush()
             buf = []
             mode = head
@@ -1176,10 +1179,13 @@ def _load_analysis_from_disk(project_dir: Path) -> Optional[Dict[str, Any]]:
         except OSError:
             pass
 
+    if other_figures and other_figures.lower().strip() in ("none", "none.", "n/a", "na"):
+        other_figures = ""
     return {
         "overall": overall,
         "sections": sections,
         "character_guidance": character_guidance,
+        "other_figures": other_figures,
         "character_presence": character_presence,
     }
 
@@ -1401,6 +1407,7 @@ def analyze_song_and_sections(
       overall: str
       sections: {label: notes}
       character_guidance: str
+      other_figures: str
       character_presence: {section_label: "none"|"silhouette"|"partial"|"full"}
         — used programmatically to include/exclude the reference image per line
     """
@@ -1414,6 +1421,7 @@ def analyze_song_and_sections(
         "overall": "",
         "sections": {},
         "character_guidance": "",
+        "other_figures": "",
         "character_presence": {},
     }
     if not model_path:
@@ -1431,20 +1439,27 @@ def analyze_song_and_sections(
 
     if has_character_ref:
         char_instr = (
-            "CHARACTER: 1-2 sentences on the central character's face, body type, age range, "
-            "expression, and attitude/energy only.\n"
-            "Do NOT mention clothing, outfit, wardrobe, gear, uniform, or hair style — "
-            "those are chosen later in the GUI and must not appear here.\n"
-            "A reference photo will supply likeness on some stills.\n"
+            "CHARACTER: 1-2 sentences on the SINGLE main/reference character's face, body type, "
+            "age range, expression, and attitude/energy only.\n"
+            "Do NOT mention clothing, outfit, wardrobe, gear, uniform, or hair style for the main "
+            "character — those are chosen later in the GUI and must not appear here.\n"
+            "A reference photo will supply the main character's likeness on some stills.\n"
+            "OTHER_FIGURES: 1-3 sentences on any secondary people the lyrics imply "
+            "(friends, crowd, antagonist, partner, etc.): who they are, rough role, and "
+            "what they should wear if clothing is relevant to the lyric or scene. "
+            "Secondary people are NOT the reference character and must never share that face.\n"
+            "If the lyrics never imply other people, write OTHER_FIGURES: none.\n"
             "CHARACTER_MAP: one line per section as  SectionName: none|silhouette|partial|full\n"
-            "  none=no character, silhouette=outline only, partial=partly visible, full=clearly present.\n"
-            "  Vary presence across the song when the lyrics support it.\n"
+            "  none=no main character, silhouette=outline only, partial=partly visible, full=clearly present.\n"
+            "  Vary main-character presence across the song when the lyrics support it.\n"
         )
     else:
         char_instr = (
             "CHARACTER: 1-2 sentences inventing a central figure from the lyrics "
             "(face, body type, attitude only), or 'none specified'.\n"
-            "Do NOT mention clothing, outfit, wardrobe, gear, or hair style.\n"
+            "Do NOT mention clothing, outfit, wardrobe, gear, or hair style for the central figure.\n"
+            "OTHER_FIGURES: 1-3 sentences on any secondary people the lyrics imply, including "
+            "appropriate distinct outfits when clothing matters; or 'none'.\n"
             "CHARACTER_MAP: one line per section as  SectionName: none|silhouette|partial|full\n"
         )
 
@@ -1456,8 +1471,9 @@ def analyze_song_and_sections(
         "You are a music-video art director. Write structured production notes.\n"
         "Reply with ONLY the four blocks below. Use real sentences, not keyword lists.\n"
         "Do NOT output slash-separated adjectives. Do NOT repeat the same phrase.\n"
-        "Never describe the character's clothing or hair style in any block — "
-        "wardrobe and hair are configured separately in the UI.\n\n"
+        "Never describe the MAIN character's clothing or hair style — "
+        "those are configured separately in the UI. Secondary people in OTHER_FIGURES "
+        "MAY have distinct outfits when the lyrics imply them.\n\n"
         "OVERALL:\n"
         "Write 3-5 complete sentences: narrative arc, mood, setting, colour palette, visual tone.\n\n"
         f"{char_instr}\n"
@@ -1471,6 +1487,8 @@ def analyze_song_and_sections(
         "The tone is defiant and intimate, not chaotic.\n\n"
         "CHARACTER:\n"
         "A sharp-eyed nonconformist with a calm, deliberate presence; mid-adult, lean build, unreadable expression.\n\n"
+        "OTHER_FIGURES:\n"
+        "Occasional anonymous street crowd in ordinary coats; no named secondary lead.\n\n"
         "CHARACTER_MAP:\n"
         f"{ex0}: silhouette\n"
         f"{ex1}: full\n\n"
@@ -1507,8 +1525,10 @@ def analyze_song_and_sections(
             "OVERALL:\n"
             "<3-5 sentences on narrative, mood, setting, colour>\n\n"
             "CHARACTER:\n"
-            "<1-2 sentences on face, body type, attitude only — "
-            "NO clothing, outfit, wardrobe, or hair style>\n\n"
+            "<1-2 sentences on MAIN character face, body type, attitude only — "
+            "NO main-character clothing or hair>\n\n"
+            "OTHER_FIGURES:\n"
+            "<secondary people from lyrics + their outfits if relevant, or none>\n\n"
             "CHARACTER_MAP:\n"
             + "\n".join(f"{lab}: partial" for lab in (section_labels or ["Body"]))
             + "\n\nSECTIONS:\n"
@@ -1517,7 +1537,7 @@ def analyze_song_and_sections(
                 for lab in (section_labels or ["Body"])
             )
             + "\n\nFill every section with real content about these lyrics. "
-            "Do not leave blanks. Never describe clothing or hair."
+            "Do not leave blanks. Never describe main-character clothing or hair."
         )
         try:
             raw2 = _run_llama_completion(
@@ -1533,18 +1553,22 @@ def analyze_song_and_sections(
 
     overall = ""
     character = ""
+    other_figures = ""
     section_notes: Dict[str, str] = {}
     presence: Dict[str, str] = {}
 
     if raw:
         # Prefer structured split; fall back to whole text only for overall if needed
-        parts = re.split(r"(?i)\b(OVERALL|CHARACTER_MAP|CHARACTER|SECTIONS)\s*:", raw)
+        parts = re.split(
+            r"(?i)\b(OVERALL|OTHER_FIGURES|CHARACTER_MAP|CHARACTER|SECTIONS)\s*:",
+            raw,
+        )
         current = None
         buf: List[str] = []
         blocks: Dict[str, str] = {}
         for part in parts:
             key = part.strip().upper().replace(" ", "_")
-            if key in ("OVERALL", "CHARACTER", "CHARACTER_MAP", "SECTIONS"):
+            if key in ("OVERALL", "CHARACTER", "OTHER_FIGURES", "CHARACTER_MAP", "SECTIONS"):
                 if current and buf:
                     blocks[current] = "\n".join(buf).strip()
                 current = key
@@ -1556,6 +1580,7 @@ def analyze_song_and_sections(
 
         overall = blocks.get("OVERALL", "").strip()
         character = blocks.get("CHARACTER", "").strip()
+        other_figures = blocks.get("OTHER_FIGURES", "").strip()
         sec_blob = blocks.get("SECTIONS", "")
         map_blob = blocks.get("CHARACTER_MAP", "")
 
@@ -1569,6 +1594,8 @@ def analyze_song_and_sections(
             overall = ""
         if _looks_like_keyword_spam(character):
             character = ""
+        if _looks_like_keyword_spam(other_figures):
+            other_figures = ""
 
         parsed_notes = _parse_labeled_section_notes(
             sec_blob, [s["label"] for s in sections],
@@ -1620,10 +1647,15 @@ def analyze_song_and_sections(
         print(f"[analysis]   {lab}: {val}", flush=True)
 
     # Do NOT invent a default OVERALL when the model failed — empty signals unusable
+    if other_figures and other_figures.lower().strip() in ("none", "none.", "n/a", "na"):
+        other_figures = ""
+    print(f"[analysis] other_figures: {(other_figures[:120] + '…') if len(other_figures) > 120 else (other_figures or '(none)')}", flush=True)
+
     return {
         "overall": overall,
         "sections": section_notes,
         "character_guidance": character,
+        "other_figures": other_figures,
         "character_presence": presence,
     }
 
@@ -1661,6 +1693,7 @@ def generate_visual_prompts(
     overall = (analysis or {}).get("overall") or ""
     section_notes = (analysis or {}).get("sections") or {}
     char_guide = (analysis or {}).get("character_guidance") or ""
+    other_figures = (analysis or {}).get("other_figures") or ""
     presence_map = (analysis or {}).get("character_presence") or {}
 
     prompts: List[str] = []
@@ -1697,20 +1730,53 @@ def generate_visual_prompts(
                 "partial": "show the reference character partially (cropped, turned, or distant)",
                 "full": "show the reference character clearly, matching the reference likeness",
             }.get(pres, "show the reference character")
+            if other_figures:
+                sec_people = (
+                    f"Secondary people guidance: {other_figures[:280]} "
+                    "Give any secondary figures their own distinct outfits and appearance "
+                    "appropriate to the lyric — never dress them in the main character's "
+                    "locked wardrobe and never copy the reference face. "
+                )
+            else:
+                sec_people = (
+                    "If this lyric needs other people besides the main character, invent "
+                    "distinct secondary figures with their own appropriate outfits; they "
+                    "must not share the reference face or the main character's wardrobe. "
+                )
             char_clause = (
-                f"CHARACTER: {how}. "
-                f"Character notes: {char_guide or 'match the reference subject.'} "
+                f"MAIN CHARACTER: {how}. "
+                "Exactly ONE instance of the reference/main character in the frame — "
+                "never duplicate, clone, or mirror the same face. "
+                "Do NOT invent clothing for the main character (wardrobe is applied later). "
+                f"Main character notes: {char_guide or 'match the reference subject.'} "
+                f"{sec_people}"
             )
         elif has_character_ref and pres == "none":
+            if other_figures:
+                sec_people = (
+                    f"Other people (not the reference): {other_figures[:280]} "
+                    "Dress them appropriately for the scene with their own outfits. "
+                )
+            else:
+                sec_people = ""
             char_clause = (
-                "CHARACTER: Do NOT depict the reference person. "
+                "MAIN CHARACTER: Do NOT depict the reference person. "
                 "No recognisable central character from the reference photo — "
-                "environment, abstract, or anonymous figures only. "
+                "environment, abstract, or non-reference figures only. "
+                f"{sec_people}"
             )
         else:
+            if other_figures:
+                sec_people = (
+                    f"Other people guidance: {other_figures[:280]} "
+                    "Give secondary figures distinct outfits when clothing matters. "
+                )
+            else:
+                sec_people = ""
             char_clause = (
                 "No reference photo is provided — invent figures purely from the lyrics "
                 "and notes when needed. "
+                f"{sec_people}"
             )
 
         instruction = (
@@ -1719,7 +1785,9 @@ def generate_visual_prompts(
             f"Section ({sec}): {sec_note[:250]}\n"
             f"{char_clause}"
             "Reply with ONLY the visual description for this single still, "
-            "one paragraph, no preamble, no quotes, no section labels."
+            "one paragraph, no preamble, no quotes, no section labels. "
+            "Main-character wardrobe is configured in the UI — omit main-character "
+            "clothing details. Secondary people may wear concrete, lyric-appropriate outfits."
         )
         try:
             text = _run_llama_completion(
@@ -2156,12 +2224,13 @@ def _sanitize_visual_prompt(prompt: str, lyric: str, style_hint: str = "") -> st
 
 
 def _appearance_bit(cfg: Dict[str, Any]) -> str:
-    """Identity + hair/outfit clause from cfg (character-bearing stills only)."""
+    """Identity + hair/outfit/age clause from cfg (character-bearing stills only)."""
     return configure.character_identity_clause(
         hair=cfg.get("hair_style") or "",
         outfit=cfg.get("outfit_worn") or "",
         gender=cfg.get("ref_gender") or "",
         bodyshape=cfg.get("ref_bodyshape") or "",
+        age=cfg.get("ref_age"),
     )
 
 
@@ -2309,6 +2378,7 @@ def generate_images_from_prompts(
         neg = configure.merge_negative_prompt(
             (cfg.get("negative_prompt") or "").strip(),
             cover=bool(cfg.get("cover_mode")),
+            ambient=bool(cfg.get("ambient_mode")),
         )
         if neg:
             c.extend(["-n", neg])
@@ -2407,7 +2477,9 @@ def generate_images_from_prompts(
                 final_prompt = (
                     f"{clean_prompt}{seq_bit}{appear_bit} "
                     f"[Reference character presence: {pres}. "
-                    "Match the provided reference image likeness accordingly.]"
+                    "Match the provided reference image likeness. "
+                    "Exactly one instance of this reference person — "
+                    "do not duplicate or clone the same face in the frame.]"
                 )
                 print(f"[images] character ref ATTACHED ({pres})"
                       f"{' +appearance' if appear else ''}", flush=True)
@@ -2589,12 +2661,16 @@ def regenerate_named_still(
     cfg_run = dict(cfg)
     if kind == "cover":
         cfg_run["cover_mode"] = True
+        # Character covers keep anatomy negatives; non-character → ambient no-people
+        cfg_run["cover_uses_character"] = bool(use_char_ref)
+        cfg_run["ambient_mode"] = not bool(use_char_ref)
         return _generate_named_still(
             dest, prompt, cfg_run,
             reference_image=reference_image if has_ref else "",
             attach_ref=has_ref,
         )
-    # Theme: never attach character reference
+    # Theme: never attach character reference — ambient no-people negative
+    cfg_run["ambient_mode"] = True
     return _generate_named_still(
         dest, prompt, cfg_run,
         reference_image="",
@@ -2782,6 +2858,7 @@ def regenerate_single_still(
         neg = configure.merge_negative_prompt(
             (cfg.get("negative_prompt") or "").strip(),
             cover=bool(cfg.get("cover_mode")),
+            ambient=bool(cfg.get("ambient_mode")),
         )
         if neg:
             c.extend(["-n", neg])
@@ -2900,11 +2977,14 @@ def _analysis_is_usable(analysis: Optional[Dict[str, Any]]) -> bool:
 
 def _write_analysis_file(project_dir: Path, analysis: Dict[str, Any]) -> None:
     try:
+        of_block = (analysis.get("other_figures") or "").strip()
         (project_dir / "analysis.txt").write_text(
             "OVERALL\n"
             + (analysis.get("overall") or "")
             + "\n\nCHARACTER\n"
             + (analysis.get("character_guidance") or "")
+            + "\n\nOTHER_FIGURES\n"
+            + (of_block if of_block else "none")
             + "\n\nCHARACTER_MAP\n"
             + "\n".join(
                 f"{k}: {v}"
@@ -2956,6 +3036,7 @@ def ensure_project_assessment(
             "overall": "",
             "sections": {},
             "character_guidance": "",
+            "other_figures": "",
             "character_presence": {},
         }
 
@@ -3221,6 +3302,7 @@ def _generate_named_still(
     neg = configure.merge_negative_prompt(
         (cfg.get("negative_prompt") or "").strip(),
         cover=bool(cfg.get("cover_mode")),
+        ambient=bool(cfg.get("ambient_mode")),
     )
     if neg:
         cmd.extend(["-n", neg])
@@ -3378,6 +3460,7 @@ def _build_cover_prompt(
             f"{title_lead}"
             f"Feature the central character as the single focused subject embodying the song name.{char_bit} "
             f"{appear + ' ' if appear else ''}"
+            "Exactly one instance of the reference person — do not duplicate or clone the same face. "
             "Iconic cover portrait or figure study — not a busy scene. "
             f"{no_text}"
         )
@@ -3613,6 +3696,8 @@ def generate_cover_image(
             )
             cfg_cover = dict(cfg)
             cfg_cover["cover_mode"] = True
+            cfg_cover["ambient_mode"] = not bool(use_char_ref)
+            cfg_cover["cover_uses_character"] = bool(use_char_ref)
             out = _generate_named_still(
                 dest, cover_prompt + var_bit, cfg_cover,
                 reference_image=reference_image if use_char_ref else "",
@@ -3856,8 +3941,10 @@ def generate_theme_images(
                 )
             print(f"[theme] {i + 1}/{total} — {fname} (no character / no ref)", flush=True)
             try:
+                cfg_theme = dict(cfg)
+                cfg_theme["ambient_mode"] = True
                 out = _generate_named_still(
-                    dest, final, cfg,
+                    dest, final, cfg_theme,
                     reference_image="",
                     attach_ref=False,
                 )

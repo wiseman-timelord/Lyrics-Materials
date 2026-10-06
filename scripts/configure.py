@@ -640,25 +640,46 @@ def outfit_phrase(value: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Reference image gender (subject token)
+# Reference image gender (subject token) — ONE main character only
 # ---------------------------------------------------------------------------
-GENDER_MALE = "Mal(s)"
-GENDER_MIXED = "M+F(s)"
-GENDER_SHEFEM = "S+F(s)"
-GENDER_NEUT = "Neut(s)"
-GENDER_TRANS = "Shem(s)"
-GENDER_FEMALE = "Fem(s)"
+# Plural / multi-subject labels (Mal(s), M+F(s), …) were retired: the reference
+# image configures a single central character. Secondary people in a lyric line
+# are invented by the prompt model with their own wardrobe and must not share
+# the reference likeness.
+GENDER_MALE = "Male"
+GENDER_SHEMALE = "Shemale"
+GENDER_NEUTRAL = "Neutral"
+GENDER_FEMALE = "Female"
 GENDER_CHOICES = [
-    GENDER_MALE, GENDER_MIXED, GENDER_SHEFEM, GENDER_NEUT, GENDER_TRANS, GENDER_FEMALE,
+    GENDER_MALE, GENDER_SHEMALE, GENDER_NEUTRAL, GENDER_FEMALE,
 ]
 GENDER_DEFAULT = GENDER_MALE
 GENDER_WORDS = {
     GENDER_MALE: "male",
-    GENDER_MIXED: "mixed-gender",
-    GENDER_SHEFEM: "feminine-presenting",
-    GENDER_NEUT: "androgynous",
-    GENDER_TRANS: "transfeminine",
+    GENDER_SHEMALE: "shemale",
+    GENDER_NEUTRAL: "androgynous",
     GENDER_FEMALE: "female",
+}
+# Map old UI labels + common synonyms → current singular choices
+_GENDER_LEGACY = {
+    "mal(s)": GENDER_MALE,
+    "male": GENDER_MALE,
+    "m+f(s)": GENDER_MALE,          # mixed was multi-subject; fall back to Male
+    "mixed-gender": GENDER_MALE,
+    "mixed": GENDER_MALE,
+    "s+f(s)": GENDER_SHEMALE,
+    "feminine-presenting": GENDER_SHEMALE,
+    "shem(s)": GENDER_SHEMALE,
+    "shemale": GENDER_SHEMALE,
+    "transfeminine": GENDER_SHEMALE,
+    "trans": GENDER_SHEMALE,
+    "neut(s)": GENDER_NEUTRAL,
+    "neutral": GENDER_NEUTRAL,
+    "androgynous": GENDER_NEUTRAL,
+    "neut": GENDER_NEUTRAL,
+    "fem(s)": GENDER_FEMALE,
+    "female": GENDER_FEMALE,
+    "fem": GENDER_FEMALE,
 }
 
 
@@ -669,6 +690,9 @@ def normalize_gender(value: str) -> str:
     for c in GENDER_CHOICES:
         if c.lower() == v.lower():
             return c
+    mapped = _GENDER_LEGACY.get(v.lower())
+    if mapped:
+        return mapped
     return GENDER_DEFAULT
 
 
@@ -725,15 +749,63 @@ def bodyshape_phrase(value: str) -> str:
     return (BODYSHAPE_WORDS.get(key) or "").strip()
 
 
+
+# ---------------------------------------------------------------------------
+# Physical Age -- the third token, and the third thing Flux.2 invents when the
+# prompt does not say.
+#
+# WHY IT EXISTS. Left unsaid, Flux.2 has a strong prior toward rendering
+# subjects in their mid-twenties regardless of how old the person in the
+# reference photo actually is -- the same class of error as the long-haired
+# man in a dress or the gym-fit body: the model filling a silence with its
+# training average instead of reading the photo. A 45-year-old client comes
+# back looking 25-30. Naming the age closes it.
+#
+# UNLIKE GENDER, THIS DOES NOT VARY WITH SUBJECT COUNT -- like Bodyshape, one
+# age describes the whole batch the same way whether it is one person or a
+# group, so this is a single scalar rather than a grid. A photo whose subjects
+# are different ages wants two runs, the same as a photo whose subjects
+# differ in bodyshape.
+#
+# A SLIDER, NOT A CHOICE LIST. The value IS the word substituted for <age> --
+# no lookup table, because the label already is the number sd-cli should see
+# ("at age 40 years" wants the literal 40). Rounded to nearest 5 on write.
+AGE_MIN: int = 25
+AGE_MAX: int = 95
+# 45 is the shipped default -- comfortably clear of the mid-twenties Flux.2
+# defaults to unprompted, the same reasoning BODYSHAPE uses for a concrete shape.
+AGE_DEFAULT: int = 45
+AGE_TOKEN: str = "<age>"
+
+
+def normalize_age(value) -> int:
+    """Clamp to [AGE_MIN, AGE_MAX] and round to nearest 5."""
+    try:
+        n = int(round(float(value)))
+    except (TypeError, ValueError):
+        n = AGE_DEFAULT
+    n = max(AGE_MIN, min(AGE_MAX, n))
+    # nearest multiple of 5
+    n = int(round(n / 5.0) * 5)
+    n = max(AGE_MIN, min(AGE_MAX, n))
+    return n
+
+
+def age_phrase(value) -> str:
+    """Literal age words for prompt injection, e.g. 'at age 45 years'."""
+    n = normalize_age(value)
+    return f"at age {n} years"
+
 def subject_appearance_clause(
     hair: str = "",
     outfit: str = "",
     gender: str = "",
     bodyshape: str = "",
+    age=None,
 ) -> str:
     """
     Build optional identity/appearance text for character-bearing prompts.
-    Hair/outfit omitted when None; gender/bodyshape default to concrete words.
+    Hair/outfit omitted when None; gender/bodyshape/age default to concrete words.
     """
     bits: List[str] = []
     gp = gender_phrase(gender) if gender else ""
@@ -742,6 +814,8 @@ def subject_appearance_clause(
         bits.append(f"{gp} subject")
     if bp:
         bits.append(f"{bp} bodyshape")
+    if age is not None and str(age).strip() != "":
+        bits.append(age_phrase(age))
     hp = hair_style_phrase(hair)
     op = outfit_phrase(outfit)
     if hp:
@@ -758,17 +832,24 @@ def character_identity_clause(
     outfit: str = "",
     gender: str = "",
     bodyshape: str = "",
+    age=None,
 ) -> str:
     """
     Strong identity-lock sentence for stills that attach the reference image.
     Mirrors Image-Glamour's "facial appearance and personal identity match
     the reference image exactly, other than …" pattern.
+
+    Flux.2 often clones the reference subject when the prompt is silent about
+    count; the explicit single-instance clause closes that prior. Age is named
+    so the model does not default every adult to mid-twenties.
     """
     gp = gender_phrase(gender) or "person"
     bp = bodyshape_phrase(bodyshape)
     hp = hair_style_phrase(hair)
     op = outfit_phrase(outfit)
     other: List[str] = []
+    if age is not None and str(age).strip() != "":
+        other.append(age_phrase(age))
     if bp:
         other.append(f"a {bp} bodyshape")
     if hp:
@@ -781,8 +862,11 @@ def character_identity_clause(
     return (
         f"Photorealistic depiction of the {gp} whose facial appearance and "
         f"personal identity match the reference image exactly{other_bit}. "
-        "Preserve the same face, bone structure, eyes, and likeness from the "
-        "reference; anatomically correct hands with five fingers on each hand."
+        "Exactly one instance of this reference person in the frame — never "
+        "duplicate, clone, or mirror the same face twice; secondary people may "
+        "appear only when the scene needs them and must not share the reference "
+        "likeness. Preserve the same face, bone structure, eyes, and likeness "
+        "from the reference; anatomically correct hands with five fingers on each hand."
     )
 
 # Fade colours (RGB 0-255) used for intro/outro and lyric gaps
@@ -842,18 +926,31 @@ DEFAULT_HEIGHT = 512
 DEFAULT_STEPS = 8  # 8 improves eyes / fine detail vs 4 on Flux.2-klein
 DEFAULT_CFG = 1.0
 # Sectioned negative: periods group related terms (style / overlays / quality / anatomy).
+# Prefer concrete Flux.2 failure modes over long synonym lists — CFG is low (1.0)
+# on distilled klein, so every token competes; keep high-impact terms only.
 DEFAULT_NEGATIVE_PROMPT = (
-    "cartoon, pixelated, anime, illustration. "
-    "text, letters, words, writing, typography, caption, subtitle, title text, "
-    "graphical overlay, text overlay, UI, HUD, watermark, logo, signature, stamp. "
-    "blurry, low quality, noisy, jpeg artifacts. "
-    "deformed, extra limbs, mutated hands, bad anatomy."
+    "cartoon, illustration, anime, drawing, pixelated. "
+    "text, letters, words, writing, typography, caption, subtitle, "
+    "watermark, logo, signature, stamp, UI, HUD. "
+    "blurry, out of focus, low quality, noisy, jpeg artifacts. "
+    "deformed, extra limbs, missing limbs, fused fingers, fewer than five fingers, "
+    "mutated hands, bad anatomy, distorted anatomy, exaggerated proportions, "
+    "contorted pose, head on backwards. "
+    "electronic devices, mobile phones, headphones."
 )
-# Extra negatives always merged into cover stills (Flux 4B loves to write titles).
+# Cover / Theme ambient stills are not meant to host people. Anatomy lists are
+# wasted budget there; replace with a hard no-person prior plus anti-text.
+AMBIENT_NEGATIVE_PROMPT = (
+    "cartoon, illustration, anime, drawing, pixelated. "
+    "text, letters, words, writing, typography, caption, subtitle, "
+    "watermark, logo, signature, stamp, UI, HUD, signage, poster text, banner. "
+    "blurry, out of focus, low quality, noisy, jpeg artifacts. "
+    "people, person, human, face, portrait, character, figure, crowd, body."
+)
+# Extra anti-text always merged into cover stills (Flux 4B loves to write titles).
 COVER_NEGATIVE_EXTRA = (
-    "text, letters, words, writing, typography, alphabet, calligraphy, "
-    "signage, poster text, album title text, readable text, misspelled text, "
-    "graphical overlay, text overlay, watermark, logo, banner, caption."
+    "alphabet, calligraphy, album title text, readable text, misspelled text, "
+    "graphical overlay, text overlay."
 )
 DEFAULT_SAMPLER = "euler_a"
 DEFAULT_SEED = -1
@@ -940,11 +1037,33 @@ def image_size_aspect(value: str = "") -> str:
     return IMAGE_SIZE_ASPECT_REGULAR
 
 
-def merge_negative_prompt(base: str = "", *, cover: bool = False) -> str:
-    """Combine user/default negative with optional cover-specific anti-text terms."""
+def merge_negative_prompt(
+    base: str = "",
+    *,
+    cover: bool = False,
+    ambient: bool = False,
+) -> str:
+    """
+    Combine user/default negative with optional cover anti-text and ambient
+    (no-people) priors.
+
+    ambient=True  → use AMBIENT_NEGATIVE_PROMPT (Cover non-character / Theme)
+    cover=True    → always append COVER_NEGATIVE_EXTRA anti-title terms
+    Otherwise     → DEFAULT_NEGATIVE_PROMPT (lyrics / character stills)
+    """
     bits = []
-    b = (base or "").strip() or DEFAULT_NEGATIVE_PROMPT
-    bits.append(b)
+    b = (base or "").strip()
+    if ambient:
+        # Ambient path ignores a lyrics-oriented user negative when empty;
+        # if the user supplied one, still honour it as the lead chunk.
+        bits.append(b if b else AMBIENT_NEGATIVE_PROMPT)
+        if not b:
+            pass
+        else:
+            # User base may lack no-people terms — append ambient core
+            bits.append(AMBIENT_NEGATIVE_PROMPT)
+    else:
+        bits.append(b if b else DEFAULT_NEGATIVE_PROMPT)
     if cover:
         bits.append(COVER_NEGATIVE_EXTRA)
     # De-dupe while preserving order
@@ -1541,6 +1660,7 @@ GENERATION_KEYS = [
     "outfit_worn",
     "ref_gender",
     "ref_bodyshape",
+    "ref_age",
     "project_label",
     "last_image_gen_seconds",
 ]
@@ -1567,6 +1687,7 @@ def _default_generation() -> Dict[str, Any]:
         "outfit_worn": OUTFIT_DEFAULT,
         "ref_gender": GENDER_DEFAULT,
         "ref_bodyshape": BODYSHAPE_DEFAULT,
+        "ref_age": AGE_DEFAULT,
         "project_label": "",
         "last_image_gen_seconds": 0.0,
     }
