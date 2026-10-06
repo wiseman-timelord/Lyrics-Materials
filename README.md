@@ -25,7 +25,7 @@ Available on [HuggingFace.Co](https://huggingface.co/)...
 - Note the mmproj is not used, and if present then is auto-moved to `models\mmproj\`
 
 ### Instructions:
-- Usage...
+- Usage (needs re-writing)...
 ```
 1. User enters **song name** (folder slug) and pastes lyrics; optional single **reference image** for central character.
 2. Phase 1 — **Thinking** (if set) else **Encoder** (`llama-completion`):
@@ -39,6 +39,9 @@ Available on [HuggingFace.Co](https://huggingface.co/)...
    - Hard-coded **768×512** stills named `NNN - lyric line.png`
 5. Project folder: `output/<song_name_with_underscores>/` with images, `lyrics.txt`, `analysis.txt`, `prompts.txt`, `character_map.txt`.
 ```
+
+### Notation:
+- Ensure that the reference image is not HUGE, and I advise trimming it down to, torso and head, or bust and head, then setting the bodyshape correctly. Limiting the reference image to smaller area including head, assists with facial likeness. 
 
 ### Struture:
 ```
