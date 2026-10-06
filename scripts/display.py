@@ -859,26 +859,113 @@ def _lyrics_section_should_show(paths: Optional[List[str]] = None) -> bool:
 
 
 
-def _line_path_map(paths: Optional[List[str]] = None) -> Dict[int, str]:
-    """Map 1-based line number → absolute still path."""
+def _parse_still_line_variant(name: str) -> Tuple[int, int]:
+    """
+    Parse numbered still filename into (1-based line, 1-based variant).
+
+    Patterns:
+      001-lyric-slug.png      → (1, 1)   # L1 / legacy
+      001-2-lyric-slug.png    → (1, 2)   # L2/L3 variant 2
+      001 - lyric line.png    → (1, 1)   # space-dash legacy
+    Returns (0, 0) when not a numbered still.
+    """
+    stem = Path(name or "").name
+    m = re.match(r"^(\d{1,4})(?:\s*[-–—]\s*|[-.])(.*)$", stem)
+    if not m:
+        m2 = re.match(r"^(\d{1,4})\.", stem)
+        if m2:
+            return int(m2.group(1)), 1
+        return 0, 0
+    line_no = int(m.group(1))
+    rest = (m.group(2) or "").lstrip()
+    # Variant form: NNN-V-slug  (rest starts with digit then dash)
+    vm = re.match(r"^(\d+)[-–—](.+)$", rest)
+    if vm:
+        return line_no, max(1, int(vm.group(1)))
+    return line_no, 1
+
+
+def _line_path_map(paths: Optional[List[str]] = None, variant: int = 0) -> Dict[int, str]:
+    """
+    Map 1-based line number → absolute still path.
+
+    variant:
+      0  → any/latest path per line (legacy single-map behaviour)
+      N  → path for that sequence variant only (L2/L3 page N)
+    """
     if paths is None:
         paths = _list_project_images()
     out: Dict[int, str] = {}
+    # Prefer higher mtime when multiple match the same key
+    mtimes: Dict[int, float] = {}
+    want = int(variant or 0)
     for p in paths:
         if not p or not Path(p).is_file():
             continue
-        m = re.match(r"^(\d+)", Path(p).name)
-        if not m:
+        line_no, var = _parse_still_line_variant(Path(p).name)
+        if line_no <= 0:
             continue
-        out[int(m.group(1))] = str(Path(p).resolve())
+        if want > 0 and var != want:
+            continue
+        try:
+            mt = Path(p).stat().st_mtime
+        except OSError:
+            mt = 0.0
+        if line_no not in out or mt >= mtimes.get(line_no, 0.0):
+            out[line_no] = str(Path(p).resolve())
+            mtimes[line_no] = mt
     return out
 
 
+def _lyrics_per_line_count() -> int:
+    """Current Image Frequency L value (stills per lyric line)."""
+    try:
+        return max(1, int(configure.frequency_lyrics_per_line(_current_freq_label())))
+    except Exception:
+        return 1
+
+
+def _lyrics_page_current() -> int:
+    """1-based variant page currently shown in Lyrics Thumbnails."""
+    per = _lyrics_per_line_count()
+    try:
+        page = int(configure.APP_STATE.get("lyrics_page") or 1)
+    except (TypeError, ValueError):
+        page = 1
+    return max(1, min(page, per))
+
+
+def _set_lyrics_page(page: int) -> int:
+    per = _lyrics_per_line_count()
+    try:
+        p = int(page or 1)
+    except (TypeError, ValueError):
+        p = 1
+    p = max(1, min(p, per))
+    configure.APP_STATE["lyrics_page"] = p
+    return p
+
+
+def _lyrics_page_choices() -> List[str]:
+    """Labels for the Lyrics Image page switcher (Page 1 … Page N)."""
+    per = _lyrics_per_line_count()
+    return [f"Page {i}" for i in range(1, per + 1)]
+
+
+def _lyrics_page_label(page: int = 0) -> str:
+    p = int(page) if page else _lyrics_page_current()
+    return f"Page {max(1, p)}"
+
+
 def _thumb_expected_count() -> int:
-    """How many sequential slots to show (line_count), capped at THUMB_SLOTS."""
+    """How many lyric-line slots to show (line_count only — not × L), capped at THUMB_SLOTS.
+
+    Multi-variant stills (L2/L3) are paged via the Lyrics Image page switcher;
+    each page still shows one slot per lyric line.
+    """
     n = int(configure.APP_STATE.get("thumb_expected_count") or 0)
     if n <= 0:
-        # Fall back to highest existing still number
+        # Fall back to highest existing still line number
         m = _line_path_map()
         if m:
             n = max(m.keys())
@@ -1085,16 +1172,27 @@ def _theme_panel_updates(project_dir: str = "") -> List[Any]:
 def _thumb_panel_updates(paths: Optional[List[str]] = None) -> List[Any]:
     """
     Gradio updates for Lyrics Thumbnails grid (slot i = lyric line i+1):
-      - has still on disk → that image
+      - has still on disk for the *current page variant* → that image
       - line is generating / regenerating now → thumbnails_generating.jpg
       - line is listed for generation, not started → thumbnails_qued_for_generation.jpg
       - expected but missing / removed, nothing pending → thumbnails_no_image.jpg
+
+    When Image Frequency is L2 or L3, a page switcher (Page 1 / Page 2 / Page 3)
+    sits under the Lyrics Thumbnails heading; each page shows that variant for
+    every lyric line. L1 keeps the switcher hidden.
     Section is hidden when there are no lyrics stills and nothing queued.
     """
-    by_line = _line_path_map(paths)
+    page = _lyrics_page_current()
+    per = _lyrics_per_line_count()
+    # Clamp stored page if frequency dropped
+    if page > per:
+        page = _set_lyrics_page(per)
+    by_line = _line_path_map(paths, variant=page if per > 1 else 0)
+    # Any-variant map for section visibility / expected line count
+    by_line_any = _line_path_map(paths, variant=0) if per > 1 else by_line
     expected = _thumb_expected_count()
-    if by_line:
-        expected = max(expected, min(max(by_line.keys()), THUMB_SLOTS))
+    if by_line_any:
+        expected = max(expected, min(max(by_line_any.keys()), THUMB_SLOTS))
     expected = min(expected, THUMB_SLOTS)
     show_section = _lyrics_section_should_show(paths)
 
@@ -1119,7 +1217,17 @@ def _thumb_panel_updates(paths: Optional[List[str]] = None) -> List[Any]:
     th = _thumb_size_px()
     n_rows = len(_gen.get("thumb_rows") or []) or max(1, (THUMB_SLOTS + THUMB_COLS - 1) // THUMB_COLS)
 
-    updates: List[Any] = [gr.update(visible=show_section)]
+    # Panel + page switcher (visible only when L>1 and section shown)
+    show_pages = bool(show_section and per > 1)
+    choices = _lyrics_page_choices()
+    updates: List[Any] = [
+        gr.update(visible=show_section),
+        gr.update(
+            visible=show_pages,
+            choices=choices,
+            value=_lyrics_page_label(page) if show_pages else None,
+        ),
+    ]
     for r in range(n_rows):
         row_start = r * THUMB_COLS
         row_has = show_section and row_start < expected
@@ -1205,6 +1313,8 @@ def _thumb_panel_outputs() -> List[Any]:
     # Lyrics
     if _gen.get("thumbs_panel") is not None:
         outs.append(_gen["thumbs_panel"])
+    if _gen.get("lyrics_page_radio") is not None:
+        outs.append(_gen["lyrics_page_radio"])
     for row in (_gen.get("thumb_rows") or []):
         outs.append(row)
     for i in range(THUMB_SLOTS):
@@ -1648,6 +1758,16 @@ def _build_create_tab() -> None:
             elem_classes=["materials-thumbs-heading"],
             size="sm",
         )
+        # Page switcher for L2/L3 (one still set per lyric line per page).
+        # Hidden when Image Frequency is L1.
+        _gen["lyrics_page_radio"] = gr.Radio(
+            choices=_lyrics_page_choices(),
+            value=_lyrics_page_label(),
+            label="Lyrics Image Page",
+            visible=False,
+            interactive=True,
+            elem_id="lyrics-page-radio",
+        )
         _gen["thumbs_panel"] = _thumbs_panel
         _gen["thumb_cols"] = []
         _gen["thumb_imgs"] = []
@@ -1767,15 +1887,23 @@ def _execute_named_job(job: Dict[str, Any], ctx: Dict[str, Any]) -> str:
     return f"Regenerated {kind} still: {Path(out).name}"
 
 
-def _execute_lyric_job(line_idx: int, ctx: Dict[str, Any]) -> str:
+def _execute_lyric_job(job: Any, ctx: Dict[str, Any]) -> str:
+    """job is 0-based line index (legacy int) or dict with line_idx + variant."""
+    if isinstance(job, dict):
+        line_idx = int(job.get("line_idx", 0))
+        variant = int(job.get("variant") or 1)
+    else:
+        line_idx = int(job)
+        variant = int(ctx.get("variant") or 1)
     proj = str(ctx.get("proj") or "")
     cfg = dict(ctx.get("cfg") or {})
     ref = str(ctx.get("ref") or "")
     inference.regenerate_single_still(
         Path(proj), int(line_idx), cfg,
         reference_image=_project_local_ref(ref, proj),
+        variant=variant,
     )
-    return f"Regenerated lyrics still {int(line_idx) + 1}."
+    return f"Regenerated lyrics still {int(line_idx) + 1} variant {variant}."
 
 
 def _regen_worker_loop() -> None:
@@ -1807,8 +1935,12 @@ def _regen_worker_loop() -> None:
                     configure.APP_STATE["image_gen_t0"] = None
                 continue
             if lq:
-                qi = int(lq.pop(0))
+                job = lq.pop(0)
                 configure.APP_STATE["regen_queue"] = lq
+                if isinstance(job, dict):
+                    qi = int(job.get("line_idx", 0))
+                else:
+                    qi = int(job)
                 q_line = qi + 1
                 _unqueue_line(q_line)
                 busy = set()
@@ -1820,7 +1952,7 @@ def _regen_worker_loop() -> None:
                 busy.add(q_line)
                 configure.APP_STATE["regen_busy_lines"] = sorted(busy)
                 try:
-                    msg = _execute_lyric_job(qi, ctx)
+                    msg = _execute_lyric_job(job, ctx)
                     print(f"[regen-worker] {msg}", flush=True)
                 except Exception as e:
                     print(f"[regen-worker] lyrics {q_line} failed: {e}", flush=True)
@@ -2638,29 +2770,38 @@ def _wire_create_events(status_box) -> None:
         q = list(configure.APP_STATE.get("regen_queue") or [])
         configure.APP_STATE["regen_queue"] = []
         if q and not inference.is_cancel_requested():
-            # Drop invalid indices before running
+            # Drop invalid jobs before running (int line_idx or {line_idx, variant})
             valid_q = []
-            for qi in q:
+            for job in q:
                 try:
-                    qi = int(qi)
+                    if isinstance(job, dict):
+                        qi = int(job.get("line_idx", -1))
+                        var = int(job.get("variant") or 1)
+                        if qi < 0:
+                            continue
+                        valid_q.append({"line_idx": qi, "variant": var})
+                    else:
+                        qi = int(job)
+                        if qi < 0:
+                            continue
+                        valid_q.append({"line_idx": qi, "variant": 1})
                 except (TypeError, ValueError):
                     continue
-                if qi < 0:
-                    continue
-                valid_q.append(qi)
             q = valid_q
-            configure.APP_STATE["thumb_queued_lines"] = [qi + 1 for qi in q]
+            configure.APP_STATE["thumb_queued_lines"] = [j["line_idx"] + 1 for j in q]
             if q:
                 msg = f"{msg}  Processing {len(q)} queued regenerate(s)…"
                 yield (
                     msg, *idle_btns, sid,
                 ) + tuple(_all_gallery_updates(lyric_paths=paths)) + tuple(_refresh_session_slots(sid))
-            for line_idx in q:
+            for job in q:
                 if inference.is_cancel_requested():
                     break
+                line_idx = int(job["line_idx"])
+                var = int(job.get("variant") or 1)
                 try:
                     configure.APP_STATE["generating"] = True
-                    _unqueue_line(int(line_idx) + 1)
+                    _unqueue_line(line_idx + 1)
                     proj = configure.APP_STATE.get("current_project_folder") or ""
                     cfg_now = configure.load_configuration()
                     gnow = configure.load_generation()
@@ -2681,16 +2822,18 @@ def _wire_create_events(status_box) -> None:
                     cfg_now["ref_gender"] = configure.normalize_gender(str(gnow.get("ref_gender") or ""))
                     cfg_now["ref_bodyshape"] = configure.normalize_bodyshape(str(gnow.get("ref_bodyshape") or ""))
                     inference.regenerate_single_still(
-                        Path(proj), int(line_idx), cfg_now, reference_image=_project_local_ref(ref_image or ""),
+                        Path(proj), line_idx, cfg_now,
+                        reference_image=_project_local_ref(ref_image or ""),
+                        variant=var,
                     )
                     paths = _list_project_images(proj)
                     yield (
-                        f"Regenerated still {int(line_idx) + 1}.",
+                        f"Regenerated still {line_idx + 1} variant {var}.",
                         *idle_btns, sid,
                     ) + tuple(_all_gallery_updates(lyric_paths=paths)) + tuple(_refresh_session_slots(sid))
                 except Exception as e:
                     yield (
-                        f"Queued regenerate line {int(line_idx) + 1} failed: {e}",
+                        f"Queued regenerate line {line_idx + 1} failed: {e}",
                         *idle_btns, sid,
                     ) + tuple(_all_gallery_updates(lyric_paths=paths)) + tuple(_refresh_session_slots(sid))
                 finally:
@@ -2779,8 +2922,15 @@ def _wire_create_events(status_box) -> None:
                 from scripts.inference import parse_lyrics, lyric_lines_only
                 n_lines = len(lyric_lines_only(parse_lyrics(text)))
             if n_lines > 0:
-                per = configure.frequency_lyrics_per_line(freq)
-                configure.APP_STATE["thumb_expected_count"] = n_lines * max(1, per)
+                # Grid slots = lyric lines only; L2/L3 variants use the page switcher
+                configure.APP_STATE["thumb_expected_count"] = n_lines
+            per = configure.frequency_lyrics_per_line(freq)
+            # Keep current page when possible; clamp to new L range
+            try:
+                cur = int(configure.APP_STATE.get("lyrics_page") or 1)
+            except (TypeError, ValueError):
+                cur = 1
+            configure.APP_STATE["lyrics_page"] = max(1, min(cur, max(1, per)))
         except Exception:
             pass
         pad_status = (
@@ -2814,6 +2964,30 @@ def _wire_create_events(status_box) -> None:
                 _gen["theme_btn"],
                 _gen["run_btn"],
                 _gen["stop_btn"],
+                _gen["active_session_id"],
+            ] + _thumb_panel_outputs() + _session_refresh_outputs,
+        )
+
+    def _on_lyrics_page_change(page_label, active_session_id):
+        """Switch Lyrics Thumbnails to the selected variant page (L2/L3)."""
+        label = str(page_label or "").strip()
+        m = re.search(r"(\d+)", label)
+        page = int(m.group(1)) if m else 1
+        page = _set_lyrics_page(page)
+        return (
+            f"Showing lyrics stills — {_lyrics_page_label(page)} "
+            f"(of {_lyrics_per_line_count()}).",
+            active_session_id or "",
+        ) + tuple(_all_gallery_updates()) + tuple(
+            _refresh_session_slots(active_session_id or "")
+        )
+
+    if _gen.get("lyrics_page_radio") is not None:
+        _gen["lyrics_page_radio"].change(
+            _on_lyrics_page_change,
+            inputs=[_gen["lyrics_page_radio"], _gen["active_session_id"]],
+            outputs=[
+                status_box,
                 _gen["active_session_id"],
             ] + _thumb_panel_outputs() + _session_refresh_outputs,
         )
@@ -3464,25 +3638,32 @@ def _wire_create_events(status_box) -> None:
                 _refresh_session_slots(active_session_id or "")
             )
         line_no = resolved + 1
+        page = _lyrics_page_current()
+        per = _lyrics_per_line_count()
         removed = []
-        for old in list(Path(proj).iterdir()):
-            if not old.is_file():
+        for oldf in list(Path(proj).iterdir()):
+            if not oldf.is_file():
                 continue
-            if old.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
+            if oldf.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
                 continue
-            m = re.match(r"^(\d+)", old.name)
-            if m and int(m.group(1)) == line_no:
-                try:
-                    old.unlink()
-                    removed.append(old.name)
-                except OSError as e:
-                    print(f"[remove] {old}: {e}", flush=True)
+            ln, var = _parse_still_line_variant(oldf.name)
+            if ln != line_no:
+                continue
+            # L1 or single-file legacy: remove all for the line.
+            # L2/L3: only the variant on the current Lyrics Image page.
+            if per > 1 and var != page:
+                continue
+            try:
+                oldf.unlink()
+                removed.append(oldf.name)
+            except OSError as e:
+                print(f"[remove] {oldf}: {e}", flush=True)
         # Drop from APP_STATE paths
         kept = []
         for p in (configure.APP_STATE.get("generation_output_paths") or []):
             try:
-                m = re.match(r"^(\d+)", Path(p).name)
-                if m and int(m.group(1)) == line_no:
+                ln, var = _parse_still_line_variant(Path(p).name)
+                if ln == line_no and (per <= 1 or var == page):
                     continue
             except Exception:
                 pass
@@ -3499,8 +3680,9 @@ def _wire_create_events(status_box) -> None:
         exp = int(configure.APP_STATE.get("thumb_expected_count") or 0)
         if line_no > exp:
             configure.APP_STATE["thumb_expected_count"] = line_no
+        var_bit = f" (page {page} / variant {page})" if per > 1 else ""
         msg = (
-            f"Removed still {line_no}"
+            f"Removed still {line_no}{var_bit}"
             + (f" ({', '.join(removed)})" if removed else "")
             + ". Slot shows placeholder — Generate Materials or Regenerate to refill."
         )
@@ -3610,20 +3792,35 @@ def _wire_create_events(status_box) -> None:
             "imagegen_steps": int(steps or configure.DEFAULT_STEPS),
             "imagegen_cfg_scale": float(cfg_scale or configure.DEFAULT_CFG),
         })
+        page = _lyrics_page_current()
+        per = _lyrics_per_line_count()
+        variant = page if per > 1 else 1
         configure.APP_STATE["regen_worker_ctx"] = {
             "proj": proj,
             "cfg": cfg_now,
             "ref": ref_image or "",
+            "variant": variant,
         }
         q = list(configure.APP_STATE.get("regen_queue") or [])
-        if resolved_idx not in q:
-            q.append(resolved_idx)
+        job = {"line_idx": resolved_idx, "variant": variant}
+        # Avoid duplicate identical jobs
+        already = False
+        for existing in q:
+            if isinstance(existing, dict) and int(existing.get("line_idx", -1)) == resolved_idx and int(existing.get("variant") or 1) == variant:
+                already = True
+                break
+            if existing == resolved_idx and variant == 1:
+                already = True
+                break
+        if not already:
+            q.append(job)
         configure.APP_STATE["regen_queue"] = q
         configure.APP_STATE["thumb_queued_lines"] = sorted(_queued_lines() | {line_no})
         _ensure_regen_worker()
 
+        var_bit = f" page {page}" if per > 1 else ""
         yield (
-            f"Queued regenerate for still {line_no}…",
+            f"Queued regenerate for still {line_no}{var_bit}…",
             gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
             active_session_id or "",
         ) + tuple(_all_gallery_updates()) + tuple(

@@ -2608,12 +2608,16 @@ def regenerate_single_still(
     cfg: Dict[str, Any],
     reference_image: str = "",
     progress_callback: Optional[Callable] = None,
+    variant: int = 1,
 ) -> Path:
     """
     Force-regenerate ONE still (0-based line_index) only.
 
-    Does not call the batch generator. Deletes only that line's PNG, runs one
-    sd-cli invocation, leaves every other still untouched.
+    variant: 1-based sequence index when Image Frequency is L2/L3
+    (filename 001-2-slug.png for variant 2). Defaults to 1 (L1 naming).
+
+    Does not call the batch generator. Runs one sd-cli invocation for that
+    line+variant, leaves every other still untouched.
     """
     project_dir = Path(project_dir)
     if not project_dir.is_dir():
@@ -2714,7 +2718,20 @@ def regenerate_single_still(
             "[Do not depict any specific real person from a reference photo.]"
         ) if has_ref else clean_prompt
 
-    img_path = project_dir / _still_filename(line_no, line_text)
+    freq_label = configure.normalize_image_frequency(
+        cfg.get("imagegen_frequency") or configure.DEFAULT_IMAGE_FREQUENCY
+    )
+    freq = max(1, int(configure.frequency_lyrics_per_line(freq_label)))
+    var = max(1, min(int(variant or 1), freq))
+    # Apply sequence framing hint when regenerating a multi-variant still
+    if freq > 1:
+        hints = configure.image_frequency_hints(freq_label)
+        hint = hints[var - 1] if var - 1 < len(hints) else ""
+        if hint:
+            final_prompt = f"{final_prompt} {hint}".strip()
+    img_path = project_dir / _still_filename(
+        line_no, line_text, variant=var, frequency=freq,
+    )
     # Write to a sibling temp path first so the existing still stays on disk
     # until success (avoids "No Image" flash and slot-list shifts mid-regen).
     partial = img_path.with_name(img_path.stem + ".__partial__" + img_path.suffix)
@@ -2780,10 +2797,12 @@ def regenerate_single_still(
     out, rc = _run_sd_cli_once(_one_cmd(attach_ref=use_ref), exe)
     found = partial if partial.is_file() else None
     if found is None:
-        found = _find_still_for_line(project_dir, line_no)
+        found = _find_still_for_line(
+            project_dir, line_no, variant=var if freq > 1 else None,
+        )
 
     if not _sd_attempt_succeeded(out, rc, found) and use_ref:
-        print(f"[regen] line {line_no} failed with ref — one retry without reference…", flush=True)
+        print(f"[regen] line {line_no} var {var} failed with ref — one retry without reference…", flush=True)
         try:
             if partial.exists():
                 partial.unlink()
@@ -2792,7 +2811,9 @@ def regenerate_single_still(
         out, rc = _run_sd_cli_once(_one_cmd(attach_ref=False), exe)
         found = partial if partial.is_file() else None
         if found is None:
-            found = _find_still_for_line(project_dir, line_no)
+            found = _find_still_for_line(
+                project_dir, line_no, variant=var if freq > 1 else None,
+            )
 
     if not _sd_attempt_succeeded(out, rc, found):
         try:
@@ -2802,10 +2823,10 @@ def regenerate_single_still(
             pass
         detail = _format_sd_failure(out, vae_path, model_path, rc)
         raise RuntimeError(
-            f"Regenerate failed for line {line_no} only.\n{detail}"
+            f"Regenerate failed for line {line_no} variant {var} only.\n{detail}"
         )
 
-    # Atomic-ish replace: only now remove the previous still
+    # Atomic-ish replace: only now remove the previous still for this variant
     dest = img_path
     try:
         if found is not None and found.resolve() != img_path.resolve():
@@ -2824,9 +2845,14 @@ def regenerate_single_still(
     for p in (configure.APP_STATE.get("generation_output_paths") or []):
         try:
             n = Path(p).name
-            m = re.match(r"^(\d+)", n)
-            if m and int(m.group(1)) == line_no:
-                continue
+            # Drop only the same line+variant path we just replaced
+            if freq > 1:
+                if n.startswith(f"{line_no:03d}-{var}-") or n.startswith(f"{line_no:03d}-{var}."):
+                    continue
+            else:
+                m = re.match(r"^(\d+)", n)
+                if m and int(m.group(1)) == line_no:
+                    continue
         except Exception:
             pass
         kept.append(p)
