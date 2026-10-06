@@ -1,5 +1,5 @@
 # Lyrics-Materials
-Status: Beta - Developing and improving. If the Generation page panels relating to Details Mode do not show, try switching back and forth, between Panel Mode's (there are a lot of items). This is Experimental, and while I have not made my first video with it, it will likely be updated daily or more frequently.
+Status: Beta - Developing and improving. This is Experimental, and while I have not made my first video with it, it will likely be updated daily or more frequently.
 
 ### Description:
 It will convert lines of lyrics into AI generated images, one for each line. The idea is one could arrange these in a movie editor, and fade in/out between sections of images, to make simple music videos. One could also take the line of lyrics and the generated images, and feed that into AI video generator to make clips, that could then be assembled.
@@ -39,6 +39,7 @@ Available on [HuggingFace.Co](https://huggingface.co/)...
 - At 8 Steps per image, most things turn out ok, but at 10 steps the eyes will more likely be correct and not weird looking. At 12 steps, its going to take forever, but I assume the eyes will be 100% correct at that point. 
 - Remember by editing `.\scripts\configure.py` script it is possible to have custom hair/clothes/etc. Ie for clothing you would for example search for something unique like "Rocker" in configure script, and then change, prompt detail and relating GUI option, for that one or one of the others you wont use. 
 - When a session is under-way, ensure to collapse the session slots column on the left, with the little "--><--" button. This will optimize the interface a little.
+- If the Generation page panels relating to Details Mode do not show, try switching back and forth, between Panel Mode's (there are a lot of items to display). 
 
 ### Struture:
 ```
@@ -57,6 +58,7 @@ Lyrics-Materials/
 
 ### Development:
 - It works, making first video. Then will decide next steps.
+- Possibly we need to put image output to a new Details mode panel.
 
 ### Disclaimer:
 - Do not over-load your GPU, it could cause graphics driver crash. As stated, ensure you understand the capabilities of your card. My max settings for 8 GB GPU was 768x512 (no bigger), and image models were loaded in Split mode. If your graphics driver does start to crash due to low ram, then try to close the program (python command prompt is fastest) IMMEDIATELY, and re-think your configurations.
