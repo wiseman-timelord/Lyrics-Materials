@@ -41,7 +41,7 @@ Available on [HuggingFace.Co](https://huggingface.co/)...
 ```
 
 ### Notation:
-- Ensure that the reference image is not HUGE, and I advise trimming it down to, torso and head, or bust and head, then setting the bodyshape correctly. Limiting the reference image to smaller area including head, assists with facial likeness. 
+- Ensure that the reference image is not HUGE, and I advise trimming it down to, torso and head, or bust and head, then setting the bodyshape correctly. Limiting the reference image to, smaller body area and full head, assists with facial likeness. 
 
 ### Struture:
 ```
