@@ -12,7 +12,7 @@ It will convert lines of lyrics into AI generated images, one for each line. The
 - **Local Tool**; paste lyrics → one still per non-marker lyric line → `output/<song_name>/` folder of numbered PNGs for use in external AI video tools.
 - **Clever Model Handling;** If Thinking and ImageGen share the same Vulkan device and either uses M-Lock, Thinking fully unloads before Flux loads — they are never resident together.
 - **Two-phase orchestration;** Phase 1 = assessment + prompts (Thinking preferred, else Encoder),  Phase 2 = image generation (Flux on its backend)
-- **llama.cpp;**: (`llama-completion`) for song analysis + per-line visual prompts.
+- **llama.cpp;** (`llama-completion`) for song analysis + per-line visual prompts.
 - **stable-diffusion.cpp;** (`sd-cli`) for Flux.2-klein stills.
 - **ffmpeg;** for utility/probe use only — not used for materials output.
 
