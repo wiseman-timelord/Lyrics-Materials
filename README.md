@@ -45,7 +45,7 @@ Available on [HuggingFace.Co](https://huggingface.co/)...
 5. Project folder: `output/<song_name_with_underscores>/` with images, `lyrics.txt`, `analysis.txt`, `prompts.txt`, `character_map.txt`.
 ```
 
-### STRUCTURE:
+### Struture:
 ```
 Lyrics-Materials/
 ├── Lyrics-Materials.bat
@@ -62,3 +62,6 @@ Lyrics-Materials/
 
 ### Development:
 - It works, making first video. Then will decide next steps.
+
+### Disclaimer:
+- Do not over-load your GPU, it could cause graphics driver crash. As stated, ensure you understand the capabilities of your card. My max settings for 8 GB GPU was 768x512 (no bigger), and image models were loaded in Split mode. If your graphics driver does start to crash due to low ram, then try to close the program (python command prompt is fastest) IMMEDIATELY, and re-think your configurations.
