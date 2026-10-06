@@ -58,7 +58,7 @@ Lyrics-Materials/
 
 ### Development:
 - It works, making first video. Then will decide next steps.
-- Possibly we need to put image output to a new Details mode panel.
+- Possibly we need to put image output to a new Details mode panel, because Details Mode is struggling.
 
 ### Disclaimer:
 - Do not over-load your GPU, it could cause graphics driver crash. As stated, ensure you understand the capabilities of your card. My max settings for 8 GB GPU was 768x512 (no bigger), and image models were loaded in Split mode. If your graphics driver does start to crash due to low ram, then try to close the program (python command prompt is fastest) IMMEDIATELY, and re-think your configurations.
