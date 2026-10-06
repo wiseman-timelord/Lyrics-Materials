@@ -1,5 +1,5 @@
 # Lyrics-Materials
-Status: Beta - Developing and improving. If the Generation page panels relating to Details Mode do not show, try switching back and forth, between Panel Mode's (there are a lot of items). This is Experimental, and while I have not made my first video with it, it will be updated daily/frequently.
+Status: Beta - Developing and improving. If the Generation page panels relating to Details Mode do not show, try switching back and forth, between Panel Mode's (there are a lot of items). This is Experimental, and while I have not made my first video with it, it will likely be updated daily or more.
 
 ### Description:
 It will convert lines of lyrics into AI generated images, one for each line. The idea is one could arrange these in a movie editor, and fade in/out between sections of images, to make simple music videos. One could also take the line of lyrics and the generated images, and feed that into AI video generator to make clips, that could then be assembled.
