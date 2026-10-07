@@ -57,8 +57,8 @@ Lyrics-Materials/
 ```
 
 ### Development:
-- It works, making first video. Then will decide next steps.
-- Possibly we need to put image output to a new Details mode panel, because Details Mode is struggling.
+- It works, but I want it to work better, improving prompting, until its all working well, and ensuring that the likeness is same as reference image for main character but NOT other characters that may be present in given scenes.
+- Apparently the qwen3-vl-thinking model can generate the prompts AND encode the images? if this is the case, please ensure to shift ALL instruct model duties over to the thinking model, so we can reduce the number of models used  
 
 ### Disclaimer:
 - Do not over-load your GPU, it could cause graphics driver crash. As stated, ensure you understand the capabilities of your card. My max settings for 8 GB GPU was 768x512 (no bigger), and image models were loaded in Split mode. If your graphics driver does start to crash due to low ram, then try to close the program (python command prompt is fastest) IMMEDIATELY, and re-think your configurations.
