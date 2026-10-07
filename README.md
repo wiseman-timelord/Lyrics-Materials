@@ -1,5 +1,5 @@
 # Lyrics-Materials
-Status: Beta - Developing and improving. This is Experimental, I have not made my first video with it yet, it is possible, but the controls need work. Next version will have lots of GOOD new features, and likeness to reference image will be fixed again, but I am working right on the limits of what Flux2-4B is capable of.
+Status: Beta - Developing and improving. This is Experimental, I have not made my first video with it yet, it is possible, but the controls need work. Next version will have lots of GOOD new features, and likeness to reference image will be fixed again, but I am working right on the limits of what Flux2-4B is capable of. Note the images shown below were generated with v0.11, things differ per version until I get it pinned down.
 
 ### Description:
 It will convert lines of lyrics into AI generated images, one for each line. The idea is one could arrange these in a movie editor, and fade in/out between sections of images, to make simple music videos. One could also take the line of lyrics and the generated images, and feed that into AI video generator to make clips, that could then be assembled.
