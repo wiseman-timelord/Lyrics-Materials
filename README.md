@@ -27,11 +27,13 @@ Available on [HuggingFace.Co](https://huggingface.co/)...
 ### Instructions:
 - These are my current instructions for using the program...
 ```
+- Note; If you are unsure as to if Flux2 will be ok with your settings and VRam settings, then you may want Task manager open at this stage, with the python process selected ready to End Task if you get VRam overload. As I have repeating stated "for 8GB VRam you would want image settings to, 768x512 or 640x360 (half 720p), that is with Diffuser Placement set to "Split". Failure to do so can, crash or mess up graphics drivers requiring factory reset install. This is the same with Any application that uses Stable Diffusion, and people may not realize due to possibly only using text based models normally.
 1. The program will start, you will be in a new project, so collapse the left pane, unless you are going to hop sessions.
 2. User enters **song name** (folder slug) and pastes lyrics; optional (advised) single **reference image** for central character.
-3. Ensure Image frequency and other settings are correct (and not too wild, see notes), then click "Generate All Assets". 
+3. Ensure Image frequency and other settings are correct (and not too wild, see notes), then click "Generate All Assets".
 4. When all assets are generated, then click on "Lyrics Thumbnails", have a look at the images, and regenerate them individually as required.
 5. When images are all how you intended, then copy them to the movie making app you have. For basic/simple editing, possibly you could use "Microsoft Movie Maker" that came with the "Microsoft Essentials 2012" package.
+
 ```
 
 ### Notation:
