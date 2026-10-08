@@ -532,6 +532,78 @@ STYLE_CHOICES = [STYLE_LIGHT, STYLE_DARK, STYLE_COLORFUL]
 STYLE_DEFAULT = STYLE_DARK
 
 # ---------------------------------------------------------------------------
+# Image style (lead word at the start of every still prompt)
+# ---------------------------------------------------------------------------
+# Controls the first word(s) of the assembled sd-cli prompt so the whole still
+# follows one rendering language. Visual Style (light/dark/colourful) remains
+# a separate mood/template control.
+IMAGE_STYLE_PHOTO = "Photo Realistic"
+IMAGE_STYLE_CARTOON = "Cartoon"
+IMAGE_STYLE_MANGA = "Manga Anime"
+IMAGE_STYLE_GAME = "Computer Game Graphics"
+IMAGE_STYLE_PIXEL = "Pixelated"
+IMAGE_STYLE_CHOICES = [
+    IMAGE_STYLE_PHOTO,
+    IMAGE_STYLE_CARTOON,
+    IMAGE_STYLE_MANGA,
+    IMAGE_STYLE_GAME,
+    IMAGE_STYLE_PIXEL,
+]
+IMAGE_STYLE_DEFAULT = IMAGE_STYLE_PHOTO
+# Lead token(s) written at the very start of the complete positive prompt.
+IMAGE_STYLE_LEAD = {
+    IMAGE_STYLE_PHOTO: "Photorealistic",
+    IMAGE_STYLE_CARTOON: "Cartoon",
+    IMAGE_STYLE_MANGA: "Manga anime",
+    IMAGE_STYLE_GAME: "Computer game graphics",
+    IMAGE_STYLE_PIXEL: "Pixelated",
+}
+# Style-opposed terms — first section of the negative, chosen by Image Style.
+# Photo Realistic fights drawn styles; Cartoon/Manga fight photo + pixel;
+# Game/Pixel fight photo + pure drawing look.
+IMAGE_STYLE_NEGATIVE_LEAD = {
+    IMAGE_STYLE_PHOTO: "cartoon, anime, pixelated",
+    IMAGE_STYLE_CARTOON: "photorealistic, pixelated, computer game graphics",
+    IMAGE_STYLE_MANGA: "photorealistic, pixelated, computer game graphics",
+    IMAGE_STYLE_GAME: "photorealistic, cartoon, anime, drawing",
+    IMAGE_STYLE_PIXEL: "photorealistic, cartoon, anime, drawing",
+}
+
+
+def normalize_image_style(value: str) -> str:
+    v = (value or "").strip()
+    if v in IMAGE_STYLE_CHOICES:
+        return v
+    low = v.lower().replace("_", " ").replace("-", " ")
+    for c in IMAGE_STYLE_CHOICES:
+        if c.lower() == low:
+            return c
+    aliases = {
+        "photorealistic": IMAGE_STYLE_PHOTO,
+        "photo realistic": IMAGE_STYLE_PHOTO,
+        "photo": IMAGE_STYLE_PHOTO,
+        "realistic": IMAGE_STYLE_PHOTO,
+        "cartoon": IMAGE_STYLE_CARTOON,
+        "manga": IMAGE_STYLE_MANGA,
+        "anime": IMAGE_STYLE_MANGA,
+        "manga anime": IMAGE_STYLE_MANGA,
+        "game": IMAGE_STYLE_GAME,
+        "computer game": IMAGE_STYLE_GAME,
+        "computer game graphics": IMAGE_STYLE_GAME,
+        "pixel": IMAGE_STYLE_PIXEL,
+        "pixelated": IMAGE_STYLE_PIXEL,
+        "pixel art": IMAGE_STYLE_PIXEL,
+    }
+    return aliases.get(low, IMAGE_STYLE_DEFAULT)
+
+
+def image_style_lead(value: str = "") -> str:
+    """First word(s) of the assembled still prompt, e.g. 'Photorealistic'."""
+    key = normalize_image_style(value)
+    return IMAGE_STYLE_LEAD.get(key, IMAGE_STYLE_LEAD[IMAGE_STYLE_DEFAULT])
+
+
+# ---------------------------------------------------------------------------
 # Hair style (subject token — optional via None)
 # Injected into character-bearing prompts when not None.
 # ---------------------------------------------------------------------------
@@ -555,9 +627,9 @@ HAIR_STYLE_CONCRETE = [
 HAIR_STYLE_DEFAULT = HAIR_STYLE_NONE
 HAIR_STYLE_TOKEN = "<hair_style>"
 HAIR_STYLE_WORDS = {
-    HAIR_STYLE_SHORT: "cut short and even, three inches length",
-    HAIR_STYLE_NATURAL: "worn naturally, 3 inches length all over",
-    HAIR_STYLE_DUDE: "center parting, shaggy and shoulder length",
+    HAIR_STYLE_SHORT: "cut short and even with length 3 inches",
+    HAIR_STYLE_NATURAL: "worn naturally with length 3 inches",
+    HAIR_STYLE_DUDE: "center parting shaggy shoulder length",
     HAIR_STYLE_BOB: "styled in a short bob with a fringe",
     HAIR_STYLE_PONY: "tied-back in a shoulder-length high-ponytail",
     HAIR_STYLE_PIGTAIL: "tied-back in 2 shoulder-length high-pigtails",
@@ -792,9 +864,9 @@ def normalize_age(value) -> int:
 
 
 def age_phrase(value) -> str:
-    """Literal age words for prompt injection, e.g. 'at age 45 years'."""
+    """Literal age words for identity lock, e.g. '45 years old'."""
     n = normalize_age(value)
-    return f"at age {n} years"
+    return f"{n} years old"
 
 def subject_appearance_clause(
     hair: str = "",
@@ -833,41 +905,165 @@ def character_identity_clause(
     gender: str = "",
     bodyshape: str = "",
     age=None,
+    pose: str = "",
+    placement: str = "middle",
 ) -> str:
     """
-    Strong identity-lock sentence for stills that attach the reference image.
-    Mirrors Image-Glamour's "facial appearance and personal identity match
-    the reference image exactly, other than …" pattern.
+    Character lock after the scene description.
 
-    Flux.2 often clones the reference subject when the prompt is silent about
-    count; the explicit single-instance clause closes that prior. Age is named
-    so the model does not default every adult to mid-twenties.
+    placement:
+      "middle"     → "Depicted in the middle of the scene, …"  (full / partial)
+      "background" → "In the background of the scene, …"       (silhouette)
+
+    Target form (middle):
+      Depicted in the middle of the scene[, pose], the single individual with
+      the exact same face as the gender male shown in the reference image, …
     """
-    gp = gender_phrase(gender) or "person"
+    gp = gender_phrase(gender) if gender else ""
     bp = bodyshape_phrase(bodyshape)
     hp = hair_style_phrase(hair)
     op = outfit_phrase(outfit)
-    other: List[str] = []
+
+    gender_bit = f"the gender {gp}" if gp else "the subject"
+
+    attrs: List[str] = []
     if age is not None and str(age).strip() != "":
-        other.append(age_phrase(age))
+        attrs.append(age_phrase(age))
     if bp:
-        other.append(f"a {bp} bodyshape")
+        attrs.append(f"bodyshape of {bp}")
     if hp:
-        other.append(f"hair {hp}")
-    if op:
-        other.append(f"wearing a {op}")
-    other_bit = ""
-    if other:
-        other_bit = ", other than the subject being " + ", ".join(other)
-    return (
-        f"Photorealistic depiction of the {gp} whose facial appearance and "
-        f"personal identity match the reference image exactly{other_bit}. "
-        "Exactly one instance of this reference person in the frame — never "
-        "duplicate, clone, or mirror the same face twice; secondary people may "
-        "appear only when the scene needs them and must not share the reference "
-        "likeness. Preserve the same face, bone structure, eyes, and likeness "
-        "from the reference; anatomically correct hands with five fingers on each hand."
+        attrs.append(f"hair {hp}")
+    attrs.append("anatomically correct hands")
+    attr_bit = " and ".join(attrs)
+
+    place = (placement or "middle").strip().lower()
+    if place in ("background", "bg", "silhouette", "rear", "distant"):
+        lead = "In the background of the scene"
+    else:
+        lead = "Depicted in the middle of the scene"
+
+    pose_s = (pose or "").strip()
+    if pose_s and pose_s.upper() not in ("NONE", "N/A", "NA", "-"):
+        # Strip placeholder junk the model sometimes echoes
+        if "pose/framing" in pose_s.lower() or pose_s.startswith("<"):
+            pose_s = ""
+    if pose_s and pose_s.upper() not in ("NONE", "N/A", "NA", "-"):
+        pose_s = pose_s.rstrip(" .,;:")
+        mid = f"{lead}, {pose_s}, the single individual"
+    else:
+        mid = f"{lead}, the single individual"
+
+    core = (
+        f"{mid} with the exact same face as {gender_bit} shown in the reference "
+        f"image, that in the generated image are, {attr_bit}"
     )
+    if op:
+        core = f"{core}, wearing a {op}."
+    else:
+        core = core + "."
+    return core
+
+
+def still_header(image_style: str = "", visual_style: str = "") -> str:
+    """
+    Lead clause for every still:
+      Photorealistic, dark and gloomy, cinematic composition, coherent lighting.
+    """
+    lead = image_style_lead(image_style)
+    mood = (visual_style or "").strip()
+    parts = [lead]
+    if mood:
+        parts.append(mood)
+    parts.append("cinematic composition")
+    parts.append("coherent lighting")
+    return ", ".join(parts) + "."
+
+
+def compose_lyric_still_prompt(
+    *,
+    image_style: str = "",
+    visual_style: str = "",
+    lyric: str = "",
+    scene: str = "",
+    background: str = "",
+    identity: str = "",
+    sequence_bit: str = "",
+) -> str:
+    """
+    Full positive prompt for a lyric still:
+
+      {header} {scene}. {background}. {identity} [{sequence}]
+
+    The thinking model supplies scene (+ optional background people). The
+    identity lock is UI-driven (reference face / age / hair / outfit / pose).
+    The raw lyric line is NOT echoed into the image prompt — it only steered
+    the thinking model. Fallback: if scene is empty, a short lyric-based
+    still phrase is used so generation is not blank.
+    """
+    header = still_header(image_style, visual_style)
+    lyric_s = (lyric or "").strip().rstrip(" .,;:!?…")
+    parts: List[str] = [header]
+
+    def _finish_sentence(s: str) -> str:
+        s = (s or "").strip().rstrip(" ,;:")
+        if s and s[-1] not in ".!?":
+            s += "."
+        return s
+
+    scene_s = (scene or "").strip()
+    if scene_s:
+        low = scene_s.lower().strip()
+        lyric_low = lyric_s.lower()
+        # Drop garbage / instruction echoes / pure lyric repeats
+        if low.startswith("music-video still"):
+            scene_s = ""
+        elif lyric_low and (low == lyric_low or low.rstrip(".!?") == lyric_low):
+            scene_s = ""
+        elif "music-video still of:" in low and len(scene_s) < 100:
+            scene_s = ""
+        elif any(k in low for k in (
+            "likeness and wardrobe",
+            "applied later from the reference",
+            "describe pose, action, and framing only",
+            "main-character clothing",
+            "character: show the main",
+            "character: absent",
+            "do not quote the lyric",
+            "do not describe the main character",
+            "do not copy these instructions",
+            "output exactly three labeled",
+            "include secondary people as suggested",
+            "never copy the main character",
+            "one short paragraph",
+            "pose/framing only",
+            "scene description:",
+            "background characters:",
+            "no lyric quote",
+            "no face",
+            "no main clothing",
+            "setting, action, lighting, mood",
+            "other people and outfits",
+        )):
+            scene_s = ""
+    if scene_s:
+        parts.append(_finish_sentence(scene_s))
+    elif lyric_s:
+        # Last-resort fallback so the still is not header-only
+        parts.append(f"Music-video still illustrating: {lyric_s}.")
+
+    bg = (background or "").strip()
+    if bg and bg.upper() not in ("NONE", "N/A", "NA", "-"):
+        parts.append(_finish_sentence(bg))
+
+    id_s = (identity or "").strip()
+    if id_s:
+        parts.append(id_s)
+    seq = (sequence_bit or "").strip()
+    if seq:
+        parts.append(seq)
+    return " ".join(parts).strip()
+
+
 
 # Fade colours (RGB 0-255) used for intro/outro and lyric gaps
 STYLE_FADE_RGB = {
@@ -925,27 +1121,78 @@ DEFAULT_WIDTH = 768
 DEFAULT_HEIGHT = 512
 DEFAULT_STEPS = 8  # 8 improves eyes / fine detail vs 4 on Flux.2-klein
 DEFAULT_CFG = 1.0
-# Sectioned negative: periods group related terms (style / overlays / quality / anatomy).
-# Prefer concrete Flux.2 failure modes over long synonym lists — CFG is low (1.0)
-# on distilled klein, so every token competes; keep high-impact terms only.
-DEFAULT_NEGATIVE_PROMPT = (
-    "cartoon, illustration, anime, drawing, pixelated. "
-    "text, letters, words, writing, typography, caption, subtitle, "
-    "watermark, logo, signature, stamp, UI, HUD. "
-    "blurry, out of focus, low quality, noisy, jpeg artifacts. "
-    "deformed, extra limbs, missing limbs, fused fingers, fewer than five fingers, "
-    "mutated hands, bad anatomy, distorted anatomy, exaggerated proportions, "
-    "contorted pose, head on backwards. "
-    "electronic devices, mobile phones, headphones."
+# ---------------------------------------------------------------------------
+# Negative prompt sections (user-editable in Generation UI)
+# ---------------------------------------------------------------------------
+# Three sections, combined dynamically at generate time:
+#
+#   General   — style-opposed lead (from Image Style) + quality/overlay body.
+#               Always applied. Alone when the still has no people.
+#   Character — anatomy only. Applied when people appear. Users should rarely
+#               need to edit this; keep it stable for consistent hands/limbs.
+#   Multi     — identity collision + devices. Applied only when the reference
+#               character is present AND secondary people are in the still
+#               (devices usually belong to background figures, not the lead).
+#
+DEFAULT_GENERAL_NEGATIVE_BODY = (
+    "text, writing, watermark, signature. "
+    "blurry, out of focus, low quality, noisy."
+)
+
+
+def general_negative_for_style(image_style: str = "") -> str:
+    """
+    General Negative Prompt for the given Image Style:
+      "<style-opposed lead>. <shared body>"
+    e.g. Photo Realistic → "cartoon, anime, pixelated. text, writing, …"
+         Cartoon         → "photorealistic, pixelated, computer game graphics. text, …"
+    """
+    style_key = normalize_image_style(image_style or IMAGE_STYLE_DEFAULT)
+    lead = IMAGE_STYLE_NEGATIVE_LEAD.get(
+        style_key, IMAGE_STYLE_NEGATIVE_LEAD[IMAGE_STYLE_DEFAULT]
+    )
+    body = DEFAULT_GENERAL_NEGATIVE_BODY.strip()
+    if not lead:
+        return body
+    return f"{lead.rstrip('. ')}. {body}"
+
+
+# Photo-Realistic default shown in the UI on first load
+DEFAULT_GENERAL_NEGATIVE = general_negative_for_style(IMAGE_STYLE_PHOTO)
+
+# Character: anatomy only — leave alone for consistent hands / limbs / pose.
+DEFAULT_CHARACTER_NEGATIVE = (
+    "deformed, bad anatomy, exaggerated proportions, contorted pose, "
+    "head on backwards, extra limbs, missing limbs, fused fingers, "
+    "fewer than five fingers on each hand."
+)
+# Multi-character: identity + devices (devices usually on background people).
+DEFAULT_MULTI_CHARACTER_NEGATIVE = (
+    "More than 1 character with same identity as shown in the reference image. "
+    "Electronic devices, mobile phones, headphones."
+)
+# Combined body kept for back-compat callers (period-space joined).
+DEFAULT_NEGATIVE_BODY = (
+    DEFAULT_GENERAL_NEGATIVE_BODY
+    + " "
+    + DEFAULT_CHARACTER_NEGATIVE
+    + " "
+    + DEFAULT_MULTI_CHARACTER_NEGATIVE
+)
+# Full default assumes Photo Realistic style lead (legacy single-box value).
+DEFAULT_NEGATIVE_PROMPT = general_negative_for_style(IMAGE_STYLE_PHOTO) + " " + (
+    DEFAULT_CHARACTER_NEGATIVE + " " + DEFAULT_MULTI_CHARACTER_NEGATIVE
 )
 # Cover / Theme ambient stills are not meant to host people. Anatomy lists are
 # wasted budget there; replace with a hard no-person prior plus anti-text.
+# Style lead is prepended by merge_negative_prompt; keep ambient body style-free.
+# Cover / Theme: no subjects of any kind (people, faces, figures, bodies).
 AMBIENT_NEGATIVE_PROMPT = (
-    "cartoon, illustration, anime, drawing, pixelated. "
-    "text, letters, words, writing, typography, caption, subtitle, "
-    "watermark, logo, signature, stamp, UI, HUD, signage, poster text, banner. "
-    "blurry, out of focus, low quality, noisy, jpeg artifacts. "
-    "people, person, human, face, portrait, character, figure, crowd, body."
+    "text, writing, caption, watermark, signature, graphical overlay, "
+    "signage, poster text, banner. "
+    "blurry, out of focus, low quality, noisy. "
+    "people, person, human, face, portrait, character, figure, crowd, body, "
+    "man, woman, child, silhouette of a person, humanoid subject."
 )
 # Extra anti-text always merged into cover stills (Flux 4B loves to write titles).
 COVER_NEGATIVE_EXTRA = (
@@ -1037,46 +1284,110 @@ def image_size_aspect(value: str = "") -> str:
     return IMAGE_SIZE_ASPECT_REGULAR
 
 
+def _negative_section_strip(s: str) -> str:
+    """Trim whitespace and trailing/leading dots so sections join cleanly with '. '."""
+    return (s or "").strip().strip(". ").strip()
+
+
+def _join_negative_sections(*parts: str) -> str:
+    """
+    Join non-empty negative sections with '. ' so combined output looks like:
+      lead. body one. body two.
+    never 'headphones.deformed' (missing space after the period).
+    """
+    cleaned: List[str] = []
+    seen_norm: set = set()
+    for p in parts:
+        t = _negative_section_strip(p)
+        if not t:
+            continue
+        # Whole-section dedupe (case-insensitive)
+        key = re.sub(r"\s+", " ", t.lower())
+        if key in seen_norm:
+            continue
+        seen_norm.add(key)
+        cleaned.append(t)
+    if not cleaned:
+        return ""
+    # Join with period-space; each piece should not already end with '.'
+    return ". ".join(cleaned) + "."
+
+
 def merge_negative_prompt(
     base: str = "",
     *,
+    general: str = "",
+    character: str = "",
+    multi_addition: str = "",
+    has_character: bool = False,
+    has_secondary: bool = False,
     cover: bool = False,
     ambient: bool = False,
+    image_style: str = "",
 ) -> str:
     """
-    Combine user/default negative with optional cover anti-text and ambient
-    (no-people) priors.
+    Assemble the negative prompt dynamically from the three UI sections:
 
-    ambient=True  → use AMBIENT_NEGATIVE_PROMPT (Cover non-character / Theme)
-    cover=True    → always append COVER_NEGATIVE_EXTRA anti-title terms
-    Otherwise     → DEFAULT_NEGATIVE_PROMPT (lyrics / character stills)
+      General Negative          (always — includes style-opposed lead + body)
+      + Character Negative      (when the still features people)
+      + Multi-Character Addition  (reference character + other people)
+      + Ambient / Cover extras  (theme & cover stills)
+
+    The General section is expected to already contain the Image-Style opposed
+    lead (kept in sync by the UI when Image Style changes). If General is
+    blank we rebuild it from ``image_style``.
+
+    Sections are joined with ". " so period-grouped phrases stay readable.
+    ``base`` is legacy single-box fallback.
     """
-    bits = []
-    b = (base or "").strip()
-    if ambient:
-        # Ambient path ignores a lyrics-oriented user negative when empty;
-        # if the user supplied one, still honour it as the lead chunk.
-        bits.append(b if b else AMBIENT_NEGATIVE_PROMPT)
-        if not b:
-            pass
-        else:
-            # User base may lack no-people terms — append ambient core
-            bits.append(AMBIENT_NEGATIVE_PROMPT)
+    gen = (general or "").strip()
+    char = (character or "").strip()
+    multi = (multi_addition or "").strip()
+    legacy = (base or "").strip()
+
+    # Fill defaults when UI sections are blank
+    if not gen and not char and not multi and legacy:
+        gen = legacy
+        char = ""
+        multi = ""
     else:
-        bits.append(b if b else DEFAULT_NEGATIVE_PROMPT)
-    if cover:
-        bits.append(COVER_NEGATIVE_EXTRA)
-    # De-dupe while preserving order
-    seen = set()
-    out: List[str] = []
-    for chunk in bits:
-        for part in re.split(r"[.,;]+", chunk):
-            t = part.strip().lower()
-            if not t or t in seen:
-                continue
-            seen.add(t)
-            out.append(part.strip())
-    return ", ".join(out)
+        if not gen:
+            gen = general_negative_for_style(image_style)
+        if not char:
+            char = DEFAULT_CHARACTER_NEGATIVE
+        if not multi:
+            multi = DEFAULT_MULTI_CHARACTER_NEGATIVE
+
+    # If General does not already start with the current style lead, ensure
+    # the style-opposed terms are present (e.g. stale session text).
+    style_key = normalize_image_style(image_style or IMAGE_STYLE_DEFAULT)
+    style_lead = IMAGE_STYLE_NEGATIVE_LEAD.get(
+        style_key, IMAGE_STYLE_NEGATIVE_LEAD[IMAGE_STYLE_DEFAULT]
+    )
+    gen_l = gen.lower()
+    if style_lead and not any(
+        gen_l.startswith(lead.lower())
+        for lead in IMAGE_STYLE_NEGATIVE_LEAD.values()
+    ):
+        gen = f"{style_lead.rstrip('. ')}. {gen}"
+
+    if ambient or cover:
+        # No-people stills (Cover / Theme): General + hard ambient prior
+        parts = [gen, AMBIENT_NEGATIVE_PROMPT]
+        if cover:
+            parts.append(COVER_NEGATIVE_EXTRA)
+        return _join_negative_sections(*parts)
+
+    # Lyrics stills:
+    #   has_character True  → full/partial presence → General + Character anatomy
+    #   has_character False → none (or non-anatomy) → General only
+    #   has_secondary True  → Multi (identity + devices) on top of either
+    parts = [gen]
+    if has_character:
+        parts.append(char)
+    if has_secondary:
+        parts.append(multi)
+    return _join_negative_sections(*parts)
 
 
 
@@ -1645,6 +1956,7 @@ GENERATION_KEYS = [
     "imagegen_height",
     "imagegen_size",
     "imagegen_frequency",
+    "image_style",
     "imagegen_steps",
     "imagegen_cfg_scale",
     "imagegen_seed",
@@ -1663,6 +1975,10 @@ GENERATION_KEYS = [
     "ref_age",
     "project_label",
     "last_image_gen_seconds",
+    "general_negative_prompt",
+    "character_negative_prompt",
+    "multi_character_negative",
+    "negative_prompt",  # legacy combined (session meta / older installs)
 ]
 
 
@@ -1672,6 +1988,7 @@ def _default_generation() -> Dict[str, Any]:
         "imagegen_height": DEFAULT_HEIGHT,
         "imagegen_size": DEFAULT_IMAGE_SIZE,
         "imagegen_frequency": DEFAULT_IMAGE_FREQUENCY,
+        "image_style": IMAGE_STYLE_DEFAULT,
         "imagegen_steps": DEFAULT_STEPS,
         "imagegen_cfg_scale": DEFAULT_CFG,
         "imagegen_seed": DEFAULT_SEED,
@@ -1690,11 +2007,96 @@ def _default_generation() -> Dict[str, Any]:
         "ref_age": AGE_DEFAULT,
         "project_label": "",
         "last_image_gen_seconds": 0.0,
+        "general_negative_prompt": DEFAULT_GENERAL_NEGATIVE,
+        "character_negative_prompt": DEFAULT_CHARACTER_NEGATIVE,
+        "multi_character_negative": DEFAULT_MULTI_CHARACTER_NEGATIVE,
+        "negative_prompt": DEFAULT_NEGATIVE_PROMPT,
     }
 
 
+def _norm_neg(s: str) -> str:
+    """Collapse whitespace for comparing negative-prompt defaults."""
+    return " ".join((s or "").split()).strip().lower().rstrip(".")
+
+
+# Known legacy defaults from earlier builds — migrate to current when matched.
+# Users who customized away from these keep their text.
+_LEGACY_GENERAL_NEGATIVES = {
+    _norm_neg(
+        "cartoon, anime, pixelated. text, writing, caption, watermark, signature, "
+        "graphical overlay. blurry, out of focus, low quality, noisy."
+    ),
+    _norm_neg(
+        "cartoon, anime, pixelated. text, writing, watermark, signature. "
+        "blurry, out of focus, low quality, noisy. electronic devices, mobile phones, headphones."
+    ),
+    _norm_neg(
+        "cartoon, anime, pixelated. text, writing, caption, watermark, signature, "
+        "graphical overlay. blurry, out of focus, low quality, noisy. "
+        "electronic devices, mobile phones, headphones."
+    ),
+}
+_LEGACY_CHARACTER_NEGATIVES = {
+    _norm_neg(
+        "deformed, bad anatomy, extra limbs, missing limbs, mutated limbs, "
+        "mutated hands, fused fingers, fewer than five fingers on each hand, "
+        "exaggerated proportions, contorted pose, head on backwards. "
+        "electronic devices, mobile phones, headphones."
+    ),
+    _norm_neg(
+        "deformed, bad anatomy, extra limbs, missing limbs, mutated limbs, "
+        "mutated hands, fused fingers, fewer than five fingers on each hand, "
+        "exaggerated proportions, contorted pose, head on backwards."
+    ),
+}
+_LEGACY_MULTI_NEGATIVES = {
+    _norm_neg(
+        "More than 1 character with same identity as shown in the reference image."
+    ),
+}
+
+
+def _migrate_negative_defaults(data: Dict[str, Any]) -> bool:
+    """
+    Replace stored negative prompts that still match a known *legacy default*
+    with the current DEFAULT_* strings. Returns True if anything changed.
+    Custom user text is left untouched.
+    """
+    changed = False
+    style = data.get("image_style") or IMAGE_STYLE_DEFAULT
+    want_general = general_negative_for_style(str(style))
+    want_char = DEFAULT_CHARACTER_NEGATIVE
+    want_multi = DEFAULT_MULTI_CHARACTER_NEGATIVE
+
+    gen = (data.get("general_negative_prompt") or "").strip()
+    if not gen or _norm_neg(gen) in _LEGACY_GENERAL_NEGATIVES:
+        data["general_negative_prompt"] = want_general
+        changed = True
+    elif _norm_neg(gen) != _norm_neg(want_general):
+        # Not legacy and not current — keep custom
+        pass
+
+    char = (data.get("character_negative_prompt") or "").strip()
+    if not char or _norm_neg(char) in _LEGACY_CHARACTER_NEGATIVES:
+        data["character_negative_prompt"] = want_char
+        changed = True
+
+    multi = (data.get("multi_character_negative") or "").strip()
+    if not multi or _norm_neg(multi) in _LEGACY_MULTI_NEGATIVES:
+        data["multi_character_negative"] = want_multi
+        changed = True
+
+    return changed
+
+
 def load_generation() -> Dict[str, Any]:
-    return _load_json_with_defaults(get_generation_path(), _default_generation())
+    data = _load_json_with_defaults(get_generation_path(), _default_generation())
+    if _migrate_negative_defaults(data):
+        try:
+            save_generation(data)
+        except OSError:
+            pass
+    return data
 
 
 def save_generation(data: Dict[str, Any]) -> None:

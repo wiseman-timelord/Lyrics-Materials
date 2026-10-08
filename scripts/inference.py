@@ -1174,8 +1174,8 @@ def _load_analysis_from_disk(project_dir: Path) -> Optional[Dict[str, Any]]:
                 if ":" in raw and not raw.strip().lower().startswith("section"):
                     k, v = raw.split(":", 1)
                     k, v = k.strip(), v.strip().lower()
-                    if k and v in ("none", "silhouette", "partial", "full"):
-                        character_presence[k] = v
+                    if k and v in ("none", "silhouette", "partial", "full", "outline"):
+                        character_presence[k] = normalize_presence(v)
         except OSError:
             pass
 
@@ -1293,6 +1293,21 @@ def _snapshot_session(
         "steps": int(cfg.get("imagegen_steps") or configure.DEFAULT_STEPS),
         "cfg_scale": float(cfg.get("imagegen_cfg_scale") or configure.DEFAULT_CFG),
         "reference_image": reference_image or "",
+        "general_negative_prompt": (
+            cfg.get("general_negative_prompt")
+            or getattr(configure, "DEFAULT_GENERAL_NEGATIVE", "")
+            or ""
+        ),
+        "character_negative_prompt": (
+            cfg.get("character_negative_prompt")
+            or getattr(configure, "DEFAULT_CHARACTER_NEGATIVE", "")
+            or ""
+        ),
+        "multi_character_negative": (
+            cfg.get("multi_character_negative")
+            or getattr(configure, "DEFAULT_MULTI_CHARACTER_NEGATIVE", "")
+            or ""
+        ),
         "negative_prompt": (cfg.get("negative_prompt") if cfg.get("negative_prompt") is not None
                             else configure.DEFAULT_NEGATIVE_PROMPT) or "",
         "line_count": int(line_count or 0),
@@ -1301,11 +1316,21 @@ def _snapshot_session(
     if phase:
         updates["phase"] = phase
     configure.save_session_meta(project_dir, updates)
-    # Side file for easy inspection / external tools
+    # Side file for easy inspection / external tools (combined sections)
     try:
-        neg = updates.get("negative_prompt") or ""
-        payload = (neg + "\n") if neg else ""
-        (project_dir / "negative_prompt.txt").write_text(payload, encoding="utf-8")
+        lines_out = [
+            "=== General Negative Prompt ===",
+            updates.get("general_negative_prompt") or "",
+            "",
+            "=== Character Negative Prompt ===",
+            updates.get("character_negative_prompt") or "",
+            "",
+            "=== Multi-Character Negative Addition ===",
+            updates.get("multi_character_negative") or "",
+        ]
+        (project_dir / "negative_prompt.txt").write_text(
+            "\n".join(lines_out) + "\n", encoding="utf-8"
+        )
     except OSError:
         pass
 
@@ -1408,7 +1433,7 @@ def analyze_song_and_sections(
       sections: {label: notes}
       character_guidance: str
       other_figures: str
-      character_presence: {section_label: "none"|"silhouette"|"partial"|"full"}
+      character_presence: {section_label: "none"|"partial"|"full"}
         — used programmatically to include/exclude the reference image per line
     """
     if progress_callback:
@@ -1449,8 +1474,8 @@ def analyze_song_and_sections(
             "what they should wear if clothing is relevant to the lyric or scene. "
             "Secondary people are NOT the reference character and must never share that face.\n"
             "If the lyrics never imply other people, write OTHER_FIGURES: none.\n"
-            "CHARACTER_MAP: one line per section as  SectionName: none|silhouette|partial|full\n"
-            "  none=no main character, silhouette=outline only, partial=partly visible, full=clearly present.\n"
+            "CHARACTER_MAP: one line per section as  SectionName: none|partial|full\n"
+            "  none=absent (no people), partial=partly visible, full=clearly present. Never use silhouette.\n"
             "  Vary main-character presence across the song when the lyrics support it.\n"
         )
     else:
@@ -1460,7 +1485,7 @@ def analyze_song_and_sections(
             "Do NOT mention clothing, outfit, wardrobe, gear, or hair style for the central figure.\n"
             "OTHER_FIGURES: 1-3 sentences on any secondary people the lyrics imply, including "
             "appropriate distinct outfits when clothing matters; or 'none'.\n"
-            "CHARACTER_MAP: one line per section as  SectionName: none|silhouette|partial|full\n"
+            "CHARACTER_MAP: one line per section as  SectionName: none|partial|full\n"
         )
 
     # Rigid, example-led prompt — no trailing "Notes:" (models often free-associate after it)
@@ -1490,7 +1515,7 @@ def analyze_song_and_sections(
         "OTHER_FIGURES:\n"
         "Occasional anonymous street crowd in ordinary coats; no named secondary lead.\n\n"
         "CHARACTER_MAP:\n"
-        f"{ex0}: silhouette\n"
+        f"{ex0}: partial\n"
         f"{ex1}: full\n\n"
         "SECTIONS:\n"
         f"{ex0}: Wide establishing shots of an anonymous crowd. The camera glides; the figure is barely present.\n"
@@ -1638,7 +1663,7 @@ def analyze_song_and_sections(
         if lab not in presence:
             low = lab.lower()
             if any(k in low for k in ("intro", "outro", "fade")):
-                presence[lab] = "silhouette" if has_character_ref else "none"
+                presence[lab] = "partial" if has_character_ref else "none"
             else:
                 presence[lab] = "full" if has_character_ref else "partial"
 
@@ -1672,7 +1697,7 @@ def generate_visual_prompts(
     """
     One visual-description prompt per lyric line.
     Returns (prompts, presence_per_line) where presence_per_line[i] is
-    none|silhouette|partial|full for programmatic ref-image include/exclude.
+    none|partial|full for programmatic ref-image include/exclude.
     """
     model_path, role = _resolve_prompt_model(cfg)
     if not model_path:
@@ -1705,9 +1730,10 @@ def generate_visual_prompts(
             break
         line_no = i + 1
         sec = line_section.get(i, "Body")
-        pres = (presence_map.get(sec) or ("full" if has_character_ref else "none")).lower()
-        if pres not in ("none", "silhouette", "partial", "full"):
-            pres = "full" if has_character_ref else "none"
+        pres = normalize_presence(
+            presence_map.get(sec) or ("full" if has_character_ref else "none"),
+            has_ref=has_character_ref,
+        )
         presence_per_line.append(pres)
 
         print(f"[prompts] ────────────────────────────────────────", flush=True)
@@ -1722,85 +1748,120 @@ def generate_visual_prompts(
                 {"phase": "prompts", "line": line_no, "total": total},
             )
         sec_note = section_notes.get(sec, "")
-        style_part = template.replace("{line}", line) if "{line}" in template else f"{template}\n{line}"
 
-        if has_character_ref and pres != "none":
-            how = {
-                "silhouette": "show the reference character only as a silhouette or shadow outline",
-                "partial": "show the reference character partially (cropped, turned, or distant)",
-                "full": "show the reference character clearly, matching the reference likeness",
-            }.get(pres, "show the reference character")
-            if other_figures:
-                sec_people = (
-                    f"Secondary people guidance: {other_figures[:280]} "
-                    "Give any secondary figures their own distinct outfits and appearance "
-                    "appropriate to the lyric — never dress them in the main character's "
-                    "locked wardrobe and never copy the reference face. "
-                )
-            else:
-                sec_people = (
-                    "If this lyric needs other people besides the main character, invent "
-                    "distinct secondary figures with their own appropriate outfits; they "
-                    "must not share the reference face or the main character's wardrobe. "
-                )
-            char_clause = (
-                f"MAIN CHARACTER: {how}. "
-                "Exactly ONE instance of the reference/main character in the frame — "
-                "never duplicate, clone, or mirror the same face. "
-                "Do NOT invent clothing for the main character (wardrobe is applied later). "
-                f"Main character notes: {char_guide or 'match the reference subject.'} "
-                f"{sec_people}"
+        # Presence-driven brief for the thinking model only.
+        # Assessment gates whether BACKGROUND is ever used in the final sd prompt.
+        other_ok = bool(
+            (other_figures or "").strip()
+            and (other_figures or "").strip().lower() not in ("none", "n/a", "na", "-", "none.")
+        )
+
+        if pres == "none":
+            people_rule = (
+                "This still has no people. Describe only the place, objects, light, and mood."
             )
-        elif has_character_ref and pres == "none":
-            if other_figures:
-                sec_people = (
-                    f"Other people (not the reference): {other_figures[:280]} "
-                    "Dress them appropriately for the scene with their own outfits. "
-                )
-            else:
-                sec_people = ""
-            char_clause = (
-                "MAIN CHARACTER: Do NOT depict the reference person. "
-                "No recognisable central character from the reference photo — "
-                "environment, abstract, or non-reference figures only. "
-                f"{sec_people}"
+        elif other_ok:
+            people_rule = (
+                "Main character is in this still (pose only in Main Character). "
+                "Secondary people are allowed; fill Background Characters briefly. "
+                f"Assessment hint: {other_figures[:120]}"
             )
         else:
-            if other_figures:
-                sec_people = (
-                    f"Other people guidance: {other_figures[:280]} "
-                    "Give secondary figures distinct outfits when clothing matters. "
-                )
-            else:
-                sec_people = ""
-            char_clause = (
-                "No reference photo is provided — invent figures purely from the lyrics "
-                "and notes when needed. "
-                f"{sec_people}"
+            people_rule = (
+                "Main character is in this still (pose only in Main Character). "
+                "No secondary people — leave Background Characters as NONE."
             )
 
+        # Form with NO negative phrases inside labels (models echo them into positives)
         instruction = (
-            f"{style_part}\n\n"
-            f"Song context: {overall[:350]}\n"
-            f"Section ({sec}): {sec_note[:250]}\n"
-            f"{char_clause}"
-            "Reply with ONLY the visual description for this single still, "
-            "one paragraph, no preamble, no quotes, no section labels. "
-            "Main-character wardrobe is configured in the UI — omit main-character "
-            "clothing details. Secondary people may wear concrete, lyric-appropriate outfits."
+            "Fill this form for one music-video still. Use short concrete phrases.\n"
+            f"Lyric: {line}\n"
+            f"Mood: {(overall or '')[:120]}\n"
+            f"Section: {(sec_note or '')[:80]}\n"
+            f"{people_rule}\n\n"
+            "Scene Description:\n"
+            "(place, action, lighting, mood)\n\n"
+            "Main Character:\n"
+            "(pose and action only, or NONE)\n\n"
+            "Background Characters:\n"
+            "(if secondary people: one short line like "
+            "'Background characters are a group of humans wearing street-wear, walking past'. "
+            "Otherwise NONE)\n"
         )
         try:
-            text = _run_llama_completion(
+            text_out = _run_llama_completion(
                 instruction, cfg, role=role, model_path=model_path,
-                n_predict=_PROMPT_PREDICT, ctx_size=_PROMPT_CTX,
-                temperature=0.8, timeout=_TIMEOUT_PROMPT,
+                n_predict=min(_PROMPT_PREDICT, 160), ctx_size=_PROMPT_CTX,
+                temperature=0.65, timeout=_TIMEOUT_PROMPT,
             )
-            preview = (text or "").strip().replace("\n", " ")[:120]
-            print(f"[prompts] Lyrics Line {line_no} OK — prompt preview: {preview}…", flush=True)
+            preview = (text_out or "").strip().replace("\n", " ")[:140]
+            print(f"[prompts] Lyrics Line {line_no} OK — preview: {preview}…", flush=True)
         except Exception as e:
-            print(f"[prompts] Lyrics Line {line_no} FAILED — fallback to raw lyric: {e}", flush=True)
-            text = ""
-        prompts.append(text.strip() or line)
+            print(f"[prompts] Lyrics Line {line_no} FAILED — empty scene: {e}", flush=True)
+            text_out = ""
+
+        parsed_sc = _parse_structured_scene(text_out or "")
+        scene_body = _scrub_field_text((parsed_sc.get("scene") or "").strip())
+        pose_body = _scrub_field_text((parsed_sc.get("pose") or "").strip())
+        bg_body = _scrub_field_text((parsed_sc.get("background") or "").strip())
+
+        if scene_body and scene_body.lower().rstrip(" .,;:!?…") == line.strip().lower().rstrip(" .,;:!?…"):
+            scene_body = ""
+        for field_name, field_val in (("scene", scene_body), ("pose", pose_body), ("background", bg_body)):
+            low = (field_val or "").lower()
+            if any(m in low for m in _PROMPT_LEAK_MARKERS):
+                print(f"[prompts] stripping leaked instruction from {field_name}", flush=True)
+                if field_name == "scene":
+                    scene_body = ""
+                elif field_name == "pose":
+                    pose_body = ""
+                else:
+                    bg_body = ""
+
+        # Assessment gate: only keep BACKGROUND when OTHER_FIGURES is real
+        if pres == "none":
+            pose_body = ""
+            bg_body = ""
+            if scene_body:
+                scene_body = re.sub(
+                    r"(?i)\b(crowd|anonymous figures?|secondary people|other people|"
+                    r"passers[- ]by|onlookers|group of (people|figures)|"
+                    r"background characters?)\b[^.,;]*[.,;]?",
+                    " ",
+                    scene_body,
+                )
+                scene_body = re.sub(r"\s+", " ", scene_body).strip(" ,;:-")
+        else:
+            if not other_ok:
+                bg_body = ""
+            if not pose_body:
+                pose_body = _default_pose_for_presence(pres)
+            # Normalize BACKGROUND to a single clean sentence when present
+            if bg_body:
+                bg_body = _normalize_background_clause(bg_body)
+
+        def _cap(s: str, n: int = 320) -> str:
+            s = (s or "").strip()
+            if len(s) <= n:
+                return s
+            cut = s[:n]
+            for sep in (". ", "; ", ", "):
+                pos = cut.rfind(sep)
+                if pos > n // 2:
+                    return cut[: pos + 1].strip()
+            return cut.rsplit(" ", 1)[0].strip()
+
+        scene_body = _cap(scene_body, 360)
+        pose_body = _cap(pose_body, 120)
+        bg_body = _cap(bg_body, 180)
+
+        print(
+            f"[prompts] line {line_no} stored — presence={pres} "
+            f"other_ok={other_ok} people_bg={'yes' if bg_body else 'no'} "
+            f"pose={'yes' if pose_body else 'no'}",
+            flush=True,
+        )
+        prompts.append(_format_structured_scene(scene_body, pose_body, bg_body))
 
     print(f"[prompts] === finished {len(prompts)}/{total} prompts ===", flush=True)
     # Pad presence if cancelled mid-loop
@@ -2178,59 +2239,294 @@ def _write_sd_failure_log(out_dir: Path, line_no: int, attempt: str, cmd: List[s
         return None
 
 
+# Instruction-echo markers (model often pastes the system brief into the scene)
 _PROMPT_LEAK_MARKERS = (
     "reply with only the visual description",
     "character: do not show the reference",
     "character: show the reference character",
+    "character: show the main character",
+    "show the main character only as a silhouette",
+    "likeness and wardrobe for the main character",
+    "applied later from the reference image",
+    "describe pose, action, and framing only",
+    "not main-character clothing",
     "no preamble, no quotes",
     "no section labels",
     "--- prompt ---",
     "character notes:",
+    "omit main-character clothing",
+    "ui-locked",
+    "write only the visual scene",
+    "in 512 characters, write",
+    "song context:",
+    "output exactly these",
+    "output exactly three labeled",
+    "scene description:",
+    "main character:",
+    "background characters:",
+    "do not quote the lyric",
+    "do not describe the main character",
+    "do not copy these instructions",
+    "one short paragraph",
+    "include secondary people as suggested",
+    "never copy the main character",
+    "each with their own distinct outfit and action",
+    "pose/framing only",
+    "or none>",
+    "<who / what they wear",
+    "<one short paragraph",
+    "you write visual notes",
+    "lyric line (most important",
+    "no lyric quote",
+    "no face, no main clothing",
+    "no face",
+    "no main clothing",
+    "setting, action, lighting, mood",
+    "other people and outfits",
+    "pose/framing words only",
+    "or none",
+    "reply with exactly three lines",
 )
+
+
+
+def _format_structured_scene(
+    scene: str = "",
+    pose: str = "",
+    background: str = "",
+) -> str:
+    """Canonical on-disk / in-memory form for a lyric still prompt body."""
+    sc = (scene or "").strip() or "NONE"
+    po = (pose or "").strip() or "NONE"
+    bg = (background or "").strip() or "NONE"
+    return (
+        f"SCENE: {sc}\n"
+        f"POSE: {po}\n"
+        f"BACKGROUND: {bg}"
+    )
+
+
+def _scrub_field_text(val: str) -> str:
+    """
+    Remove instruction templates, form-label echoes, chat crumbs, and
+    negative-style "no X" phrases that must never appear in a positive prompt.
+    Keeps real scene / pose / background prose.
+    """
+    s = (val or "").strip()
+    if not s:
+        return ""
+    # Chat role crumbs
+    s = re.sub(r"(?im)^\s*(assistant|user|system)\s*:?\s*", " ", s)
+    s = re.sub(r"(?im)\bassistant\b\s*", " ", s)
+    # Angle-bracket placeholders
+    s = re.sub(r"<[^>]{0,160}>", " ", s)
+    s = re.sub(r"<\s*>", " ", s)
+    # Form-label echoes the model pastes from the brief
+    label_echoes = [
+        # Form-label echoes only (do not eat the real scene that follows)
+        r"(?i)\bsetting,?\s*action,?\s*lighting,?\s*mood\s*\([^)]{0,80}\)\s*",
+        r"(?i)\bsetting,?\s*action,?\s*lighting,?\s*mood\s*",
+        r"(?i)\bother people and outfits,?\s*or\s*NONE\s*",
+        r"(?i)\bother people and outfits\s*",
+        r"(?i)\bpose/?framing words only,?\s*or\s*NONE\s*",
+        r"(?i)\bpose/?framing words only\s*",
+        r"(?i)\bno lyric quote\b[,.]?\s*",
+        r"(?i)\bno face,?\s*no main clothing\b[,.]?\s*",
+        r"(?i)\bno face visible\b[,.]?\s*",
+        r"(?i)\bno face\b[,.]?\s*",
+        r"(?i)\bno main clothing\b[,.]?\s*",
+        r"(?i)\bno clothing\b[,.]?\s*",
+        r"(?i)\bno readable text\b[,.]?\s*",
+        r"(?i)\bdo not (quote|describe|copy|invent)\b[^.]{0,40}\.?",
+        r"(?i)\breply with exactly three lines\b[^.]{0,40}\.?",
+        r"(?i)include secondary people as suggested by the assessment\s*\([^)]{0,500}\)\s*,?",
+        r"(?i)include secondary people as suggested by the assessment[^.]{0,200}\.?",
+        r"(?i)output exactly three labeled lines[^.\n]{0,120}\.?",
+        r"(?i)never copy the main character'?s face or wardrobe\.?",
+        r"(?i)each with their own distinct outfit and action\.?",
+        r"(?i)you write visual notes for one music-video still\.?",
+        r"(?i)lyric line \(most important[^)]*\)[:.]?",
+        r"(?i)song context \(reference only[^)]*\)[:.]?",
+        r"(?i)character presence for this section[:.]?\s*\w+",
+        r"(?i)\bwho / what they wear / what they do,?\s*or\s*NONE\b",
+        r"(?i)\bone short paragraph:[^.]{0,60}\.",
+        r"(?i)\bsilhouette\b",
+        r"(?i)\bshadow outline\b",
+    ]
+    for pat in label_echoes:
+        s = re.sub(pat, " ", s)
+    # Leading "or NONE" / bare NONE after scrub
+    s = re.sub(r"(?i)^\s*or\s*NONE\b\s*", "", s)
+    s = re.sub(r"\s+", " ", s).strip(" ,;:-")
+    low = s.lower()
+    if not s or low in ("none", "n/a", "na", "-", "or none"):
+        return ""
+    if low.startswith("one short paragraph") or low.startswith("who / what they wear"):
+        return ""
+    hit = sum(1 for m in _PROMPT_LEAK_MARKERS if m in low)
+    if hit >= 2 and len(s) < 80:
+        return ""
+    return s.strip()
+
+
+
+def _parse_structured_scene(raw: str) -> Dict[str, str]:
+    """
+    Parse SCENE / POSE / BACKGROUND from thinking-model output or prompts.txt.
+
+    Handles:
+      - Clean labeled blocks
+      - "Scene Description:" / "Main Character:" / "Background Characters:" aliases
+      - Inline labels on one line
+      - Chat crumbs (assistant / user)
+    Falls back to scrubbed plain text as SCENE only when no labels exist.
+    """
+    text = (raw or "").strip()
+    out = {"scene": "", "pose": "", "background": ""}
+    if not text:
+        return out
+
+    # Strip leading chat role lines
+    text = re.sub(r"(?im)^\s*(assistant|user|system)\s*\n?", "", text).strip()
+
+    norm = text
+    norm = re.sub(r"(?im)^\s*Scene Description\s*:", "SCENE:", norm)
+    norm = re.sub(r"(?im)^\s*Main Character\s*:", "POSE:", norm)
+    norm = re.sub(r"(?im)^\s*Background Characters\s*:", "BACKGROUND:", norm)
+    # Inline forms mid-string
+    norm = re.sub(r"(?i)\bScene Description\s*:", "\nSCENE:", norm)
+    norm = re.sub(r"(?i)\bMain Character\s*:", "\nPOSE:", norm)
+    norm = re.sub(r"(?i)\bBackground Characters\s*:", "\nBACKGROUND:", norm)
+
+    if re.search(r"(?im)^\s*SCENE\s*:", norm) or re.search(r"(?im)^\s*POSE\s*:", norm):
+        current = None
+        buf: Dict[str, List[str]] = {"scene": [], "pose": [], "background": []}
+        for line in norm.splitlines():
+            m = re.match(r"(?i)^\s*(SCENE|POSE|BACKGROUND)\s*:\s*(.*)$", line)
+            if m:
+                current = m.group(1).lower()
+                rest = (m.group(2) or "").strip()
+                if rest:
+                    buf[current].append(rest)
+                continue
+            if current:
+                t = line.strip()
+                if t.lower() in ("assistant", "user", "system"):
+                    continue
+                if t:
+                    buf[current].append(t)
+        for k in out:
+            val = " ".join(x for x in buf[k] if x).strip()
+            val = _scrub_field_text(val)
+            if val.upper() in ("NONE", "N/A", "NA", "-"):
+                val = ""
+            out[k] = val
+        return out
+
+    # No labels — scrub whole blob; only keep if it still looks like a scene
+    scrubbed = _scrub_field_text(text)
+    if scrubbed and not any(m in scrubbed.lower() for m in _PROMPT_LEAK_MARKERS):
+        out["scene"] = scrubbed
+    return out
+
+
+def normalize_presence(value: str, *, has_ref: bool = False) -> str:
+    """
+    Canonical presence for lyric stills: none | partial | full.
+
+    "silhouette" is retired — Flux.2-klein does not render reliable silhouettes
+    when other figures or identity locks are in the prompt. Legacy map values
+    are folded to partial (character still present, reference still attached).
+    """
+    p = (value or "").strip().lower()
+    if p in ("silhouette", "outline", "shadow", "sil"):
+        p = "partial"
+    if p not in ("none", "partial", "full"):
+        p = "full" if has_ref else "none"
+    return p
+
+
+def _normalize_background_clause(raw: str) -> str:
+    """
+    Turn a free-form BACKGROUND field into one short positive sentence.
+    Example: "Background characters are a group of humans wearing street-wear, walking past."
+    """
+    s = _scrub_field_text(raw or "")
+    if not s:
+        return ""
+    low = s.lower().strip()
+    if low in ("none", "n/a", "na", "-"):
+        return ""
+    if low.startswith("background characters"):
+        return s[0].upper() + s[1:] if s else ""
+    s = re.sub(r"(?i)^\s*(are|is|with)\s+", "", s).strip()
+    if not s:
+        return ""
+    body = s[0].lower() + s[1:] if len(s) > 1 else s.lower()
+    return f"Background characters are {body}".rstrip(".") + "."
+
+
+def _default_pose_for_presence(pres: str) -> str:
+    """Fallback pose words when the model omits Main Character / POSE."""
+    p = normalize_presence(pres)
+    if p == "partial":
+        return "partially visible, cropped or turned away"
+    if p == "full":
+        return "clearly visible in frame"
+    return ""
 
 
 def _sanitize_visual_prompt(prompt: str, lyric: str, style_hint: str = "") -> str:
     """
-    Drop llama instruction-echo leaks (the model sometimes dumps remaining
-    section templates instead of a still description). Truncate huge prompts.
+    Return a pure scene paragraph for the still, or "" if unusable.
+
+    Header, lyric line, and identity lock are assembled separately by
+    compose_lyric_still_prompt — this function must NOT inject those.
     """
     p = (prompt or "").strip()
+    if not p:
+        return ""
     low = p.lower()
+    lyric_low = (lyric or "").strip().lower().rstrip(" .,;:!?…")
+
+    # Exact lyric used as a stand-in is not a scene description
+    if lyric_low and low.rstrip(" .,;:!?…") == lyric_low:
+        return ""
+
     leaked = (
-        not p
-        or any(m in low for m in _PROMPT_LEAK_MARKERS)
+        any(m in low for m in _PROMPT_LEAK_MARKERS)
         or low.lstrip().startswith("section (")
+        or low.lstrip().startswith("main character:")
+        or low.lstrip().startswith("in 512 characters")
     )
     if leaked:
-        print("[images] prompt looks like instruction leak — using lyric fallback", flush=True)
-        bits = []
-        if style_hint:
-            bits.append(style_hint.strip().split("\n")[0][:240])
-        bits.append(f"Music-video still of: {lyric.strip()}")
-        bits.append("Cinematic composition, coherent lighting, no on-image text.")
-        p = " ".join(bits)
-    # Soft cap — prefer ending on a sentence boundary so Flux is not fed a stump
-    if len(p) > 1400:
-        cut = p[:1400]
+        print("[images] prompt looks like instruction leak — scene omitted", flush=True)
+        return ""
+
+    # Soft cap ~512 chars at a sentence boundary
+    if len(p) > 512:
+        cut = p[:512]
         for sep in (". ", "! ", "? ", "; "):
             pos = cut.rfind(sep)
-            if pos > 600:
+            if pos > 200:
                 cut = cut[: pos + 1]
                 break
         else:
             cut = cut.rsplit(" ", 1)[0]
         p = cut
-    return p
+    return p.strip()
 
 
-def _appearance_bit(cfg: Dict[str, Any]) -> str:
-    """Identity + hair/outfit/age clause from cfg (character-bearing stills only)."""
+def _appearance_bit(cfg: Dict[str, Any], pose: str = "", presence: str = "") -> str:
+    """Identity + hair/outfit/age/pose clause from cfg (character-bearing stills only)."""
     return configure.character_identity_clause(
         hair=cfg.get("hair_style") or "",
         outfit=cfg.get("outfit_worn") or "",
         gender=cfg.get("ref_gender") or "",
         bodyshape=cfg.get("ref_bodyshape") or "",
         age=cfg.get("ref_age"),
+        pose=pose or "",
+        placement="middle",
     )
 
 
@@ -2242,6 +2538,86 @@ def _sd_attempt_succeeded(out: str, rc: int, found: Optional[Path]) -> bool:
     if rc == 0 and ("images saved" in low or "[[saved_ok]]" in low or "save result image" in low):
         return True
     return False
+
+
+
+def _resolve_negative_sections(cfg: Dict[str, Any]) -> Tuple[str, str, str, str]:
+    """
+    Return (general, character, multi, legacy_base) from cfg / generation defaults.
+    Prefer the three UI sections; fall back to legacy negative_prompt.
+    General is rebuilt from Image Style when blank so the style-opposed lead stays correct.
+    """
+    gen = (cfg.get("general_negative_prompt") or "").strip()
+    char = (cfg.get("character_negative_prompt") or "").strip()
+    multi = (cfg.get("multi_character_negative") or "").strip()
+    legacy = (cfg.get("negative_prompt") or "").strip()
+    if not gen:
+        style = str(cfg.get("image_style") or "")
+        if hasattr(configure, "general_negative_for_style"):
+            gen = configure.general_negative_for_style(style)
+        else:
+            gen = getattr(configure, "DEFAULT_GENERAL_NEGATIVE", "") or ""
+    if not char:
+        char = getattr(configure, "DEFAULT_CHARACTER_NEGATIVE", "") or ""
+    if not multi:
+        multi = getattr(configure, "DEFAULT_MULTI_CHARACTER_NEGATIVE", "") or ""
+    return gen, char, multi, legacy
+
+
+def _analysis_has_secondary(cfg: Optional[Dict[str, Any]] = None,
+                            project_dir: Optional[Path] = None) -> bool:
+    """True when assessment OTHER_FIGURES names secondary people."""
+    if cfg:
+        of = (cfg.get("other_figures") or "").strip()
+        if of and of.lower() not in ("none", "n/a", "na", "-", "none."):
+            return True
+    folder = project_dir
+    if folder is None:
+        try:
+            pf = configure.APP_STATE.get("current_project_folder") or ""
+            if pf:
+                folder = Path(pf)
+        except Exception:
+            folder = None
+    if folder and Path(folder).is_dir():
+        try:
+            raw = (Path(folder) / "analysis.txt").read_text(
+                encoding="utf-8", errors="replace"
+            )
+            m = re.search(
+                r"(?im)^OTHER[_\s-]*FIGURES?\s*[:\-]\s*(.+?)(?=\n\s*[A-Z][A-Z_ ]{2,}:|\Z)",
+                raw,
+                re.S,
+            )
+            if m:
+                body = (m.group(1) or "").strip()
+                if body and body.lower() not in ("none", "n/a", "na", "-", "none."):
+                    return True
+        except OSError:
+            pass
+    return False
+
+
+def _build_merged_negative(
+    cfg: Dict[str, Any],
+    *,
+    has_character: bool = False,
+    has_secondary: bool = False,
+    cover: bool = False,
+    ambient: bool = False,
+) -> str:
+    gen, char, multi, legacy = _resolve_negative_sections(cfg)
+    return configure.merge_negative_prompt(
+        legacy,
+        general=gen,
+        character=char,
+        multi_addition=multi,
+        has_character=has_character,
+        has_secondary=has_secondary,
+        cover=cover or bool(cfg.get("cover_mode")),
+        ambient=ambient or bool(cfg.get("ambient_mode")),
+        image_style=str(cfg.get("image_style") or ""),
+    )
 
 
 def generate_images_from_prompts(
@@ -2339,11 +2715,16 @@ def generate_images_from_prompts(
 
     style_hint = str(cfg.get("prompt_template") or cfg.get("style") or "")
 
+    # Secondary people from assessment (OTHER_FIGURES) — multi-character negative
+    _has_secondary_global = _analysis_has_secondary(cfg, out_dir)
+
     def _build_sd_cmd(
         prompt_text: str,
         dest: Path,
         attach_ref: bool,
         ref_override: str = "",
+        has_character: bool = False,
+        has_secondary: bool = False,
     ) -> List[str]:
         c = [
             str(exe),
@@ -2375,10 +2756,10 @@ def generate_images_from_prompts(
             r_use = str(ref_path)
         if r_use and Path(r_use).is_file():
             c.extend(["-r", str(r_use)])
-        neg = configure.merge_negative_prompt(
-            (cfg.get("negative_prompt") or "").strip(),
-            cover=bool(cfg.get("cover_mode")),
-            ambient=bool(cfg.get("ambient_mode")),
+        neg = _build_merged_negative(
+            cfg,
+            has_character=has_character,
+            has_secondary=has_secondary,
         )
         if neg:
             c.extend(["-n", neg])
@@ -2401,8 +2782,50 @@ def generate_images_from_prompts(
         pres = "none"
         if presence_per_line and i < len(presence_per_line):
             pres = (presence_per_line[i] or "none").lower()
+        pres = normalize_presence(pres, has_ref=has_ref)
         use_char_ref = bool(has_ref and pres != "none")
-        clean_prompt = _sanitize_visual_prompt(prompt, line_text, style_hint)
+        line_has_ref = pres != "none"
+        line_apply_anatomy_neg = pres in ("full", "partial")
+        # Structured SCENE / POSE / BACKGROUND from Phase 1 (or legacy plain text)
+        parsed_sc = _parse_structured_scene(prompt or "")
+        scene_part = _sanitize_visual_prompt(
+            _scrub_field_text(parsed_sc.get("scene") or ""), line_text, style_hint
+        )
+        pose_part = _scrub_field_text(parsed_sc.get("pose") or "")
+        bg_part = _scrub_field_text(parsed_sc.get("background") or "")
+        # Enforce people policy at compose time (guards stale prompts.txt)
+        if pres == "none":
+            pose_part = ""
+            bg_part = ""
+            if scene_part:
+                scene_part = re.sub(
+                    r"(?i)\b(crowd|anonymous figures?|secondary people|other people|"
+                    r"passers[- ]by|onlookers|silhouette|shadow outline)\b[^.,;]*[.,;]?",
+                    " ",
+                    scene_part,
+                )
+                scene_part = re.sub(r"\s+", " ", scene_part).strip(" ,;:-")
+        else:
+            if line_has_ref and not pose_part:
+                pose_part = _default_pose_for_presence(pres)
+            pose_part = re.sub(
+                r"(?i)\b(silhouette|shadow outline|no face visible)\b[^.,;]*",
+                " ",
+                pose_part or "",
+            )
+            pose_part = re.sub(r"\s+", " ", pose_part).strip(" ,;:-")
+            scene_part = re.sub(
+                r"(?i)\b(silhouette|shadow outline)\b", "figure", scene_part or ""
+            )
+        # Assessment gate: ignore model BACKGROUND unless song has OTHER_FIGURES
+        if not _has_secondary_global:
+            bg_part = ""
+        elif bg_part:
+            bg_part = _normalize_background_clause(bg_part)
+        # Multi negative only when BACKGROUND is actually included in the positive
+        line_has_secondary = bool(
+            bg_part and bg_part.upper() not in ("NONE", "N/A", "NA", "-")
+        )
         prev_still: Optional[Path] = None  # progressive chain within this line
 
         for var in range(1, freq + 1):
@@ -2454,17 +2877,25 @@ def generate_images_from_prompts(
             progressive = bool(freq > 1 and var > 1 and prev_still and prev_still.is_file())
             ref_override = ""
             attach_ref = False
+            identity = ""
             if progressive:
                 ref_override = str(prev_still)
                 attach_ref = True
-                appear = _appearance_bit(cfg) if use_char_ref else ""
-                appear_bit = f" {appear}" if appear else ""
-                final_prompt = (
-                    f"{clean_prompt}{seq_bit}{appear_bit} "
-                    f"This is beat {var} of {freq} in a continuous moment. "
-                    "Evolve naturally from the provided reference still "
-                    "(same scene, characters, hair, outfit, and lighting language) — "
-                    "show the next beat of the action, not a new unrelated shot."
+                if use_char_ref:
+                    identity = _appearance_bit(cfg, pose=pose_part, presence=pres)
+                beat = (
+                    f"Beat {var} of {freq} in a continuous moment: "
+                    "same scene, characters, hair, outfit, and lighting language, "
+                    "evolving to the next beat of the action."
+                )
+                final_prompt = configure.compose_lyric_still_prompt(
+                    image_style=str(cfg.get("image_style") or ""),
+                    visual_style=str(cfg.get("style") or ""),
+                    lyric=line_text,
+                    scene=scene_part,
+                    background=bg_part,
+                    identity=identity,
+                    sequence_bit=f"{seq_bit} {beat}".strip() if seq_bit else beat,
                 )
                 print(
                     f"[images] progressive ref ← {prev_still.name} (var {var}/{freq})",
@@ -2472,27 +2903,44 @@ def generate_images_from_prompts(
                 )
             elif use_char_ref:
                 attach_ref = True
-                appear = _appearance_bit(cfg)
-                appear_bit = f" {appear}" if appear else ""
-                final_prompt = (
-                    f"{clean_prompt}{seq_bit}{appear_bit} "
-                    f"[Reference character presence: {pres}. "
-                    "Match the provided reference image likeness. "
-                    "Exactly one instance of this reference person — "
-                    "do not duplicate or clone the same face in the frame.]"
+                identity = _appearance_bit(cfg, pose=pose_part, presence=pres)
+                final_prompt = configure.compose_lyric_still_prompt(
+                    image_style=str(cfg.get("image_style") or ""),
+                    visual_style=str(cfg.get("style") or ""),
+                    lyric=line_text,
+                    scene=scene_part,
+                    background=bg_part,
+                    identity=identity,
+                    sequence_bit=seq_bit.strip(" []") if seq_bit else "",
                 )
                 print(f"[images] character ref ATTACHED ({pres})"
-                      f"{' +appearance' if appear else ''}", flush=True)
+                      f"{' +appearance' if identity else ''}", flush=True)
             else:
                 if has_ref:
                     print("[images] character ref OMITTED (presence=none)", flush=True)
-                final_prompt = (
-                    f"{clean_prompt}{seq_bit} "
-                    "[Do not depict any specific real person from a reference photo.]"
-                ) if has_ref else f"{clean_prompt}{seq_bit}"
+                final_prompt = configure.compose_lyric_still_prompt(
+                    image_style=str(cfg.get("image_style") or ""),
+                    visual_style=str(cfg.get("style") or ""),
+                    lyric=line_text,
+                    scene=scene_part,
+                    background=bg_part,
+                    identity="",
+                    sequence_bit=seq_bit.strip(" []") if seq_bit else "",
+                )
+            neg_preview = _build_merged_negative(
+                cfg,
+                has_character=line_apply_anatomy_neg,
+                has_secondary=line_has_secondary,
+            )
+            print(f"[images] presence={pres}  ref={'yes' if attach_ref else 'no'}  "
+                  f"anatomy_neg={'yes' if line_apply_anatomy_neg else 'no'}  "
+                  f"multi_neg={'yes' if line_has_secondary else 'no'}", flush=True)
+            print(f"[images] + positive: {final_prompt[:280]}{'…' if len(final_prompt) > 280 else ''}", flush=True)
+            print(f"[images] − negative: {neg_preview[:280]}{'…' if len(neg_preview) > 280 else ''}", flush=True)
 
             cmd = _build_sd_cmd(
                 final_prompt, img_path, attach_ref=attach_ref, ref_override=ref_override,
+                has_character=line_apply_anatomy_neg, has_secondary=line_has_secondary,
             )
             t_img = time.time()
             configure.APP_STATE["image_gen_t0"] = t_img
@@ -2514,7 +2962,8 @@ def generate_images_from_prompts(
                     "retrying without reference…",
                     flush=True,
                 )
-                cmd2 = _build_sd_cmd(final_prompt, img_path, attach_ref=False, ref_override="")
+                cmd2 = _build_sd_cmd(final_prompt, img_path, attach_ref=False, ref_override="",
+                                     has_character=line_apply_anatomy_neg, has_secondary=line_has_secondary)
                 out, rc = _run_sd_cli_once(cmd2, exe)
                 found = _find_still_for_line(
                     out_dir, line_no, variant=var if freq > 1 else None,
@@ -2647,10 +3096,11 @@ def regenerate_named_still(
         if not prompt:
             overall = (analysis.get("overall") or "").strip()
             prompt = (
-                f"{style_hint.replace('{line}', (overall[:160] or title))} "
-                f"Ambient theme still from the song's OVERALL world only. {overall[:520]} "
+                f"{configure.image_style_lead(cfg.get('image_style') or '')}, "
+                f"{style}, cinematic composition, coherent lighting. "
+                f"Ambient theme still of the song's worldspace only. {overall[:520]} "
                 "Environment and atmosphere only — no person, no character, no face, "
-                "no silhouette. No readable text, logos, or watermarks."
+                "no silhouette, no humanoid subject. No readable text, logos, or watermarks."
             )
         prompt = (
             f"{prompt.strip()} "
@@ -2661,13 +3111,12 @@ def regenerate_named_still(
     cfg_run = dict(cfg)
     if kind == "cover":
         cfg_run["cover_mode"] = True
-        # Character covers keep anatomy negatives; non-character → ambient no-people
-        cfg_run["cover_uses_character"] = bool(use_char_ref)
-        cfg_run["ambient_mode"] = not bool(use_char_ref)
+        cfg_run["cover_uses_character"] = False
+        cfg_run["ambient_mode"] = True  # no people on covers
         return _generate_named_still(
             dest, prompt, cfg_run,
-            reference_image=reference_image if has_ref else "",
-            attach_ref=has_ref,
+            reference_image="",
+            attach_ref=False,
         )
     # Theme: never attach character reference — ambient no-people negative
     cfg_run["ambient_mode"] = True
@@ -2729,7 +3178,7 @@ def regenerate_single_still(
     prompt = prompts[line_index]
     pres = "none"
     if presence and line_index < len(presence):
-        pres = (presence[line_index] or "none").lower()
+        pres = normalize_presence(presence[line_index] or "none")
 
     # Keep the existing still on disk until the new one is written (sd-cli -o
     # overwrites). Pre-deleting made the gallery show "No Image" and shifted
@@ -2779,20 +3228,27 @@ def regenerate_single_still(
     threads = _worker_thread_count(cfg)
 
     style_hint = str(cfg.get("prompt_template") or cfg.get("style") or "")
-    clean_prompt = _sanitize_visual_prompt(prompt, line_text, style_hint)
-    if use_ref:
-        appear = _appearance_bit(cfg)
-        appear_bit = f" {appear}" if appear else ""
-        final_prompt = (
-            f"{clean_prompt}{appear_bit} "
-            f"[Reference character presence: {pres}. "
-            "Match the provided reference image likeness accordingly.]"
-        )
-    else:
-        final_prompt = (
-            f"{clean_prompt} "
-            "[Do not depict any specific real person from a reference photo.]"
-        ) if has_ref else clean_prompt
+    parsed_sc = _parse_structured_scene(prompt or "")
+    scene = _sanitize_visual_prompt(
+        _scrub_field_text(parsed_sc.get("scene") or ""), line_text, style_hint
+    )
+    pose_part = _scrub_field_text(parsed_sc.get("pose") or "")
+    bg_part = _scrub_field_text(parsed_sc.get("background") or "")
+    if use_ref and not pose_part:
+        pose_part = _default_pose_for_presence(pres)
+    if not use_ref:
+        pose_part = ""
+    identity = _appearance_bit(cfg, pose=pose_part, presence=pres) if use_ref else ""
+    final_prompt = configure.compose_lyric_still_prompt(
+        image_style=str(cfg.get("image_style") or ""),
+        visual_style=str(cfg.get("style") or ""),
+        lyric=line_text,
+        scene=scene,
+        background=bg_part,
+        identity=identity,
+        sequence_bit="",
+    )
+    print(f"[regen] prompt → {final_prompt[:220]}…", flush=True)
 
     freq_label = configure.normalize_image_frequency(
         cfg.get("imagegen_frequency") or configure.DEFAULT_IMAGE_FREQUENCY
@@ -2855,10 +3311,15 @@ def regenerate_single_still(
             pass
         if attach_ref and has_ref:
             c.extend(["-r", str(ref)])
-        neg = configure.merge_negative_prompt(
-            (cfg.get("negative_prompt") or "").strip(),
-            cover=bool(cfg.get("cover_mode")),
-            ambient=bool(cfg.get("ambient_mode")),
+        # Anatomy negative only for full/partial; Multi if secondary figures
+        _sec = bool(
+            _analysis_has_secondary(cfg, project_dir)
+            or (bg_part and bg_part.upper() not in ("NONE", "N/A", "NA", "-"))
+        )
+        neg = _build_merged_negative(
+            cfg,
+            has_character=(pres in ("full", "partial")),
+            has_secondary=_sec,
         )
         if neg:
             c.extend(["-n", neg])
@@ -3113,7 +3574,7 @@ def generate_theme_prompts_from_assessment(
         "- Be a single dense paragraph for one ambient environmental still\n"
         "- Explore a different facet of that OVERALL space "
         "(architecture, atmosphere, light, weather, scale, time of day)\n"
-        "- Contain NO person, NO character, NO face, NO silhouette of a person, NO figure\n"
+        "- Contain NO person, NO character, NO face, NO silhouette, NO figure, NO humanoid subject\n"
         "- Contain NO reference to a protagonist or central subject\n"
         "- Work as a Flux image prompt (concrete environment, lighting, composition)\n"
         "- No quotes, no 'Prompt:' labels, no lyrics, no readable text in the image\n\n"
@@ -3272,12 +3733,39 @@ def _generate_named_still(
         pass
 
     configure.APP_STATE["image_gen_t0"] = time.time()
-    clean = _sanitize_visual_prompt(prompt, "", str(cfg.get("style") or ""))
+    # Cover / Theme are ambient paragraphs from their own generators.
+    # Do NOT run the lyrics-form leak sanitizer here — its markers
+    # (e.g. "no face", "or none") false-positive on ambient text and wipe
+    # the whole scene, leaving only the style lead (broken covers/themes).
+    # Lyrics stills use a different path (generate_images_from_prompts).
+    raw_prompt = (prompt or "").strip()
+    if cfg.get("ambient_mode") or cfg.get("cover_mode"):
+        clean = re.sub(r"(?im)^\s*(assistant|user|system)\s*:?\s*", "", raw_prompt).strip()
+        if not clean:
+            clean = raw_prompt
+    else:
+        clean = _sanitize_visual_prompt(raw_prompt, "", str(cfg.get("style") or ""))
+        if not clean:
+            clean = raw_prompt  # never ship a style-lead-only still
+    style_lead = configure.image_style_lead(
+        cfg.get("image_style") or configure.IMAGE_STYLE_DEFAULT
+    )
+    scene = (clean or "").strip()
+    if scene and scene[-1] not in ".!?":
+        scene = scene + "."
+    # Avoid double lead if caller already prepended
+    if scene and scene.lower().startswith(style_lead.lower()):
+        assembled = scene
+    elif scene:
+        assembled = f"{style_lead}. {scene}".strip()
+    else:
+        assembled = f"{style_lead}."
+    print(f"[named-still] prompt → {assembled[:220]}…", flush=True)
     cmd = [
         str(exe),
         "--diffusion-model", str(model_path),
         "--llm", str(llm_path),
-        "-p", clean,
+        "-p", assembled,
         "-o", str(partial),
         "-W", str(width), "-H", str(height),
         "--steps", str(steps),
@@ -3299,8 +3787,11 @@ def _generate_named_still(
         pass
     if has_ref:
         cmd.extend(["-r", str(ref_path)])
-    neg = configure.merge_negative_prompt(
-        (cfg.get("negative_prompt") or "").strip(),
+    # Cover / Theme are ambient (no character anatomy); has_character=False
+    neg = _build_merged_negative(
+        cfg,
+        has_character=False,
+        has_secondary=False,
         cover=bool(cfg.get("cover_mode")),
         ambient=bool(cfg.get("ambient_mode")),
     )
@@ -3388,9 +3879,9 @@ def _build_cover_prompt(
         if len(interpret) > 280:
             interpret = interpret[:280].rsplit(" ", 1)[0] + "…"
 
-    if not strategy:
-        strategy = classify_cover_strategy(title, analysis, cfg, has_ref)
-    use_char_ref = strategy == "character" and has_ref
+    # Covers are always non-character / no reference (object or metaphysical symbol).
+    strategy = "world"
+    use_char_ref = False
 
     # Optional short LLM concept locked to the title words
     concept = ""
@@ -3433,46 +3924,31 @@ def _build_cover_prompt(
             print(f"[cover] concept LLM skipped: {e}", flush=True)
             concept = ""
 
-    appear = _appearance_bit(cfg) if use_char_ref else ""
-    # Do NOT put the title in quotes as on-image text — Flux will try to write it.
-    title_lead = (
-        f"Album cover still inspired by the song name: {title}. "
-        "One significant, isolated subject fills the frame — a close-up or strong "
-        "figurative symbol the eye locks onto immediately. Clean composition, "
-        "shallow depth of field or solid negative space, high visual impact. "
+    # Covers never use character reference or people — object / metaphysical only.
+    use_char_ref = False
+    strategy = "world"
+    style_lead = configure.image_style_lead(
+        cfg.get("image_style") or configure.IMAGE_STYLE_DEFAULT
     )
-    if concept:
-        title_lead += f"Subject concept: {concept} "
-    elif interpret:
-        title_lead += (
-            f"Use this only to interpret what the song name means (not as a scenery brief): "
-            f"{interpret} "
-        )
+    mood = str(cfg.get("style") or configure.STYLE_DEFAULT).strip()
+    header = f"{style_lead}, {mood}, cinematic composition, coherent lighting." if mood else f"{style_lead}, cinematic composition, coherent lighting."
 
-    no_text = (
-        "Absolutely no text, letters, words, writing, typography, captions, subtitles, "
-        "logos, watermarks, signatures, UI, or graphical overlays anywhere in the image. "
-    )
-    if use_char_ref:
-        char_bit = f" Central figure: {character[:220]}." if character else ""
-        cover_prompt = (
-            f"{style_hint.replace('{line}', title)} "
-            f"{title_lead}"
-            f"Feature the central character as the single focused subject embodying the song name.{char_bit} "
-            f"{appear + ' ' if appear else ''}"
-            "Exactly one instance of the reference person — do not duplicate or clone the same face. "
-            "Iconic cover portrait or figure study — not a busy scene. "
-            f"{no_text}"
+    # Song title is the primary driver; OVERALL is a light interpretation aid only.
+    body_bits = [
+        f"Album cover still for the song title: {title}.",
+        "No people, no faces, no human figures, no characters.",
+        "One significant object or metaphysical symbol that embodies the song title — "
+        "isolated, high visual impact, clean composition, solid negative space or "
+        "shallow depth of field.",
+    ]
+    if concept:
+        body_bits.append(f"Symbol concept: {concept}")
+    elif interpret:
+        body_bits.append(
+            f"Title interpretation (mood only, not a character brief): {interpret[:220]}"
         )
-    else:
-        cover_prompt = (
-            f"{style_hint.replace('{line}', title)} "
-            f"{title_lead}"
-            "Bold symbolic or literal object/figure for the song name — not a wide landscape, "
-            "corridor, crowd, or generic mood board. One clear focal subject. "
-            f"{no_text}"
-        )
-    return cover_prompt, strategy, use_char_ref
+    cover_prompt = header + " " + " ".join(body_bits)
+    return cover_prompt, strategy, False
 
 
 def classify_cover_strategy(
@@ -3482,66 +3958,12 @@ def classify_cover_strategy(
     has_ref: bool,
 ) -> str:
     """
-    Decide cover composition strategy:
-      'character' — song title is about the central subject/character;
-                    use CHARACTER assessment + reference image when available.
-      'world'     — title is atmospheric / setting / abstract;
-                    use OVERALL worldspace only, no character / no reference image.
-
-    Uses the Thinking (or Encoder) model when available; falls back to a
-    lightweight heuristic from assessment text.
+    Cover stills are always non-character: object or metaphysical symbol of the
+    song title. Never attaches the reference image and never depicts people.
+    Kept as a function so callers stay stable; always returns 'world'.
     """
-    title = (title or "").strip()
-    overall = (analysis.get("overall") or "").strip()
-    character = (analysis.get("character_guidance") or "").strip()
-    if not has_ref or not character or character.lower() in ("none specified", "none", "n/a", ""):
-        return "world"
-
-    model_path, role = _resolve_prompt_model(cfg)
-    if model_path and Path(model_path).is_file():
-        prompt = (
-            "Classify this song title for album cover art strategy.\n\n"
-            f"Song title: {title}\n\n"
-            f"OVERALL assessment (world/mood):\n{overall[:600] or '(none)'}\n\n"
-            f"CHARACTER guidance:\n{character[:400] or '(none)'}\n\n"
-            "Answer with EXACTLY one word:\n"
-            "  CHARACTER — if the title primarily names, describes, or is about "
-            "the central character/subject (a person, named figure, or the story's protagonist).\n"
-            "  WORLD — if the title is mainly about setting, mood, abstract idea, "
-            "place, time, or atmosphere, not a specific character.\n\n"
-            "Reply with only CHARACTER or WORLD."
-        )
-        try:
-            raw = _run_llama_completion(
-                prompt, cfg, role, model_path,
-                n_predict=16,
-                ctx_size=2048,
-                temperature=0.1,
-                timeout=90.0,
-            )
-            ans = (raw or "").strip().upper()
-            first = ans.replace(".", " ").split()[0] if ans.split() else ""
-            if first.startswith("CHAR"):
-                print(f"[cover] strategy=CHARACTER (LLM: {ans[:40]!r})", flush=True)
-                return "character"
-            if first.startswith("WORLD") or "ATMOSPHER" in ans or "SETTING" in ans:
-                print(f"[cover] strategy=WORLD (LLM: {ans[:40]!r})", flush=True)
-                return "world"
-            print(f"[cover] strategy=WORLD (LLM default from {ans[:40]!r})", flush=True)
-            return "world"
-        except Exception as e:
-            print(f"[cover] LLM classify failed ({e}); using heuristic", flush=True)
-
-    # Heuristic: title words overlapping character notes → character
-    title_tokens = set(re.findall(r"[a-z0-9]+", title.lower()))
-    char_tokens = set(re.findall(r"[a-z0-9]+", character.lower()[:500]))
-    stop = {"the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with", "my", "your", "is", "it"}
-    overlap = (title_tokens - stop) & (char_tokens - stop)
-    if overlap:
-        print(f"[cover] strategy=CHARACTER (heuristic overlap={overlap})", flush=True)
-        return "character"
-    print("[cover] strategy=WORLD (heuristic, no title/character overlap)", flush=True)
     return "world"
+
 
 
 def generate_cover_image(
@@ -3553,9 +3975,9 @@ def generate_cover_image(
     lyrics: str = "",
 ) -> Dict[str, Any]:
     """
-    Cover stills from song title + assessment strategy:
-      CHARACTER → title + character guidance + reference image
-      WORLD     → title + OVERALL worldspace only (no character, no ref)
+    Cover stills: song-title-driven object or metaphysical symbol.
+    Never depicts people and never attaches the reference image.
+    OVERALL assessment is a light interpretation aid only.
     """
     clear_cancel_state()
     configure.APP_STATE["session_status"] = "running"
@@ -3696,12 +4118,12 @@ def generate_cover_image(
             )
             cfg_cover = dict(cfg)
             cfg_cover["cover_mode"] = True
-            cfg_cover["ambient_mode"] = not bool(use_char_ref)
-            cfg_cover["cover_uses_character"] = bool(use_char_ref)
+            cfg_cover["ambient_mode"] = True  # no people on covers
+            cfg_cover["cover_uses_character"] = False
             out = _generate_named_still(
                 dest, cover_prompt + var_bit, cfg_cover,
-                reference_image=reference_image if use_char_ref else "",
-                attach_ref=use_char_ref,
+                reference_image="",
+                attach_ref=False,
             )
             images.append(out)
         elapsed = time.time() - t0
@@ -4150,6 +4572,8 @@ def run_materials_pipeline(
             has_character_ref=has_ref,
             progress_callback=progress_callback,
         )
+        # Carry secondary-figures signal into Phase 2 negative merge
+        cfg["other_figures"] = (analysis or {}).get("other_figures") or ""
 
         _snapshot_session(
             project_dir, lyrics=lyrics, song_name=song_name or label, cfg=cfg,
@@ -4207,7 +4631,7 @@ def run_materials_pipeline(
                             f"--- prompt ---\n{pr}\n\n"
                         )
                 with open(project_dir / "character_map.txt", "w", encoding="utf-8") as f:
-                    f.write("section → presence (none|silhouette|partial|full)\n")
+                    f.write("section → presence (none|partial|full)\n")
                     for lab, val in (analysis.get("character_presence") or {}).items():
                         f.write(f"{lab}: {val}\n")
                     f.write("\nper-line:\n")
