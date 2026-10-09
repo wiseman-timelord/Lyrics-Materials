@@ -26,7 +26,7 @@ Available on [HuggingFace.Co](https://huggingface.co/)...
 
 ### Instructions:
 - These are my current instructions for using the program...(Note; If you are unsure as to if Flux2 will be ok with your settings and VRam settings, then you may want Task Manager open at this stage, with the python process selected ready to End Task if you get VRam overload on model load, while to also be able to monitor goings on with the GPU memory/shaders if everything goes ok. 
-- As I have repeating stated "for 8GB VRam you would want image settings to, 768x512 or 640x360 (half 720p), that is with Diffuser Placement set to "Split". I would assume one could load the complete Flux2 model to GPU on 12GB card, but then Encoder must be loaded at same time, so possibly still need cpu for Encoder if Full; failure to take consideration may crash or mess up graphics drivers, worse case scenatio requiring factory reset install.)
+- As I have repeating stated "for 8GB VRam you would want image settings to, 768x512 or 640x360 (half 720p), that is with Diffuser Placement set to "Split". I would assume one could load the complete Flux2 model to GPU on 12GB card, but then Encoder must be loaded at same time, so possibly still need cpu for Encoder if Full; failure to take consideration may crash or mess up graphics drivers, worse case scenario requiring factory reset install.)
 1. The program will start, you will be in a new project, so collapse the left pane, unless you are going to hop sessions.
 2. User enters **song name** (folder slug) and pastes lyrics; optional (advised) single **reference image** for central character.
 3. Ensure Image frequency and other settings are correct (and not too wild, see notes), then click "Generate All Assets".
