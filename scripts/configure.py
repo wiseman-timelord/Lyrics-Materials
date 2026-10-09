@@ -2,10 +2,10 @@
 configure.py - Constants, paths, settings I/O for Lyrics-Materials.
 Lyrics → per-line visual materials (images) for external AI video use.
 Models:
-  Encoder  : Qwen3-VL-4B Instruct / Uncensored (Q4)
-  Thinking : Qwen3-VL-4B Thinking (Q5) — optional, richer prompts + song analysis
+  Text     : Qwen3-VL-4B Thinking (assessment, prompts, Flux.2 --llm encoding)
+             Prefer Huihui-Qwen3-VL-4B-Thinking-abliterated*.gguf
   Diffuser : FLUX.2-klein-4B (Q8)
-  mmproj quarantined under models/mmproj/ (not used for pure text)
+  mmproj quarantined under models/mmproj/ (not used for pure-text loads)
 """
 from __future__ import annotations
 
@@ -237,16 +237,20 @@ def ensure_data_dirs() -> None:
 # ---------------------------------------------------------------------------
 # Fixed model expectations
 # ---------------------------------------------------------------------------
+# Legacy alias kept for migration of older configuration.json files
 ENCODER_MODEL_HINT = (
-    "Huihui-Qwen3-VL-4B-Instruct-abliterated*.gguf  OR  "
-    "Qwen3-VL-4B-Instruct-Uncensored-abliterated*.gguf"
+    "DEPRECATED — use Thinking GGUF (see THINKING_MODEL_HINT)"
 )
-THINKING_MODEL_HINT = "Huihui-Qwen3-VL-4B-Thinking-abliterated*.gguf"
+THINKING_MODEL_HINT = (
+    "Huihui-Qwen3-VL-4B-Thinking-abliterated*.gguf  OR  "
+    "Qwen3-VL-4B-Thinking*.gguf"
+)
+TEXT_MODEL_HINT = THINKING_MODEL_HINT  # single text model role
 MMPROJ_HINT = "mmproj*.gguf  (quarantined under models/mmproj/ — not used for pure text)"
 DIFFUSER_MODEL_HINT = "flux-2-klein-4b-Q8_0.gguf  OR  diffusion_pytorch_model_4b.safetensors"
 VAE_HINT = "flux2_ae.safetensors (Flux.2 VAE from black-forest-labs/FLUX.2-dev — NOT Flux.1 ae.safetensors)"
 
-# Qwen3-VL-4B backbone (Instruct / Thinking / Uncensored share architecture)
+# Qwen3-VL-4B backbone (Thinking family; Instruct paths accepted only as legacy fallback)
 ENCODER_MAX_LAYERS = 36
 ENCODER_MAX_CONTEXT = 40960
 ENCODER_DIM = 2560
@@ -478,15 +482,22 @@ def vram_free_for_backend(backend: str) -> int:
 
 
 def identify_encoder_variant(path_str: str) -> str:
-    """Label Qwen3-VL-4B family GGUF: Instruct / Thinking / Uncensored-Instruct."""
+    """Label Qwen3-VL-4B family GGUF (legacy name; preferred is Thinking)."""
+    return identify_text_model_variant(path_str)
+
+
+def identify_text_model_variant(path_str: str) -> str:
+    """Label the single text model: Thinking preferred; Instruct accepted as legacy."""
     n = Path(path_str or "").name.lower()
     if "thinking" in n:
         return "Thinking"
     if "uncensored" in n:
-        return "Uncensored-Instruct"
-    if "instruct" in n or "huihui" in n or "qwen3-vl-4b" in n:
-        return "Instruct"
-    return "Encoder" if path_str else ""
+        return "Uncensored-Instruct (legacy)"
+    if "instruct" in n:
+        return "Instruct (legacy)"
+    if "huihui" in n or "qwen3-vl-4b" in n:
+        return "Qwen3-VL-4B"
+    return "Text" if path_str else ""
 
 
 def get_mmproj_quarantine_dir() -> Path:
@@ -522,6 +533,79 @@ def quarantine_mmproj_files() -> List[str]:
         except OSError:
             pass
     return moved
+
+
+def resolve_text_model_path(cfg: Optional[Dict[str, Any]] = None) -> str:
+    """
+    Single text-model path for assessment, prompts, and Flux.2 --llm.
+
+    Prefer thinking_model_path; fall back to encoder_model_path so older
+    configuration.json files keep working until the user re-saves Configuration.
+    """
+    data = cfg if isinstance(cfg, dict) else load_configuration()
+    th = (data.get("thinking_model_path") or "").strip()
+    if th:
+        return th
+    return (data.get("encoder_model_path") or "").strip()
+
+
+def resolve_prompting_backend(cfg: Optional[Dict[str, Any]] = None) -> str:
+    """
+    Device for Phase 1 (assessment + visual prompts via llama-completion).
+
+    Order: prompting_backend → thinking_backend → encoder_backend → CPU.
+    """
+    data = cfg if isinstance(cfg, dict) else load_configuration()
+    for key in ("prompting_backend", "thinking_backend", "encoder_backend"):
+        v = (data.get(key) or "").strip()
+        if v:
+            return v
+    return "CPU"
+
+
+def resolve_encoding_backend(cfg: Optional[Dict[str, Any]] = None) -> str:
+    """
+    Device for Phase 2 Qwen --llm / text-encoder while Flux runs (sd-cli).
+
+    Order: encoding_backend → encoder_backend → prompting_backend → CPU.
+
+    8GB tip: set Encoding to CPU and ImageGen to Vulkan so Flux owns the GPU
+    while Qwen TE stays on system RAM.
+    """
+    data = cfg if isinstance(cfg, dict) else load_configuration()
+    for key in ("encoding_backend", "encoder_backend"):
+        v = (data.get(key) or "").strip()
+        if v:
+            return v
+    # Fall back to prompting device only if user never set encoding
+    return resolve_prompting_backend(data)
+
+
+def resolve_text_backend(cfg: Optional[Dict[str, Any]] = None) -> str:
+    """Legacy alias → Prompting Processing device."""
+    return resolve_prompting_backend(cfg)
+
+
+def backend_device_token(backend: str) -> str:
+    """
+    Map UI label 'Vulkan1 — Radeon…' / 'CPU' → sd-cli / plan token
+    'vulkan1' / 'cpu'.
+    """
+    import re as _re
+    b = (backend or "CPU").strip()
+    low = b.lower()
+    if not low or low == "cpu" or low.startswith("cpu"):
+        return "cpu"
+    m = _re.search(r"(vulkan|cuda)\s*(\d+)", low, _re.I)
+    if m:
+        return f"{m.group(1).lower()}{m.group(2)}"
+    m = _re.search(r"(\d+)", low)
+    if "vulkan" in low:
+        return f"vulkan{m.group(1) if m else 0}"
+    if "cuda" in low:
+        return f"cuda{m.group(1) if m else 0}"
+    return "cpu"
+
 
 # Styles
 STYLE_LIGHT = "light and bright"
@@ -663,6 +747,7 @@ OUTFIT_SMART_CASUAL_MALE = "Casual_Male"
 OUTFIT_SMART_CASUAL_FEMALE = "Casual_Female"
 OUTFIT_JOGGERS = "Joggers"
 OUTFIT_ROCKER = "Rocker"
+OUTFIT_DARKONES = "Darkie"
 OUTFIT_SKIMPY = "Skimpy"
 OUTFIT_NONE = "None"
 ALL_OUTFITS = "All Outfits"
@@ -670,12 +755,12 @@ ALL_OUTFITS = "All Outfits"
 _OUTFIT_LEGACY_UNDIES = "Undies"
 OUTFIT_CHOICES = [
     OUTFIT_SMART_SUIT, OUTFIT_SMART_CASUAL_MALE, OUTFIT_SMART_CASUAL_FEMALE,
-    OUTFIT_JOGGERS, OUTFIT_ROCKER, OUTFIT_SKIMPY, OUTFIT_NONE,
+    OUTFIT_JOGGERS, OUTFIT_ROCKER, OUTFIT_DARKONES, OUTFIT_SKIMPY, OUTFIT_NONE,
     ALL_OUTFITS,
 ]
 OUTFIT_CONCRETE = [
     OUTFIT_SMART_SUIT, OUTFIT_SMART_CASUAL_MALE, OUTFIT_SMART_CASUAL_FEMALE,
-    OUTFIT_JOGGERS, OUTFIT_ROCKER, OUTFIT_SKIMPY, OUTFIT_NONE,
+    OUTFIT_JOGGERS, OUTFIT_ROCKER, OUTFIT_DARKONES, OUTFIT_SKIMPY, OUTFIT_NONE,
 ]
 OUTFIT_DEFAULT = OUTFIT_NONE
 OUTFIT_TOKEN = "<outfit_worn>"
@@ -685,6 +770,7 @@ OUTFIT_WORDS = {
     OUTFIT_SMART_CASUAL_FEMALE: "black-tshirt with grey-short-skirt outfit",
     OUTFIT_JOGGERS: "black-crop-top with grey-jogging-shorts outfit",
     OUTFIT_ROCKER: "long-black-leather-coat with black shirt and grey-jeans outfit",
+    OUTFIT_DARKONES: "black-hooded-coat and grey-jeans outfit",
     OUTFIT_SKIMPY: "skimpy-revealing version of same outfit",
     OUTFIT_NONE: "",
 }
@@ -905,24 +991,52 @@ def character_identity_clause(
     gender: str = "",
     bodyshape: str = "",
     age=None,
+    presence: str = "full",
 ) -> str:
     """
     Character lock after the scene / lyric line.
 
-    Target form:
+    presence = silhouette | partial | full (default full)
+
+    **silhouette** — no face/age/hands lock (those fight a shadow outline):
+      CHARACTER: show the gender male from the reference image as silhouette or
+      shadow outline, and hair … and bodyshape of …, wearing a ….
+
+    **full / partial** — face-match identity lock:
       Depicted in the middle of the scene, the single individual with the exact
       same face as the gender male shown in the reference image, that in the
-      generated image are, 45 years old and bodyshape of exotic and hair worn
-      naturally with length 3 inches and anatomically correct hands, wearing a …
+      generated image are, 45 years old and bodyshape of exotic and hair …
+      and anatomically correct hands, wearing a …
     """
     gp = gender_phrase(gender) if gender else ""
     bp = bodyshape_phrase(bodyshape)
     hp = hair_style_phrase(hair)
     op = outfit_phrase(outfit)
+    pres = (presence or "full").strip().lower()
+    if pres not in ("none", "silhouette", "partial", "full"):
+        pres = "full"
 
     gender_bit = f"the gender {gp}" if gp else "the subject"
 
-    # "45 years old and bodyshape of exotic and hair … and anatomically correct hands"
+    # --- Silhouette / shadow: omit face, age, hands ---
+    if pres == "silhouette":
+        bits: List[str] = []
+        if hp:
+            bits.append(f"hair {hp}")
+        if bp:
+            bits.append(f"bodyshape of {bp}")
+        tail = ""
+        if bits:
+            tail = ", and " + " and ".join(bits)
+        if op:
+            tail = f"{tail}, wearing a {op}" if tail else f", wearing a {op}"
+        core = (
+            f"CHARACTER: show {gender_bit} from the reference image as "
+            f"silhouette or shadow outline{tail}."
+        )
+        return core
+
+    # --- Full / partial: face-match identity lock ---
     attrs: List[str] = []
     if age is not None and str(age).strip() != "":
         attrs.append(age_phrase(age))
@@ -942,6 +1056,11 @@ def character_identity_clause(
         core = f"{core}, wearing a {op}."
     else:
         core = core + "."
+    if pres == "partial":
+        core = (
+            "CHARACTER: show the main character partially (cropped, turned, or distant). "
+            + core
+        )
     return core
 
 
@@ -983,11 +1102,22 @@ def compose_lyric_still_prompt(
         parts.append(f"Music-video still of: {lyric_s}.")
 
     scene_s = (scene or "").strip()
-    # Drop scene if empty, duplicate of lyric, or only a music-video still echo
+    # Drop scene if empty, duplicate of lyric, instruction echo, or music-video still echo
     if scene_s:
         low = scene_s.lower().strip()
         lyric_low = lyric_s.lower()
+        _bad = (
+            "describe the visual scene",
+            "one positive paragraph",
+            "do not describe the main character",
+            "output the scene description",
+            "<|im_start|>",
+            "<think>",
+            "song context:",
+        )
         if low.startswith("music-video still"):
+            scene_s = ""
+        elif any(b in low for b in _bad):
             scene_s = ""
         elif lyric_low and (low == lyric_low or low.rstrip(".!?") == lyric_low):
             scene_s = ""
@@ -1088,11 +1218,12 @@ AMBIENT_NEGATIVE_PROMPT = (
     "text, writing, caption, watermark, signature, graphical overlay, "
     "signage, poster text, banner. "
     "blurry, out of focus, low quality, noisy. "
-    "people, person, human, face, portrait, character, figure, crowd, body, "
+    "people, humans, person, human, face, portrait, character, characters, figure, crowd, body, "
     "man, woman, child, silhouette of a person, humanoid subject."
 )
 # Extra anti-text always merged into cover stills (Flux 4B loves to write titles).
 COVER_NEGATIVE_EXTRA = (
+    "people, humans, characters, "
     "alphabet, calligraphy, album title text, readable text, misspelled text, "
     "graphical overlay, text overlay."
 )
@@ -1348,11 +1479,12 @@ STATUS_BAR_KEY = "status-bar"
 
 # Greyed-out placeholders for Configuration path fields
 MODEL_PATH_PLACEHOLDERS = {
-    "encoder": "Huihui-…Instruct…Q4_K_M.gguf or Uncensored…Q4_K_M.gguf",
-    "thinking": "Huihui-…Thinking-abliterated…Q5_K_M.gguf",
+    "encoder": "DEPRECATED — set Thinking model instead",
+    "thinking": "Huihui-Qwen3-VL-4B-Thinking-abliterated…Q4_K_M / Q5_K_M.gguf",
+    "text": "Huihui-Qwen3-VL-4B-Thinking-abliterated…Q4_K_M / Q5_K_M.gguf",
     "mmproj": "mmproj*.gguf (auto-quarantined; not used for pure text)",
     "diffuser": "flux-2-klein-4b-Q8_0.gguf",
-    "llm": "path/to/Qwen3-4B-*.gguf / qwen_3_4b.safetensors (Flux.2 text encoder)",
+    "llm": "Same as Thinking GGUF (Flux.2 --llm text conditioning)",
     "vae": "flux2_ae.safetensors OR BFL vae/diffusion_pytorch_model.safetensors (~350MB)",
 }
 
@@ -1364,8 +1496,10 @@ INPUT_GALLERY_PADDING = 16
 DEFAULT_MAX_THUMBNAILS = 50
 MAX_THUMBNAIL_CHOICES = [25, 50, 100]
 THUMBNAIL_COUNT_CHOICES = [25, 50, 100]
-DEFAULT_INPUT_THUMBNAIL = 96
-INPUT_THUMBNAIL_CHOICES = [64, 96, 128, 160]
+DEFAULT_INPUT_THUMBNAIL = 96  # legacy, unused for layout
+INPUT_THUMBNAIL_CHOICES = [64, 96, 128, 160]  # legacy
+DEFAULT_LYRICS_THUMBS_PER_ROW = 8
+LYRICS_THUMBS_PER_ROW_CHOICES = [4, 6, 8, 10, 12]
 
 # ---------------------------------------------------------------------------
 # Session state (in-memory)
@@ -1604,6 +1738,8 @@ CONFIGURATION_KEYS = [
     "llm_model_path",
     "encoder_backend",
     "thinking_backend",
+    "prompting_backend",
+    "encoding_backend",
     "imagegen_backend",
     "worker_threads",
     "encoder_threads",
@@ -1641,6 +1777,8 @@ def _default_configuration() -> Dict[str, Any]:
         "llm_model_path": "",
         "encoder_backend": "CPU",
         "thinking_backend": "CPU",
+        "prompting_backend": "CPU",
+        "encoding_backend": "CPU",
         "imagegen_backend": "CPU",
         "worker_threads": WORKER_THREADS_DEFAULT,
         "encoder_threads": HEAVY_THREADS,
@@ -1717,6 +1855,7 @@ PREFERENCES_KEYS = [
     "video_format",
     "max_thumbnails",
     "input_thumbnail_size",
+    "lyrics_thumbs_per_row",
     "bleep_section_completion",
     "bleep_video_completion",
 ]
@@ -1728,6 +1867,7 @@ def _default_preferences() -> Dict[str, Any]:
         "video_format": VIDEO_MP4,
         "max_thumbnails": DEFAULT_MAX_THUMBNAILS,
         "input_thumbnail_size": DEFAULT_INPUT_THUMBNAIL,
+        "lyrics_thumbs_per_row": DEFAULT_LYRICS_THUMBS_PER_ROW,
         "bleep_section_completion": False,
         "bleep_video_completion": False,
     }

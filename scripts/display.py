@@ -137,10 +137,10 @@ def _open_project_folder() -> str:
 
 def _models_configured() -> bool:
     cfg = _cfg()
-    enc = (cfg.get("encoder_model_path") or "").strip()
+    text_m = configure.resolve_text_model_path(cfg)
     diff = (cfg.get("imagegen_model_path") or "").strip()
     # VAE is validated at generate time (Flux.2 resolver); not required to unlock Generate
-    if not enc or not Path(enc).expanduser().exists():
+    if not text_m or not Path(text_m).expanduser().exists():
         return False
     if not diff or not Path(diff).expanduser().exists():
         return False
@@ -377,11 +377,17 @@ def _action_btn_updates(lyrics: str = "", song_name: str = "", *, running: bool 
 
     When running: hide action buttons, show Emergency Stop.
 
-    Returns (assess_u, all_assets_u, cover_u, theme_u, lyrics_u, stop_u).
+    Returns 9 updates:
+      (assess_u, all_assets_u, cover_u, theme_u, lyrics_u, stop_u,
+       thumb_cover_u, thumb_theme_u, thumb_lyrics_u)
+    Thumb copies sit under each section on the Thumbnails tab.
     """
     hide = gr.update(visible=False)
     if running:
-        return hide, hide, hide, hide, hide, gr.update(visible=True)
+        return (
+            hide, hide, hide, hide, hide, gr.update(visible=True),
+            hide, hide, hide,
+        )
 
     models_ok = _models_configured()
     if not models_ok:
@@ -394,6 +400,7 @@ def _action_btn_updates(lyrics: str = "", song_name: str = "", *, running: bool 
             ),
             hide, hide, hide, hide,
             gr.update(visible=False),
+            hide, hide, hide,
         )
 
     has_assess = _assessment_exists()
@@ -410,6 +417,7 @@ def _action_btn_updates(lyrics: str = "", song_name: str = "", *, running: bool 
             assess_u,
             hide, hide, hide, hide,
             gr.update(visible=False),
+            hide, hide, hide,
         )
 
     cover_ok = _can_cover(song_name)
@@ -441,13 +449,33 @@ def _action_btn_updates(lyrics: str = "", song_name: str = "", *, running: bool 
         variant="primary" if lyrics_ok else "secondary",
         visible=True,
     )
-    return assess_u, all_assets_u, cover_u, theme_u, lyrics_u, gr.update(visible=False)
+    # Thumbnails-tab duplicates (always visible when assessment exists)
+    return (
+        assess_u, all_assets_u, cover_u, theme_u, lyrics_u, gr.update(visible=False),
+        cover_u, theme_u, lyrics_u,
+    )
 
 
 def _run_btn_updates(lyrics: str = "", song_name: str = ""):
     """Back-compat: return only the lyrics-slideshow button update."""
-    *_, lyrics_u, _ = _action_btn_updates(lyrics, song_name, running=False)
-    return lyrics_u
+    vals = _action_btn_updates(lyrics, song_name, running=False)
+    # lyrics_u is index 4
+    return vals[4]
+
+
+def _action_btn_components() -> List[Any]:
+    """Management action buttons + Thumbnails per-section duplicates (9 total)."""
+    return [
+        _gen["assess_btn"],
+        _gen["all_assets_btn"],
+        _gen["cover_btn"],
+        _gen["theme_btn"],
+        _gen["run_btn"],
+        _gen["stop_btn"],
+        _gen["thumb_cover_btn"],
+        _gen["thumb_theme_btn"],
+        _gen["thumb_run_btn"],
+    ]
 
 
 def _run_btn_for_project(proj: str) -> Any:
@@ -594,21 +622,118 @@ def _session_choices_payload() -> List[Dict[str, Any]]:
     return configure.list_sessions()
 
 
-# Max still slots in the Generation thumb grid (4 columns).
-THUMB_SLOTS = 80
-THUMB_COLS = 8
-# Cover / Theme gallery slot budgets (separate sections)
+# Lyrics still grid: built at max columns; visible per-row from Preferences.
+THUMB_COLS_MAX = 12
+THUMB_SLOTS = 96  # 8 rows × 12 cols
+# Cover / Theme gallery slot budgets (separate sections; fixed 8-wide)
 COVER_SLOTS = 8
 THEME_SLOTS = 32
+COVER_THEME_COLS = 8
+
+
+def _lyrics_thumbs_per_row() -> int:
+    """How many lyrics stills per row (Preferences)."""
+    try:
+        v = int(
+            _prefs().get(
+                "lyrics_thumbs_per_row",
+                getattr(configure, "DEFAULT_LYRICS_THUMBS_PER_ROW", 8),
+            )
+            or 8
+        )
+        choices = getattr(configure, "LYRICS_THUMBS_PER_ROW_CHOICES", [4, 6, 8, 10, 12])
+        if v in choices:
+            return v
+    except Exception:
+        pass
+    return 8
+
+
+# Contrasting borders per lyric section (cycle through palette)
+_SECTION_BORDER_COLORS = (
+    "#e74c3c",  # red
+    "#3498db",  # blue
+    "#2ecc71",  # green
+    "#f39c12",  # orange
+    "#9b59b6",  # purple
+    "#1abc9c",  # teal
+    "#e91e63",  # pink
+    "#00bcd4",  # cyan
+    "#ff5722",  # deep orange
+    "#8e44ad",  # deep purple
+    "#16a085",  # dark teal
+    "#d35400",  # burnt orange
+)
+
+
+def _refresh_line_section_map(lyrics_text: str = "") -> Dict[int, str]:
+    """
+    Build 1-based line number → section label from lyrics.
+    Stored in APP_STATE['line_section_map'] for thumbnail border colours.
+    """
+    text_in = (lyrics_text or "").strip()
+    if not text_in:
+        folder = (configure.APP_STATE.get("current_project_folder") or "").strip()
+        if folder:
+            for name in ("lyrics.txt", "Lyrics.txt"):
+                path = Path(folder) / name
+                if path.is_file():
+                    try:
+                        text_in = path.read_text(encoding="utf-8", errors="replace")
+                    except OSError:
+                        text_in = ""
+                    break
+    mapping: Dict[int, str] = {}
+    if text_in:
+        try:
+            from scripts.inference import parse_lyrics
+            for e in parse_lyrics(text_in):
+                if e.get("type") == "line":
+                    # parse_lyrics uses 0-based index in some versions — support both
+                    idx = e.get("index")
+                    if idx is None:
+                        continue
+                    line_no = int(idx) + 1 if int(idx) < 1000 else int(idx)
+                    # Prefer explicit 1-based if provided
+                    if "line_no" in e:
+                        line_no = int(e["line_no"])
+                    sec = (e.get("section") or "Body").strip() or "Body"
+                    mapping[line_no] = sec
+        except Exception:
+            mapping = {}
+    configure.APP_STATE["line_section_map"] = mapping
+    # Ordered unique section labels → colour index
+    order: List[str] = []
+    for ln in sorted(mapping.keys()):
+        sec = mapping[ln]
+        if sec not in order:
+            order.append(sec)
+    configure.APP_STATE["section_color_order"] = order
+    return mapping
+
+
+def _section_color_index(line_no: int) -> int:
+    mapping = configure.APP_STATE.get("line_section_map") or {}
+    order = configure.APP_STATE.get("section_color_order") or []
+    sec = mapping.get(int(line_no)) or "Body"
+    if not order:
+        return 0
+    try:
+        return order.index(sec) % len(_SECTION_BORDER_COLORS)
+    except ValueError:
+        return 0
+
+
+def _section_slot_classes(line_no: int) -> List[str]:
+    idx = _section_color_index(line_no)
+    return ["thumb-slot", f"thumb-sec-{idx}"]
 
 
 def _thumb_size_px() -> int:
-    """Configured thumbnail height from Preferences (default 96)."""
-    try:
-        prefs = _prefs()
-        return int(prefs.get("input_thumbnail_size", configure.DEFAULT_INPUT_THUMBNAIL) or 96)
-    except Exception:
-        return int(getattr(configure, "DEFAULT_INPUT_THUMBNAIL", 96) or 96)
+    """Thumbnail display height — scales with per-row count (fills panel width)."""
+    n = _lyrics_thumbs_per_row()
+    # Rough fit: wider rows → shorter cells so a row stays readable
+    return max(72, min(180, 960 // max(1, n)))
 
 
 def _gallery_height_for(n_images: int) -> int:
@@ -617,7 +742,8 @@ def _gallery_height_for(n_images: int) -> int:
     cell_h = th + 40  # image + Regenerate button + gap
     if n_images <= 0:
         return cell_h + 16
-    rows = max(1, (n_images + THUMB_COLS - 1) // THUMB_COLS)
+    cols = _lyrics_thumbs_per_row()
+    rows = max(1, (n_images + cols - 1) // cols)
     return min(1600, max(cell_h + 16, rows * cell_h + 24))
 
 
@@ -841,21 +967,8 @@ def _slot_aligned_named_paths(
 
 
 def _lyrics_section_should_show(paths: Optional[List[str]] = None) -> bool:
-    """True when the Lyrics Thumbnails section should be visible."""
-    if configure.APP_STATE.get("generating") and configure.APP_STATE.get("thumb_queued_lines"):
-        return True
-    if configure.APP_STATE.get("thumb_generating_line") is not None:
-        return True
-    if int(configure.APP_STATE.get("thumb_expected_count") or 0) > 0:
-        # Only show if we actually have lyric stills or an active lyrics run queued
-        by_line = _line_path_map(paths)
-        if by_line:
-            return True
-        if configure.APP_STATE.get("thumb_queued_lines"):
-            return True
-        return False
-    by_line = _line_path_map(paths)
-    return bool(by_line)
+    """Always show Lyrics Thumbnails section (No Image placeholders when empty)."""
+    return True
 
 
 
@@ -1130,7 +1243,9 @@ def _simple_grid_updates(
       empty expected slot → thumbnails_no_image.jpg
     """
     th = _thumb_size_px()
-    n_rows = len(_gen.get(rows_key) or []) or max(1, (n_slots + THUMB_COLS - 1) // THUMB_COLS)
+    # Cover/Theme fixed column width
+    cols = COVER_THEME_COLS
+    n_rows = len(_gen.get(rows_key) or []) or max(1, (n_slots + cols - 1) // cols)
     # Frequency drives slot count: slim when expected drops, expand with no_image when it rises.
     # Caller passes expected from the current Image Frequency (busy/queued may raise it).
     exp = int(expected or 0)
@@ -1147,7 +1262,7 @@ def _simple_grid_updates(
 
     updates: List[Any] = []
     for r in range(n_rows):
-        row_start = r * THUMB_COLS
+        row_start = r * cols
         updates.append(gr.update(visible=row_start < n_show))
     for i in range(n_slots):
         if i < n_show:
@@ -1211,20 +1326,16 @@ def _cover_panel_updates(project_dir: str = "") -> List[Any]:
     paths = _slot_aligned_named_paths(
         "cover", project_dir, COVER_SLOTS, extra_slots=busy | queued,
     )
-    # Show when we have stills, pending work, or frequency asks for slots on an active project
-    show = bool(any(paths)) or bool(busy) or bool(queued)
-    if not show and expected > 0 and _assessment_exists():
-        show = True
-    # Slim to frequency expected; only expand for busy/queued beyond that
-    n_expected = expected if show else 0
+    # Always show Cover section; frequency drives No Image placeholder slots
+    show = True
+    n_expected = max(1, expected) if expected > 0 else max(1, freq_n or 1)
     if busy or queued:
-        show = True
         n_expected = max(n_expected, max(busy | queued) + 1)
     n_expected = min(n_expected, COVER_SLOTS)
     return [gr.update(visible=show)] + _simple_grid_updates(
         paths, COVER_SLOTS, "cover_rows", "cover_cols", "cover_imgs",
         "cover_regen_btns", "cover_remove_btns",
-        kind="cover", expected=n_expected if show else 0,
+        kind="cover", expected=n_expected,
     )
 
 
@@ -1249,18 +1360,16 @@ def _theme_panel_updates(project_dir: str = "") -> List[Any]:
     paths = _slot_aligned_named_paths(
         "theme", project_dir, THEME_SLOTS, extra_slots=busy | queued,
     )
-    show = bool(any(paths)) or bool(busy) or bool(queued)
-    if not show and expected > 0 and _assessment_exists():
-        show = True
-    n_expected = expected if show else 0
+    # Always show Theme section; frequency drives No Image placeholder slots
+    show = True
+    n_expected = max(1, expected) if expected > 0 else max(1, freq_n or 1)
     if busy or queued:
-        show = True
         n_expected = max(n_expected, max(busy | queued) + 1)
     n_expected = min(n_expected, THEME_SLOTS)
     return [gr.update(visible=show)] + _simple_grid_updates(
         paths, THEME_SLOTS, "theme_rows", "theme_cols", "theme_imgs",
         "theme_regen_btns", "theme_remove_btns",
-        kind="theme", expected=n_expected if show else 0,
+        kind="theme", expected=n_expected,
     )
 
 
@@ -1281,6 +1390,7 @@ def _thumb_panel_updates(paths: Optional[List[str]] = None) -> List[Any]:
       - line queued → thumbnails_qued_for_generation.jpg
       - expected but missing → thumbnails_no_image.jpg
     """
+    _refresh_line_section_map()
     n_lines = _lyrics_line_count_expected()
     per = _lyrics_per_line_count()
     pages = max(1, per)
@@ -1297,6 +1407,10 @@ def _thumb_panel_updates(paths: Optional[List[str]] = None) -> List[Any]:
     page_items = _lyrics_page_slice(n_lines=n_lines, per=per, page=page)
     expected = min(len(page_items), THUMB_SLOTS)
     show_section = _lyrics_section_should_show(paths)
+    # New project / no lyric lines yet: still show one No Image placeholder slot
+    if expected <= 0 and show_section:
+        expected = 1
+        page_items = [(1, 1)]
 
     busy_raw = configure.APP_STATE.get("regen_busy_lines") or []
     busy: set = set()
@@ -1328,7 +1442,18 @@ def _thumb_panel_updates(paths: Optional[List[str]] = None) -> List[Any]:
     que_img = _placeholder_thumb("queued") or no_img
     gen_img = _placeholder_thumb("generating") or no_img
     th = _thumb_size_px()
-    n_rows = len(_gen.get("thumb_rows") or []) or max(1, (THUMB_SLOTS + THUMB_COLS - 1) // THUMB_COLS)
+    per_row = _lyrics_thumbs_per_row()
+    n_rows = len(_gen.get("thumb_rows") or []) or max(1, (THUMB_SLOTS + THUMB_COLS_MAX - 1) // THUMB_COLS_MAX)
+
+    # Map logical still index → physical component index (row-major at THUMB_COLS_MAX)
+    # Logical layout uses per_row; trailing cells in each physical row stay hidden.
+    def _phys(logical: int) -> int:
+        return (logical // per_row) * THUMB_COLS_MAX + (logical % per_row)
+
+    # Which physical indices hold a still on this page
+    phys_active: Dict[int, int] = {}  # phys_idx → logical idx
+    for logical in range(expected if show_section else 0):
+        phys_active[_phys(logical)] = logical
 
     show_pages = bool(show_section and per > 1)
     choices = _lyrics_page_choices()
@@ -1340,22 +1465,22 @@ def _thumb_panel_updates(paths: Optional[List[str]] = None) -> List[Any]:
             value=_lyrics_page_label(page) if show_pages else None,
         ),
     ]
+    n_logical_rows = (expected + per_row - 1) // per_row if expected > 0 else 0
     for r in range(n_rows):
-        row_start = r * THUMB_COLS
-        row_has = show_section and row_start < expected
+        row_has = show_section and r < n_logical_rows
         updates.append(gr.update(visible=row_has))
 
     for i in range(THUMB_SLOTS):
-        if not show_section or i >= expected:
+        logical = phys_active.get(i)
+        if logical is None:
             updates.append(gr.update(visible=False))
             updates.append(gr.update(value=None))
             updates.append(gr.update(visible=False, value="Regenerate"))
             updates.append(gr.update(visible=False))
             continue
 
-        line_no, var = page_items[i]
+        line_no, var = page_items[logical]
         real = by_key.get((line_no, var))
-        # L1 legacy files may be stored as variant 1 without the -1- infix
         if not real and per == 1:
             real = by_key.get((line_no, 1)) or _line_path_map(paths, variant=0).get(line_no)
         is_busy = (line_no in busy) or ((line_no, var) in busy_keys)
@@ -1369,7 +1494,8 @@ def _thumb_panel_updates(paths: Optional[List[str]] = None) -> List[Any]:
         else:
             value = no_img
 
-        updates.append(gr.update(visible=True))
+        classes = _section_slot_classes(line_no)
+        updates.append(gr.update(visible=True, elem_classes=classes))
         updates.append(gr.update(value=value, height=th))
         can_regen = not is_busy and not is_queued
         can_remove = bool(real) and not is_busy
@@ -1380,6 +1506,98 @@ def _thumb_panel_updates(paths: Optional[List[str]] = None) -> List[Any]:
         ))
         updates.append(gr.update(visible=True, interactive=can_remove))
     return updates
+
+
+def _project_total_image_count(project_dir: str = "") -> int:
+    """Cover + Theme + Lyrics stills on disk for the active project."""
+    folder = _project_folder(project_dir)
+    if not folder or not Path(folder).is_dir():
+        return 0
+    return (
+        len(_list_cover_images(folder))
+        + len(_list_theme_images(folder))
+        + len(_list_project_images(folder))
+    )
+
+
+def _maybe_auto_thumbs_tab() -> Any:
+    """
+    When the first still of any type is written during an active generation,
+    switch the main tab to Thumbnails (once per project run).
+    """
+    if configure.APP_STATE.get("thumbs_tab_auto_opened"):
+        return gr.update()
+    if not configure.APP_STATE.get("generating"):
+        return gr.update()
+    n = _project_total_image_count()
+    if n < 1:
+        return gr.update()
+    configure.APP_STATE["thumbs_tab_auto_opened"] = True
+    return gr.update(selected="thumbnails")
+
+
+def _reset_thumbs_tab_flag() -> None:
+    configure.APP_STATE["thumbs_tab_auto_opened"] = False
+
+
+def _refresh_session_slots(active_id: str = "", expanded: bool = None):
+    """
+    Return updates for all session slot rows + id list + Start New visibility.
+    Compact (expanded=False): numbered buttons only, no Delete / Delete All,
+    Start New label = "New". Expanded: full labels, Delete visible, heading on.
+    """
+    if expanded is None:
+        expanded = bool(configure.APP_STATE.get("sessions_sidebar_expanded", True))
+    sessions = configure.list_sessions()
+    ids = [s["id"] for s in sessions]
+    row_updates = []
+    sel_updates = []
+    del_updates = []
+    for i in range(_MAX_SESSION_SLOTS):
+        if i < len(sessions):
+            s = sessions[i]
+            label = _session_row_label(s, expanded=expanded, index=i)
+            is_active = (s["id"] == active_id)
+            if is_active and expanded:
+                label = f"▶ {label}"
+            elif is_active and not expanded:
+                label = f"•{i + 1}"
+            row_updates.append(gr.update(visible=True))
+            sel_updates.append(gr.update(value=label, visible=True))
+            # Delete only when expanded — also collapse scale so it takes no space
+            if expanded:
+                del_updates.append(gr.update(visible=True, scale=1, min_width=64))
+            else:
+                del_updates.append(gr.update(visible=False, scale=0, min_width=0))
+        else:
+            row_updates.append(gr.update(visible=False))
+            sel_updates.append(gr.update(value="", visible=False))
+            del_updates.append(gr.update(visible=False, scale=0, min_width=0))
+    show_new = bool(active_id) or configure.APP_STATE.get("session_status") in (
+        "stopped", "done",
+    )
+    start_new = gr.update(
+        visible=show_new,
+        value="Start New Session" if expanded else "New",
+    )
+    heading = gr.update(value="**Session Slots**" if expanded else "")
+    delete_all = gr.update(visible=bool(expanded))
+    return (
+        [ids]
+        + row_updates
+        + sel_updates
+        + del_updates
+        + [start_new, heading, delete_all]
+    )
+
+
+def _gallery_sessions_tab(sid: str = "", lyric_paths: Optional[List[str]] = None, folder: str = ""):
+    """Gallery updates + session sidebar + optional auto-switch to Thumbnails."""
+    return (
+        tuple(_all_gallery_updates(folder, lyric_paths))
+        + tuple(_refresh_session_slots(sid or ""))
+        + (_maybe_auto_thumbs_tab(),)
+    )
 
 
 def _all_gallery_updates(project_dir: str = "", lyric_paths: Optional[List[str]] = None) -> List[Any]:
@@ -1485,6 +1703,7 @@ def _build_create_tab() -> None:
     configure.APP_STATE["session_status"] = "idle"
     configure.APP_STATE["current_project_folder"] = ""
     configure.APP_STATE["generation_output_paths"] = []
+    _reset_thumbs_tab_flag()
 
     # Outer row: collapsible sessions column | main generation column
     with gr.Row(elem_id="gen-outer-row"):
@@ -1813,13 +2032,26 @@ def _build_create_tab() -> None:
                     elem_id="stop-btn",
                 )
 
-        # Dynamic galleries: Cover / Theme / Lyrics — each hidden until images exist
-    th0 = _thumb_size_px()
 
-    def _build_simple_gallery(prefix: str, n_slots: int, title: str, elem_id: str):
-        """Cover / Theme gallery with Regenerate + Remove per slot (like Lyrics)."""
+    # Thumbnails live on the Thumbnails tab (_build_thumbnails_tab)
+
+def _build_thumbnails_tab() -> None:
+    """Cover / Theme / Lyrics galleries — always visible with No Image placeholders."""
+    th0 = _thumb_size_px()
+    no_img = _placeholder_thumb("no_image")
+    try:
+        freq_cover = max(1, int(configure.frequency_cover_count(_current_freq_label())))
+    except Exception:
+        freq_cover = 1
+    try:
+        freq_theme = max(1, int(configure.frequency_theme_count(_current_freq_label())))
+    except Exception:
+        freq_theme = 1
+
+    def _build_simple_gallery(prefix: str, n_slots: int, title: str, elem_id: str, initial_show: int):
+        """Cover / Theme gallery; panel always visible; initial_show slots get No Image."""
         with gr.Column(
-            visible=False,
+            visible=True,
             elem_id=elem_id,
             elem_classes=["materials-thumbs"],
         ) as panel:
@@ -1832,17 +2064,20 @@ def _build_create_tab() -> None:
             )
             cols, imgs, rows = [], [], []
             regen_btns, remove_btns = [], []
-            for row_i in range(0, n_slots, THUMB_COLS):
-                with gr.Row(visible=False, elem_classes=["thumb-row"]) as trow:
-                    for j in range(THUMB_COLS):
+            for row_i in range(0, n_slots, COVER_THEME_COLS):
+                row_visible = row_i < initial_show
+                with gr.Row(visible=row_visible, elem_classes=["thumb-row"]) as trow:
+                    for j in range(COVER_THEME_COLS):
+                        slot_i = row_i + j
+                        slot_vis = slot_i < initial_show
                         with gr.Column(
-                            visible=False,
+                            visible=slot_vis,
                             scale=1,
                             min_width=max(64, th0 // 2),
                             elem_classes=["thumb-slot"],
                         ) as col:
                             img = gr.Image(
-                                value=None,
+                                value=no_img if slot_vis else None,
                                 label=None,
                                 show_label=False,
                                 height=th0,
@@ -1852,7 +2087,7 @@ def _build_create_tab() -> None:
                             with gr.Row(elem_classes=["thumb-btn-row"]):
                                 btn = gr.Button(
                                     "Regenerate",
-                                    visible=False,
+                                    visible=slot_vis,
                                     size="sm",
                                     elem_classes=["thumb-regen-btn"],
                                     min_width=48,
@@ -1860,7 +2095,7 @@ def _build_create_tab() -> None:
                                 )
                                 rmv = gr.Button(
                                     "Remove",
-                                    visible=False,
+                                    visible=slot_vis,
                                     size="sm",
                                     variant="stop",
                                     elem_classes=["thumb-remove-btn"],
@@ -1872,6 +2107,13 @@ def _build_create_tab() -> None:
                             regen_btns.append(btn)
                             remove_btns.append(rmv)
                 rows.append(trow)
+            # Section action button (duplicate of Management generate control)
+            action_btn = gr.Button(
+                "Generate",
+                variant="primary",
+                visible=False,
+                elem_id=f"{prefix}-thumb-action-btn",
+            )
         _gen[f"{prefix}_panel"] = panel
         _gen[f"{prefix}_header"] = header
         _gen[f"{prefix}_cols"] = cols
@@ -1879,25 +2121,32 @@ def _build_create_tab() -> None:
         _gen[f"{prefix}_rows"] = rows
         _gen[f"{prefix}_regen_btns"] = regen_btns
         _gen[f"{prefix}_remove_btns"] = remove_btns
-        return header
+        _gen[f"{prefix}_action_btn"] = action_btn
+        return action_btn
 
-    _build_simple_gallery("cover", COVER_SLOTS, "Cover Thumbnails", "cover-gallery")
-    _build_simple_gallery("theme", THEME_SLOTS, "Theme Thumbnails", "theme-gallery")
+    cover_action = _build_simple_gallery(
+        "cover", COVER_SLOTS, "Cover Images", "cover-gallery", freq_cover,
+    )
+    theme_action = _build_simple_gallery(
+        "theme", THEME_SLOTS, "Theme Images", "theme-gallery", freq_theme,
+    )
+    # Map convenience keys used by action updates
+    _gen["thumb_cover_btn"] = cover_action
+    _gen["thumb_theme_btn"] = theme_action
 
+    # Lyrics gallery — always visible; one No Image slot until lines are known
     with gr.Column(
-        visible=False,
+        visible=True,
         elem_id="materials-gallery",
         elem_classes=["materials-thumbs"],
     ) as _thumbs_panel:
         _gen["open_materials_folder"] = gr.Button(
-            "Lyrics Thumbnails",
+            "Lyrics Images",
             variant="secondary",
             elem_id="materials-thumbs-header",
             elem_classes=["materials-thumbs-heading"],
             size="sm",
         )
-        # Page switcher for L2/L3 (one still set per lyric line per page).
-        # Hidden when Image Frequency is L1.
         _gen["lyrics_page_radio"] = gr.Radio(
             choices=_lyrics_page_choices(),
             value=_lyrics_page_label(),
@@ -1912,17 +2161,20 @@ def _build_create_tab() -> None:
         _gen["thumb_btns"] = []
         _gen["thumb_remove_btns"] = []
         _gen["thumb_rows"] = []
-        for row_i in range(0, THUMB_SLOTS, THUMB_COLS):
-            with gr.Row(visible=False, elem_classes=["thumb-row"]) as trow:
-                for j in range(THUMB_COLS):
+        for row_i in range(0, THUMB_SLOTS, THUMB_COLS_MAX):
+            row_visible = row_i == 0  # first row only until real line count known
+            with gr.Row(visible=row_visible, elem_classes=["thumb-row"]) as trow:
+                for j in range(THUMB_COLS_MAX):
+                    slot_i = row_i + j
+                    slot_vis = slot_i == 0
                     with gr.Column(
-                        visible=False,
+                        visible=slot_vis,
                         scale=1,
                         min_width=max(64, th0 // 2),
                         elem_classes=["thumb-slot"],
                     ) as col:
                         img = gr.Image(
-                            value=None,
+                            value=no_img if slot_vis else None,
                             label=None,
                             show_label=False,
                             height=th0,
@@ -1932,7 +2184,7 @@ def _build_create_tab() -> None:
                         with gr.Row(elem_classes=["thumb-btn-row"]):
                             btn = gr.Button(
                                 "Regenerate",
-                                visible=False,
+                                visible=slot_vis,
                                 size="sm",
                                 elem_classes=["thumb-regen-btn"],
                                 min_width=48,
@@ -1940,7 +2192,7 @@ def _build_create_tab() -> None:
                             )
                             rmv = gr.Button(
                                 "Remove",
-                                visible=False,
+                                visible=slot_vis,
                                 size="sm",
                                 variant="stop",
                                 elem_classes=["thumb-remove-btn"],
@@ -1952,6 +2204,12 @@ def _build_create_tab() -> None:
                         _gen["thumb_btns"].append(btn)
                         _gen["thumb_remove_btns"].append(rmv)
             _gen["thumb_rows"].append(trow)
+        _gen["thumb_run_btn"] = gr.Button(
+            "Generate Lyrics Images",
+            variant="primary",
+            visible=False,
+            elem_id="lyrics-thumb-action-btn",
+        )
 
 
 
@@ -2341,12 +2599,7 @@ def _wire_create_events(status_box) -> None:
             ],
             outputs=[
                 status_box,
-                _gen["assess_btn"],
-                _gen["all_assets_btn"],
-                _gen["cover_btn"],
-                _gen["theme_btn"],
-                _gen["run_btn"],
-                _gen["stop_btn"],
+                *_action_btn_components(),
             ],
         )
     if _gen.get("reload_assessment_btn") is not None:
@@ -2356,38 +2609,25 @@ def _wire_create_events(status_box) -> None:
             outputs=[
                 _gen["assessment_view"],
                 status_box,
-                _gen["assess_btn"],
-                _gen["all_assets_btn"],
-                _gen["cover_btn"],
-                _gen["theme_btn"],
-                _gen["run_btn"],
-                _gen["stop_btn"],
+                *_action_btn_components(),
             ],
         )
 
     def _ready_change(lyrics, song_name):
-        assess_u, all_u, cover_u, theme_u, lyrics_u, stop_u = _action_btn_updates(
-            lyrics, song_name, running=False
-        )
-        return assess_u, all_u, cover_u, theme_u, lyrics_u
+        # Return all 9 action updates (stop stays hidden; thumb copies included)
+        return _action_btn_updates(lyrics, song_name, running=False)
 
     for _evt in ("change", "input", "blur"):
         try:
             getattr(_gen["lyrics"], _evt)(
                 _ready_change,
                 inputs=[_gen["lyrics"], _gen["song_name"]],
-                outputs=[
-                    _gen["assess_btn"], _gen["all_assets_btn"],
-                    _gen["cover_btn"], _gen["theme_btn"], _gen["run_btn"],
-                ],
+                outputs=_action_btn_components(),
             )
             getattr(_gen["song_name"], _evt)(
                 _ready_change,
                 inputs=[_gen["lyrics"], _gen["song_name"]],
-                outputs=[
-                    _gen["assess_btn"], _gen["all_assets_btn"],
-                    _gen["cover_btn"], _gen["theme_btn"], _gen["run_btn"],
-                ],
+                outputs=_action_btn_components(),
             )
         except Exception:
             pass
@@ -2427,55 +2667,7 @@ def _wire_create_events(status_box) -> None:
 
 
     # ── Session sidebar helpers ─────────────────────────────────────────
-    def _refresh_session_slots(active_id: str = "", expanded: bool = None):
-        """
-        Return updates for all session slot rows + id list + Start New visibility.
-        Compact (expanded=False): numbered buttons only, no Delete / Delete All,
-        Start New label = "New". Expanded: full labels, Delete visible, heading on.
-        """
-        if expanded is None:
-            expanded = bool(configure.APP_STATE.get("sessions_sidebar_expanded", True))
-        sessions = configure.list_sessions()
-        ids = [s["id"] for s in sessions]
-        row_updates = []
-        sel_updates = []
-        del_updates = []
-        for i in range(_MAX_SESSION_SLOTS):
-            if i < len(sessions):
-                s = sessions[i]
-                label = _session_row_label(s, expanded=expanded, index=i)
-                is_active = (s["id"] == active_id)
-                if is_active and expanded:
-                    label = f"▶ {label}"
-                elif is_active and not expanded:
-                    label = f"•{i + 1}"
-                row_updates.append(gr.update(visible=True))
-                sel_updates.append(gr.update(value=label, visible=True))
-                # Delete only when expanded — also collapse scale so it takes no space
-                if expanded:
-                    del_updates.append(gr.update(visible=True, scale=1, min_width=64))
-                else:
-                    del_updates.append(gr.update(visible=False, scale=0, min_width=0))
-            else:
-                row_updates.append(gr.update(visible=False))
-                sel_updates.append(gr.update(value="", visible=False))
-                del_updates.append(gr.update(visible=False, scale=0, min_width=0))
-        show_new = bool(active_id) or configure.APP_STATE.get("session_status") in (
-            "stopped", "done",
-        )
-        start_new = gr.update(
-            visible=show_new,
-            value="Start New Session" if expanded else "New",
-        )
-        heading = gr.update(value="**Session Slots**" if expanded else "")
-        delete_all = gr.update(visible=bool(expanded))
-        return (
-            [ids]
-            + row_updates
-            + sel_updates
-            + del_updates
-            + [start_new, heading, delete_all]
-        )
+    # _refresh_session_slots is defined at module level (shared with _gallery_sessions_tab).
 
     _session_refresh_outputs = (
         [_gen["session_ids"]]
@@ -2525,12 +2717,7 @@ def _wire_create_events(status_box) -> None:
             _gen["negative_prompt"],
             status_box,
             _gen["active_session_id"],
-            _gen["assess_btn"],
-            _gen["all_assets_btn"],
-            _gen["cover_btn"],
-            _gen["theme_btn"],
-            _gen["run_btn"],
-            _gen["stop_btn"],
+            *_action_btn_components(),
         ]
         # Optional controls — only when present so counts stay matched
         for key in (
@@ -2581,7 +2768,7 @@ def _wire_create_events(status_box) -> None:
             if negative is None
             else negative
         )
-        assess_u, all_u, cover_u, theme_u, lyrics_u, stop_u = _action_btn_updates(
+        btn_updates = _action_btn_updates(
             lyrics or "", song or "", running=running
         )
         main = [
@@ -2595,12 +2782,7 @@ def _wire_create_events(status_box) -> None:
             gr.update(value=neg),
             status or "",
             sid or "",
-            assess_u,
-            all_u,
-            cover_u,
-            theme_u,
-            lyrics_u,
-            stop_u,
+            *btn_updates,
         ]
         g = configure.load_generation()
         extras = {
@@ -2718,14 +2900,14 @@ def _wire_create_events(status_box) -> None:
             running=False,
         )
         refresh = _refresh_session_slots(sid)
-        return form + tuple(_all_gallery_updates(lyric_paths=list(imgs))) + tuple(refresh)
+        return form + tuple(_all_gallery_updates(lyric_paths=list(imgs))) + tuple(refresh) + (gr.update(),)
 
     # Wire each select button with its index
     for i, btn in enumerate(_gen["session_select_btns"]):
         btn.click(
             lambda sid_list, i=i: _select_session(i, sid_list or []),
             inputs=[_gen["session_ids"]],
-            outputs=_session_form_outputs() + _thumb_panel_outputs() + _session_refresh_outputs,
+            outputs=_session_form_outputs() + _thumb_panel_outputs() + _session_refresh_outputs + [_gen["main_tabs"]],
         )
 
     def _delete_one(idx: int, session_ids: list, active_id: str):
@@ -2765,13 +2947,12 @@ def _wire_create_events(status_box) -> None:
             negative=configure.DEFAULT_NEGATIVE_PROMPT,
             running=False,
         )
-        return form + tuple(_all_gallery_updates(lyric_paths=[])) + tuple(
-            _refresh_session_slots("")
-        )
+        _reset_thumbs_tab_flag()
+        return form + tuple(_all_gallery_updates(lyric_paths=[])) + tuple(_refresh_session_slots("")) + (gr.update(),)
 
     _gen["start_new_session"].click(
         _start_new,
-        outputs=_session_form_outputs() + _thumb_panel_outputs() + _session_refresh_outputs,
+        outputs=_session_form_outputs() + _thumb_panel_outputs() + _session_refresh_outputs + [_gen["main_tabs"]],
     )
 
     def _ask_delete_all():
@@ -2798,9 +2979,7 @@ def _wire_create_events(status_box) -> None:
                 gr.update(visible=True),
                 "Tick the confirm box first.",
                 gr.update(),
-            ) + tuple(_all_gallery_updates()) + tuple(
-                _refresh_session_slots(configure.APP_STATE.get("active_session_id") or "")
-            )
+            ) + _gallery_sessions_tab(configure.APP_STATE.get("active_session_id") or "")
         n = configure.delete_all_sessions()
         configure.APP_STATE["generation_output_paths"] = []
         return (
@@ -2809,7 +2988,7 @@ def _wire_create_events(status_box) -> None:
             gr.update(visible=False),
             f"Deleted {n} session(s).",
             "",
-        ) + tuple(_all_gallery_updates(lyric_paths=[])) + tuple(_refresh_session_slots(""))
+        ) + _gallery_sessions_tab("", lyric_paths=[])
 
     _gen["delete_all_sessions"].click(
         _ask_delete_all,
@@ -2838,7 +3017,7 @@ def _wire_create_events(status_box) -> None:
             _gen["cancel_delete_all_btn"],
             status_box,
             _gen["active_session_id"],
-        ] + _thumb_panel_outputs() + _session_refresh_outputs,
+        ] + _thumb_panel_outputs() + _session_refresh_outputs + [_gen["main_tabs"]],
     )
 
     # Initial populate of session list when tab is built is handled at app load
@@ -2855,11 +3034,9 @@ def _wire_create_events(status_box) -> None:
         if not _can_create(lyrics, song_name):
             yield (
                 "Song name, lyrics, and models are required — fill the song name "
-                "and configure Encoder + Diffuser paths.",
+                "and configure Thinking + Diffuser paths.",
                 *idle_btns, active_session_id or "",
-            ) + tuple(_all_gallery_updates()) + tuple(
-                _refresh_session_slots(active_session_id or "")
-            )
+            ) + _gallery_sessions_tab(active_session_id or "")
             return
 
         c = _cfg()
@@ -2935,9 +3112,7 @@ def _wire_create_events(status_box) -> None:
         yield (
             _status_plain("[  0%] start  Starting lyrics slideshow pipeline…"),
             *run_btns, active_session_id or "",
-        ) + tuple(_all_gallery_updates()) + tuple(
-            _refresh_session_slots(active_session_id or "")
-        )
+        ) + _gallery_sessions_tab(active_session_id or "")
 
         prog_q: queue.Queue = queue.Queue()
         result_holder: Dict[str, Any] = {}
@@ -3033,7 +3208,7 @@ def _wire_create_events(status_box) -> None:
                 yield (
                     status_line,
                     *run_btns, sid,
-                ) + tuple(_all_gallery_updates(lyric_paths=paths)) + tuple(_refresh_session_slots(sid))
+                ) + _gallery_sessions_tab(sid, lyric_paths=paths)
                 last_yield = time.time()
             else:
                 time.sleep(0.15)
@@ -3079,7 +3254,7 @@ def _wire_create_events(status_box) -> None:
                 msg = f"{msg}  Processing {len(q)} queued regenerate(s)…"
                 yield (
                     msg, *idle_btns, sid,
-                ) + tuple(_all_gallery_updates(lyric_paths=paths)) + tuple(_refresh_session_slots(sid))
+                ) + _gallery_sessions_tab(sid, lyric_paths=paths)
             for job in q:
                 if inference.is_cancel_requested():
                     break
@@ -3120,12 +3295,12 @@ def _wire_create_events(status_box) -> None:
                     yield (
                         f"Regenerated still {line_idx + 1} variant {var}.",
                         *idle_btns, sid,
-                    ) + tuple(_all_gallery_updates(lyric_paths=paths)) + tuple(_refresh_session_slots(sid))
+                    ) + _gallery_sessions_tab(sid, lyric_paths=paths)
                 except Exception as e:
                     yield (
                         f"Queued regenerate line {line_idx + 1} failed: {e}",
                         *idle_btns, sid,
-                    ) + tuple(_all_gallery_updates(lyric_paths=paths)) + tuple(_refresh_session_slots(sid))
+                    ) + _gallery_sessions_tab(sid, lyric_paths=paths)
                 finally:
                     configure.APP_STATE["generating"] = False
 
@@ -3137,18 +3312,13 @@ def _wire_create_events(status_box) -> None:
         yield (
             msg,
             *idle_btns, sid,
-        ) + tuple(_all_gallery_updates(lyric_paths=paths)) + tuple(_refresh_session_slots(sid))
+        ) + _gallery_sessions_tab(sid, lyric_paths=paths)
 
     _run_outputs = [
         status_box,
-        _gen["assess_btn"],
-        _gen["all_assets_btn"],
-        _gen["cover_btn"],
-        _gen["theme_btn"],
-        _gen["run_btn"],
-        _gen["stop_btn"],
+        *_action_btn_components(),
         _gen["active_session_id"],
-    ] + _thumb_panel_outputs() + _session_refresh_outputs
+    ] + _thumb_panel_outputs() + _session_refresh_outputs + [_gen["main_tabs"]]
 
     def _shared_gen_inputs():
         return [
@@ -3246,9 +3416,7 @@ def _wire_create_events(status_box) -> None:
             pad_status,
             *_action_btn_updates(lyrics or "", song_name or "", running=False),
             active_session_id or "",
-        ) + tuple(_all_gallery_updates()) + tuple(
-            _refresh_session_slots(active_session_id or "")
-        )
+        ) + _gallery_sessions_tab(active_session_id or "")
 
     if _gen.get("image_frequency") is not None:
         _gen["image_frequency"].change(
@@ -3261,14 +3429,9 @@ def _wire_create_events(status_box) -> None:
             ],
             outputs=[
                 status_box,
-                _gen["assess_btn"],
-                _gen["all_assets_btn"],
-                _gen["cover_btn"],
-                _gen["theme_btn"],
-                _gen["run_btn"],
-                _gen["stop_btn"],
+                *_action_btn_components(),
                 _gen["active_session_id"],
-            ] + _thumb_panel_outputs() + _session_refresh_outputs,
+            ] + _thumb_panel_outputs() + _session_refresh_outputs + [_gen["main_tabs"]],
         )
 
     def _on_lyrics_page_change(page_label, active_session_id):
@@ -3281,9 +3444,7 @@ def _wire_create_events(status_box) -> None:
             f"Showing lyrics stills — {_lyrics_page_label(page)} "
             f"(of {_lyrics_per_line_count()}).",
             active_session_id or "",
-        ) + tuple(_all_gallery_updates()) + tuple(
-            _refresh_session_slots(active_session_id or "")
-        )
+        ) + _gallery_sessions_tab(active_session_id or "")
 
     if _gen.get("lyrics_page_radio") is not None:
         _gen["lyrics_page_radio"].change(
@@ -3292,7 +3453,7 @@ def _wire_create_events(status_box) -> None:
             outputs=[
                 status_box,
                 _gen["active_session_id"],
-            ] + _thumb_panel_outputs() + _session_refresh_outputs,
+            ] + _thumb_panel_outputs() + _session_refresh_outputs + [_gen["main_tabs"]],
         )
 
     _gen["run_btn"].click(
@@ -3311,9 +3472,7 @@ def _wire_create_events(status_box) -> None:
             yield (
                 _status_plain("Song name and models are required for a cover image."),
                 *idle_btns, active_session_id or "",
-            ) + tuple(_all_gallery_updates()) + tuple(
-                _refresh_session_slots(active_session_id or "")
-            )
+            ) + _gallery_sessions_tab(active_session_id or "")
             return
         c = _cfg()
         cfg = dict(c)
@@ -3362,9 +3521,7 @@ def _wire_create_events(status_box) -> None:
         yield (
             _status_from_progress("Generating cover image…", 0.0, {"phase": "cover", "line": 1, "total": 1}),
             *run_btns, active_session_id or "",
-        ) + tuple(_all_gallery_updates()) + tuple(
-            _refresh_session_slots(active_session_id or "")
-        )
+        ) + _gallery_sessions_tab(active_session_id or "")
         prog_q: queue.Queue = queue.Queue()
         result_holder: Dict[str, Any] = {}
 
@@ -3413,7 +3570,7 @@ def _wire_create_events(status_box) -> None:
             sid = configure.APP_STATE.get("active_session_id") or active_session_id or ""
             yield (
                 status_line, *run_btns, sid,
-            ) + tuple(_all_gallery_updates()) + tuple(_refresh_session_slots(sid))
+            ) + _gallery_sessions_tab(sid)
         r = result_holder.get("r") or {}
         msg = r.get("message") or "Cover done."
         sid = r.get("session_id") or configure.APP_STATE.get("active_session_id") or active_session_id or ""
@@ -3423,7 +3580,7 @@ def _wire_create_events(status_box) -> None:
         idle_btns = _action_btn_updates(lyrics, song_name, running=False)
         yield (
             _status_plain(msg), *idle_btns, sid,
-        ) + tuple(_all_gallery_updates()) + tuple(_refresh_session_slots(sid))
+        ) + _gallery_sessions_tab(sid)
 
     def _run_theme(
         lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale, ref_image, hair_style, outfit_worn, negative_prompt, active_session_id,
@@ -3435,9 +3592,7 @@ def _wire_create_events(status_box) -> None:
             yield (
                 _status_plain("Song name, lyrics, and models are required for theme images."),
                 *idle_btns, active_session_id or "",
-            ) + tuple(_all_gallery_updates()) + tuple(
-                _refresh_session_slots(active_session_id or "")
-            )
+            ) + _gallery_sessions_tab(active_session_id or "")
             return
         c = _cfg()
         cfg = dict(c)
@@ -3491,9 +3646,7 @@ def _wire_create_events(status_box) -> None:
                 {"phase": "theme"},
             ),
             *run_btns, active_session_id or "",
-        ) + tuple(_all_gallery_updates()) + tuple(
-            _refresh_session_slots(active_session_id or "")
-        )
+        ) + _gallery_sessions_tab(active_session_id or "")
         prog_q: queue.Queue = queue.Queue()
         result_holder: Dict[str, Any] = {}
 
@@ -3539,7 +3692,7 @@ def _wire_create_events(status_box) -> None:
             sid = configure.APP_STATE.get("active_session_id") or active_session_id or ""
             yield (
                 status_line, *run_btns, sid,
-            ) + tuple(_all_gallery_updates()) + tuple(_refresh_session_slots(sid))
+            ) + _gallery_sessions_tab(sid)
         r = result_holder.get("r") or {}
         msg = r.get("message") or "Theme images done."
         sid = r.get("session_id") or configure.APP_STATE.get("active_session_id") or active_session_id or ""
@@ -3549,7 +3702,7 @@ def _wire_create_events(status_box) -> None:
         idle_btns = _action_btn_updates(lyrics, song_name, running=False)
         yield (
             _status_plain(msg), *idle_btns, sid,
-        ) + tuple(_all_gallery_updates()) + tuple(_refresh_session_slots(sid))
+        ) + _gallery_sessions_tab(sid)
 
 
     def _run_assessment(
@@ -3563,15 +3716,15 @@ def _wire_create_events(status_box) -> None:
         _no_mode = (gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update())
         if not _models_configured():
             yield (
-                _status_plain("Configure Encoder + Diffuser models on the Configuration tab first."),
+                _status_plain("Configure Thinking + Diffuser models on the Configuration tab first."),
                 *idle_btns, active_session_id or "",
-            ) + tuple(_all_gallery_updates()) + tuple(_refresh_session_slots(active_session_id or "")) + _no_mode
+            ) + _gallery_sessions_tab(active_session_id or "") + _no_mode
             return
         if not (song_name or "").strip() or not (lyrics or "").strip():
             yield (
                 _status_plain("Song name and lyrics are required to run assessment."),
                 *idle_btns, active_session_id or "",
-            ) + tuple(_all_gallery_updates()) + tuple(_refresh_session_slots(active_session_id or "")) + _no_mode
+            ) + _gallery_sessions_tab(active_session_id or "") + _no_mode
             return
 
         configure.APP_STATE["generating"] = True
@@ -3579,7 +3732,7 @@ def _wire_create_events(status_box) -> None:
         yield (
             _status_plain("Running song assessment…"),
             *run_btns, active_session_id or "",
-        ) + tuple(_all_gallery_updates()) + tuple(_refresh_session_slots(active_session_id or "")) + _no_mode
+        ) + _gallery_sessions_tab(active_session_id or "") + _no_mode
 
         import queue
         import threading
@@ -3666,7 +3819,7 @@ def _wire_create_events(status_box) -> None:
             status_line, frac, info = item
             yield (
                 status_line, *run_btns, active_session_id or "",
-            ) + tuple(_all_gallery_updates()) + tuple(_refresh_session_slots(active_session_id or "")) + _no_mode
+            ) + _gallery_sessions_tab(active_session_id or "") + _no_mode
 
         th.join(timeout=5)
         configure.APP_STATE["generating"] = False
@@ -3684,7 +3837,7 @@ def _wire_create_events(status_box) -> None:
         )
         yield (
             _status_plain(msg), *idle_btns, sid,
-        ) + tuple(_all_gallery_updates()) + tuple(_refresh_session_slots(sid)) + (
+        ) + _gallery_sessions_tab(sid) + (
             gr.update(value="Song Assessment"),
             gr.update(visible=False),  # Project Settings
             gr.update(visible=False),  # Name and Lyrics
@@ -3721,21 +3874,21 @@ def _wire_create_events(status_box) -> None:
         run_btns = _action_btn_updates(lyrics, song_name, running=True)
         if not _models_configured():
             yield (
-                _status_plain("Configure Encoder + Diffuser models on the Configuration tab first."),
+                _status_plain("Configure Thinking + Diffuser models on the Configuration tab first."),
                 *idle_btns, active_session_id or "",
-            ) + tuple(_all_gallery_updates()) + tuple(_refresh_session_slots(active_session_id or ""))
+            ) + _gallery_sessions_tab(active_session_id or "")
             return
         if not _assessment_exists():
             yield (
                 _status_plain("Run Assessment first, then Generate All Assets."),
                 *idle_btns, active_session_id or "",
-            ) + tuple(_all_gallery_updates()) + tuple(_refresh_session_slots(active_session_id or ""))
+            ) + _gallery_sessions_tab(active_session_id or "")
             return
         if not (song_name or "").strip():
             yield (
                 _status_plain("Song name is required."),
                 *idle_btns, active_session_id or "",
-            ) + tuple(_all_gallery_updates()) + tuple(_refresh_session_slots(active_session_id or ""))
+            ) + _gallery_sessions_tab(active_session_id or "")
             return
 
         configure.APP_STATE["generating"] = True
@@ -3745,7 +3898,7 @@ def _wire_create_events(status_box) -> None:
         yield (
             _status_plain(f"{label}…"),
             *run_btns, active_session_id or "",
-        ) + tuple(_all_gallery_updates()) + tuple(_refresh_session_slots(active_session_id or ""))
+        ) + _gallery_sessions_tab(active_session_id or "")
 
         # Persist generation settings
         freq = configure.normalize_image_frequency(image_frequency)
@@ -3791,7 +3944,7 @@ def _wire_create_events(status_box) -> None:
             yield (
                 _status_plain(f"Cleared {n_del} existing asset(s) — regenerating…"),
                 *run_btns, active_session_id or "",
-            ) + tuple(_all_gallery_updates()) + tuple(_refresh_session_slots(active_session_id or ""))
+            ) + _gallery_sessions_tab(active_session_id or "")
 
         import queue
         import threading
@@ -3875,7 +4028,7 @@ def _wire_create_events(status_box) -> None:
             sid = configure.APP_STATE.get("active_session_id") or active_session_id or ""
             yield (
                 status_line, *run_btns, sid,
-            ) + tuple(_all_gallery_updates()) + tuple(_refresh_session_slots(sid))
+            ) + _gallery_sessions_tab(sid)
 
         th.join(timeout=5)
         configure.APP_STATE["generating"] = False
@@ -3889,7 +4042,7 @@ def _wire_create_events(status_box) -> None:
         idle_btns = _action_btn_updates(lyrics, song_name, running=False)
         yield (
             _status_plain(msg), *idle_btns, sid,
-        ) + tuple(_all_gallery_updates()) + tuple(_refresh_session_slots(sid))
+        ) + _gallery_sessions_tab(sid)
 
     _gen["all_assets_btn"].click(
         _run_all_assets,
@@ -3907,17 +4060,41 @@ def _wire_create_events(status_box) -> None:
         inputs=_shared_gen_inputs(),
         outputs=_run_outputs,
     )
+    # Thumbnails-tab per-section duplicates
+    if _gen.get("thumb_cover_btn") is not None:
+        _gen["thumb_cover_btn"].click(
+            _run_cover,
+            inputs=_shared_gen_inputs(),
+            outputs=_run_outputs,
+        )
+    if _gen.get("thumb_theme_btn") is not None:
+        _gen["thumb_theme_btn"].click(
+            _run_theme,
+            inputs=_shared_gen_inputs(),
+            outputs=_run_outputs,
+        )
+    if _gen.get("thumb_run_btn") is not None:
+        _gen["thumb_run_btn"].click(
+            _run,
+            inputs=_shared_gen_inputs(),
+            outputs=_run_outputs,
+        )
 
 
     def _resolve_line_from_slot(line_idx: int, paths: list = None):
-        """Map thumbnail slot → (0-based line index, 1-based variant) on the current page.
+        """Map physical thumbnail component index → (0-based line, variant).
 
-        File order on disk / in the grid:
-          001-1, 001-2, 001-3, 002-1, …  (paged into Page 1…L)
+        Physical grid is THUMB_COLS_MAX-wide; logical order uses lyrics_thumbs_per_row.
         """
         if line_idx < 0 or line_idx >= THUMB_SLOTS:
             return None
-        mapped = _slot_to_line_variant(line_idx)
+        per_row = _lyrics_thumbs_per_row()
+        row = line_idx // THUMB_COLS_MAX
+        col = line_idx % THUMB_COLS_MAX
+        if col >= per_row:
+            return None
+        logical = row * per_row + col
+        mapped = _slot_to_line_variant(logical)
         if mapped is None:
             return None
         line_no, var = mapped
@@ -3939,18 +4116,14 @@ def _wire_create_events(status_box) -> None:
             return (
                 "No active project folder.",
                 active_session_id or "",
-            ) + tuple(_all_gallery_updates(lyric_paths=paths)) + tuple(
-                _refresh_session_slots(active_session_id or "")
-            )
+            ) + _gallery_sessions_tab(active_session_id or "", lyric_paths=paths)
         paths = _list_project_images(proj)
         resolved = _resolve_line_from_slot(line_idx, paths)
         if resolved is None:
             return (
                 "Nothing to remove in that slot.",
                 active_session_id or "",
-            ) + tuple(_all_gallery_updates(lyric_paths=paths)) + tuple(
-                _refresh_session_slots(active_session_id or "")
-            )
+            ) + _gallery_sessions_tab(active_session_id or "", lyric_paths=paths)
         resolved_idx, target_var = resolved
         line_no = resolved_idx + 1
         per = _lyrics_per_line_count()
@@ -4005,9 +4178,7 @@ def _wire_create_events(status_box) -> None:
         return (
             msg,
             active_session_id or "",
-        ) + tuple(_all_gallery_updates(lyric_paths=paths)) + tuple(
-            _refresh_session_slots(active_session_id or "")
-        )
+        ) + _gallery_sessions_tab(active_session_id or "", lyric_paths=paths)
 
     def _do_regen(line_idx: int, image_size, image_frequency, steps, cfg_scale, ref_image, negative_prompt, active_session_id):
         """
@@ -4018,17 +4189,13 @@ def _wire_create_events(status_box) -> None:
         yield (
             f"Regenerate requested for still slot {int(line_idx) + 1}…",
             gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), active_session_id or "",
-        ) + tuple(_all_gallery_updates()) + tuple(
-            _refresh_session_slots(active_session_id or "")
-        )
+        ) + _gallery_sessions_tab(active_session_id or "")
 
         proj = (configure.APP_STATE.get("current_project_folder") or "").strip()
         empty = (
             "No active project folder — load a session or Generate first.",
             gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), active_session_id or "",
-        ) + tuple(_all_gallery_updates()) + tuple(
-            _refresh_session_slots(active_session_id or "")
-        )
+        ) + _gallery_sessions_tab(active_session_id or "")
         if not proj or not Path(proj).is_dir():
             yield empty
             return
@@ -4039,9 +4206,7 @@ def _wire_create_events(status_box) -> None:
             yield (
                 "That thumbnail slot is outside the current page.",
                 gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), active_session_id or "",
-            ) + tuple(_all_gallery_updates(lyric_paths=paths)) + tuple(
-                _refresh_session_slots(active_session_id or "")
-            )
+            ) + _gallery_sessions_tab(active_session_id or "", lyric_paths=paths)
             return
         resolved_idx, target_var = resolved
 
@@ -4058,9 +4223,7 @@ def _wire_create_events(status_box) -> None:
                 yield (
                     f"Still index {resolved_idx + 1} is out of range (1..{n_lines}).",
                     gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), active_session_id or "",
-                ) + tuple(_all_gallery_updates(lyric_paths=paths)) + tuple(
-                    _refresh_session_slots(active_session_id or "")
-                )
+                ) + _gallery_sessions_tab(active_session_id or "", lyric_paths=paths)
                 return
         except Exception:
             pass
@@ -4145,9 +4308,7 @@ def _wire_create_events(status_box) -> None:
             f"Queued regenerate for still {line_no}{var_bit}…",
             gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
             active_session_id or "",
-        ) + tuple(_all_gallery_updates()) + tuple(
-            _refresh_session_slots(active_session_id or "")
-        )
+        ) + _gallery_sessions_tab(active_session_id or "")
 
         # Poll until THIS line leaves queued + busy
         last_state = None
@@ -4189,9 +4350,7 @@ def _wire_create_events(status_box) -> None:
                     msg,
                     gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
                     active_session_id or "",
-                ) + tuple(_all_gallery_updates()) + tuple(
-                    _refresh_session_slots(active_session_id or "")
-                )
+                ) + _gallery_sessions_tab(active_session_id or "")
             if not mine_busy and not mine_queued:
                 break
             time.sleep(0.4)
@@ -4200,9 +4359,7 @@ def _wire_create_events(status_box) -> None:
                 f"Still {line_no} still running.",
                 gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
                 active_session_id or "",
-            ) + tuple(_all_gallery_updates()) + tuple(
-                _refresh_session_slots(active_session_id or "")
-            )
+            ) + _gallery_sessions_tab(active_session_id or "")
 
 
     def _do_remove_named(kind: str, slot_idx: int, active_session_id):
@@ -4214,9 +4371,7 @@ def _wire_create_events(status_box) -> None:
             return (
                 "Nothing to remove in that slot.",
                 active_session_id or "",
-            ) + tuple(_all_gallery_updates()) + tuple(
-                _refresh_session_slots(active_session_id or "")
-            )
+            ) + _gallery_sessions_tab(active_session_id or "")
         target = Path(path)
         try:
             if target.is_file():
@@ -4229,9 +4384,7 @@ def _wire_create_events(status_box) -> None:
         return (
             msg,
             active_session_id or "",
-        ) + tuple(_all_gallery_updates()) + tuple(
-            _refresh_session_slots(active_session_id or "")
-        )
+        ) + _gallery_sessions_tab(active_session_id or "")
 
     def _named_slot_key(kind: str, slot_idx: int) -> str:
         return f"{kind}:{int(slot_idx)}"
@@ -4342,9 +4495,7 @@ def _wire_create_events(status_box) -> None:
                 f"No {kind} image in that slot.",
                 *pad,
                 active_session_id or "",
-            ) + tuple(_all_gallery_updates()) + tuple(
-                _refresh_session_slots(active_session_id or "")
-            )
+            ) + _gallery_sessions_tab(active_session_id or "")
             return
 
         cfg = _build_named_cfg(image_size, steps, cfg_scale, negative_prompt)
@@ -4360,9 +4511,7 @@ def _wire_create_events(status_box) -> None:
             f"Queued {kind} slot {slot_idx + 1}…",
             *pad,
             active_session_id or "",
-        ) + tuple(_all_gallery_updates()) + tuple(
-            _refresh_session_slots(active_session_id or "")
-        )
+        ) + _gallery_sessions_tab(active_session_id or "")
 
         # Poll until THIS slot leaves queued+busy (worker may still be on others)
         last_state = None
@@ -4388,9 +4537,7 @@ def _wire_create_events(status_box) -> None:
                     msg,
                     *pad,
                     active_session_id or "",
-                ) + tuple(_all_gallery_updates()) + tuple(
-                    _refresh_session_slots(active_session_id or "")
-                )
+                ) + _gallery_sessions_tab(active_session_id or "")
             if not mine_busy and not mine_queued:
                 break
             time.sleep(0.4)
@@ -4399,25 +4546,18 @@ def _wire_create_events(status_box) -> None:
                 f"{kind} slot {slot_idx + 1} still running.",
                 *pad,
                 active_session_id or "",
-            ) + tuple(_all_gallery_updates()) + tuple(
-                _refresh_session_slots(active_session_id or "")
-            )
+            ) + _gallery_sessions_tab(active_session_id or "")
 
     _regen_outputs = [
         status_box,
-        _gen["assess_btn"],
-        _gen["all_assets_btn"],
-        _gen["cover_btn"],
-        _gen["theme_btn"],
-        _gen["run_btn"],
-        _gen["stop_btn"],
+        *_action_btn_components(),
         _gen["active_session_id"],
-    ] + _thumb_panel_outputs() + _session_refresh_outputs
+    ] + _thumb_panel_outputs() + _session_refresh_outputs + [_gen["main_tabs"]]
 
     _remove_outputs = [
         status_box,
         _gen["active_session_id"],
-    ] + _thumb_panel_outputs() + _session_refresh_outputs
+    ] + _thumb_panel_outputs() + _session_refresh_outputs + [_gen["main_tabs"]]
 
     # Wire each Regenerate / Remove button to ONE slot index only
     for i, btn in enumerate(_gen["thumb_btns"]):
@@ -4559,7 +4699,25 @@ def _build_config_tab() -> None:
     backends = configure.get_backend_choices()["all_choices"]
 
     def _backend_default(key: str) -> str:
-        v = cfg.get(key, "CPU")
+        """Resolve dropdown value with migration fallbacks."""
+        if key == "prompting_backend":
+            v = (
+                cfg.get("prompting_backend")
+                or cfg.get("thinking_backend")
+                or cfg.get("encoder_backend")
+                or "CPU"
+            )
+        elif key == "encoding_backend":
+            v = (
+                cfg.get("encoding_backend")
+                or cfg.get("encoder_backend")
+                or cfg.get("prompting_backend")
+                or cfg.get("thinking_backend")
+                or "CPU"
+            )
+        else:
+            v = cfg.get(key, "CPU")
+        v = (v or "CPU").strip()
         return v if v in backends else "CPU"
 
     def _path_or_empty(key: str) -> str:
@@ -4580,7 +4738,7 @@ def _build_config_tab() -> None:
             maximum=max(16, configure.get_cpu_info().get("cores_logical", 8)),
             step=1,
             value=int(cfg.get("worker_threads", configure.WORKER_THREADS_DEFAULT)),
-            info="Shared across Thinking, Encoder, and ImageGen. Cores 0–1 stay free for OS/UI.",
+            info="Shared across Thinking and ImageGen. Cores 0–1 stay free for OS/UI.",
         )
 
     gr.Markdown(
@@ -4589,57 +4747,51 @@ def _build_config_tab() -> None:
         "load mode / other settings**."
     )
 
-    # ── Three columns: Thinking | Encoder | ImageGen ────────────────────
+    # ── Two columns: Text Model (Thinking) | ImageGen ───────────────────
     with gr.Row(equal_height=False):
-        # —— Thinking (Prompts) ——
+        # —— Text Model (Thinking) — assessment, prompts, Flux --llm ——
         with gr.Column(scale=1):
-            gr.Markdown("#### Thinking (Prompts)")
-            _conf["thinking_backend"] = gr.Dropdown(
-                label="Backend",
+            gr.Markdown("#### Text Model (Thinking)")
+            gr.Markdown(
+                "One Qwen3-VL-4B **Thinking** GGUF for assessment, visual prompts, "
+                "and Flux.2 `--llm` encoding. "
+                "Prefer [Huihui-Thinking-abliterated](https://huggingface.co/mradermacher/Huihui-Qwen3-VL-4B-Thinking-abliterated-GGUF). "
+                "mmproj is auto-quarantined under `models/mmproj/`."
+            )
+            _conf["prompting_backend"] = gr.Dropdown(
+                label="Prompting Processing",
                 choices=backends,
-                value=_backend_default("thinking_backend"),
+                value=_backend_default("prompting_backend"),
+                info="Phase 1 — assessment + visual prompts (llama-completion). "
+                     "8GB: use your GPU here.",
+            )
+            _conf["encoding_backend"] = gr.Dropdown(
+                label="Encoding Processing",
+                choices=backends,
+                value=_backend_default("encoding_backend"),
+                info="Phase 2 — Qwen --llm / TE while Flux runs. "
+                     "8GB: set to CPU so Flux owns the GPU.",
             )
             _conf["thinking_path"] = gr.Textbox(
                 label="Model location",
-                value=_path_or_empty("thinking_model_path"),
-                placeholder=configure.MODEL_PATH_PLACEHOLDERS["thinking"],
+                value=_path_or_empty("thinking_model_path") or _path_or_empty("encoder_model_path"),
+                placeholder=configure.MODEL_PATH_PLACEHOLDERS.get(
+                    "thinking", configure.THINKING_MODEL_HINT
+                ),
                 lines=2,
             )
             _conf["browse_thinking"] = gr.Button("Browse", size="sm")
             _conf["thinking_load_mode"] = gr.Dropdown(
-                label="Prompts Load Mode",
+                label="Load Mode",
                 choices=configure.LOAD_MODE_CHOICES,
                 value=_load_default("thinking_load_mode", "text_load_mode"),
+                info="M-Lock = sequential unload between phases. "
+                     "On Windows the -lm mlock flag is omitted (binary crash); "
+                     "unload still happens when llama exits.",
             )
             _conf["thinking_gpu_layers"] = gr.Number(
                 label="GPU layers (−1 = auto)",
-                value=int(cfg.get("thinking_gpu_layers", cfg.get("text_gpu_layers", -1))),
-                precision=0,
-            )
-
-        # —— Encoder ——
-        with gr.Column(scale=1):
-            gr.Markdown("#### Encoder")
-            _conf["encoder_backend"] = gr.Dropdown(
-                label="Backend",
-                choices=backends,
-                value=_backend_default("encoder_backend"),
-            )
-            _conf["encoder_path"] = gr.Textbox(
-                label="Model location",
-                value=_path_or_empty("encoder_model_path"),
-                placeholder=configure.MODEL_PATH_PLACEHOLDERS["encoder"],
-                lines=2,
-            )
-            _conf["browse_encoder"] = gr.Button("Browse", size="sm")
-            _conf["encoder_load_mode"] = gr.Dropdown(
-                label="Encoder Load Mode",
-                choices=configure.LOAD_MODE_CHOICES,
-                value=_load_default("encoder_load_mode", "text_load_mode"),
-            )
-            _conf["encoder_gpu_layers"] = gr.Number(
-                label="GPU layers (−1 = auto)",
-                value=int(cfg.get("encoder_gpu_layers", cfg.get("text_gpu_layers", -1))),
+                value=int(cfg.get("thinking_gpu_layers", cfg.get("text_gpu_layers", cfg.get("encoder_gpu_layers", -1)))),
                 precision=0,
             )
 
@@ -4683,6 +4835,8 @@ def _build_config_tab() -> None:
                 value=configure.normalize_placement(
                     str(cfg.get("imagegen_placement", configure.DEFAULT_PLACEMENT))
                 ),
+                info="Split = VAE on CPU (saves VRAM). TE device follows Encoding Processing. "
+                     "Gpu_Only puts VAE with diffusion when Encoding is also on GPU.",
             )
 
     _conf["save_btn"] = gr.Button("Save Configuration", variant="primary")
@@ -4694,35 +4848,39 @@ def _wire_config_events(status_box) -> None:
             return _browse_file(_FILETYPES_MODEL, "last_model_browse_dir") or gr.update()
         return _fn
 
-    _conf["browse_encoder"].click(_b("encoder"), outputs=_conf["encoder_path"])
     _conf["browse_thinking"].click(_b("thinking"), outputs=_conf["thinking_path"])
     _conf["browse_diffuser"].click(_b("diffuser"), outputs=_conf["diffuser_path"])
     _conf["browse_vae"].click(_b("vae"), outputs=_conf["vae_path"])
 
     def _save(
         workers,
-        th_b, th_path, th_load, th_layers,
-        enc_b, enc_path, enc_load, enc_layers,
+        th_path, th_load, th_layers,
+        prompt_b, encode_b,
         img_b, diff_path, vae_path, img_load, placement,
     ):
         th_layers_i = int(th_layers if th_layers is not None else -1)
-        enc_layers_i = int(enc_layers if enc_layers is not None else -1)
+        th_path_s = (th_path or "").strip()
+        prompt_s = (prompt_b or "CPU").strip() or "CPU"
+        encode_s = (encode_b or "CPU").strip() or "CPU"
         configure.update_configuration({
             "worker_threads": int(workers or configure.WORKER_THREADS_DEFAULT),
-            "thinking_backend": th_b or "CPU",
-            "thinking_model_path": th_path or "",
+            "thinking_model_path": th_path_s,
             "thinking_load_mode": configure.normalize_load_mode(str(th_load)),
             "thinking_gpu_layers": th_layers_i,
-            "encoder_backend": enc_b or "CPU",
-            "encoder_model_path": enc_path or "",
-            "encoder_load_mode": configure.normalize_load_mode(str(enc_load)),
-            "encoder_gpu_layers": enc_layers_i,
+            # Split processing devices
+            "prompting_backend": prompt_s,
+            "encoding_backend": encode_s,
+            # Legacy aliases kept in sync
+            "thinking_backend": prompt_s,
+            "encoder_backend": encode_s,
+            "encoder_model_path": th_path_s,
+            "encoder_load_mode": configure.normalize_load_mode(str(th_load)),
+            "encoder_gpu_layers": th_layers_i,
             "imagegen_backend": img_b or "CPU",
             "imagegen_model_path": diff_path or "",
             "vae_model_path": vae_path or "",
             "imagegen_load_mode": configure.normalize_load_mode(str(img_load)),
             "imagegen_placement": configure.normalize_placement(str(placement)),
-            # Legacy shared keys kept in sync with Thinking / max layers
             "text_load_mode": configure.normalize_load_mode(str(th_load)),
             "text_gpu_layers": th_layers_i,
             "model_load_mode": configure.normalize_load_mode(str(th_load)),
@@ -4733,14 +4891,11 @@ def _wire_config_events(status_box) -> None:
         _save,
         inputs=[
             _conf["worker_threads"],
-            _conf["thinking_backend"],
             _conf["thinking_path"],
             _conf["thinking_load_mode"],
             _conf["thinking_gpu_layers"],
-            _conf["encoder_backend"],
-            _conf["encoder_path"],
-            _conf["encoder_load_mode"],
-            _conf["encoder_gpu_layers"],
+            _conf["prompting_backend"],
+            _conf["encoding_backend"],
             _conf["imagegen_backend"],
             _conf["diffuser_path"],
             _conf["vae_path"],
@@ -4749,6 +4904,7 @@ def _wire_config_events(status_box) -> None:
         ],
         outputs=status_box,
     )
+
 
 
 # ---------------------------------------------------------------------------
@@ -4767,10 +4923,14 @@ def _build_pref_tab() -> None:
             choices=configure.MAX_THUMBNAIL_CHOICES,
             value=prefs.get("max_thumbnails", configure.DEFAULT_MAX_THUMBNAILS),
         )
-        _pref["thumb_size"] = gr.Dropdown(
-            label="Thumbnail size",
-            choices=configure.INPUT_THUMBNAIL_CHOICES,
-            value=prefs.get("input_thumbnail_size", configure.DEFAULT_INPUT_THUMBNAIL),
+        _per = int(prefs.get("lyrics_thumbs_per_row", configure.DEFAULT_LYRICS_THUMBS_PER_ROW) or 8)
+        if _per not in configure.LYRICS_THUMBS_PER_ROW_CHOICES:
+            _per = configure.DEFAULT_LYRICS_THUMBS_PER_ROW
+        _pref["lyrics_per_row"] = gr.Dropdown(
+            label="Lyrics Thumbnails Per-Row",
+            choices=configure.LYRICS_THUMBS_PER_ROW_CHOICES,
+            value=_per,
+            info="How many lyrics stills in each row (images scale to the panel width).",
         )
     gr.Markdown("### Completion sounds")
     with gr.Row():
@@ -4788,20 +4948,29 @@ def _build_pref_tab() -> None:
 
 
 def _wire_pref_events(status_box) -> None:
-    def _save(max_thumbs, thumb_size, bleep_section, bleep_video):
+    def _save(max_thumbs, lyrics_per_row, bleep_section, bleep_video):
+        try:
+            per = int(lyrics_per_row)
+        except (TypeError, ValueError):
+            per = configure.DEFAULT_LYRICS_THUMBS_PER_ROW
+        if per not in configure.LYRICS_THUMBS_PER_ROW_CHOICES:
+            per = configure.DEFAULT_LYRICS_THUMBS_PER_ROW
         configure.update_preferences({
             "max_thumbnails": int(max_thumbs),
-            "input_thumbnail_size": int(thumb_size),
+            "lyrics_thumbs_per_row": per,
             "bleep_section_completion": bool(bleep_section),
             "bleep_video_completion": bool(bleep_video),
         })
-        return "Preferences saved."
+        return (
+            f"Preferences saved — lyrics stills show {per} per row "
+            f"(Thumbnails tab refreshes on next gallery update)."
+        )
 
     _pref["save_btn"].click(
         _save,
         inputs=[
             _pref["max_thumbs"],
-            _pref["thumb_size"],
+            _pref["lyrics_per_row"],
             _pref["bleep_section"],
             _pref["bleep_video"],
         ],
@@ -5055,6 +5224,80 @@ def build_app():
   gap: 0.15rem;
   padding: 0.1rem;
 }
+
+/* Lyric-section contrasting borders (cycle by section order) */
+.materials-thumbs .thumb-sec-0,
+#materials-gallery .thumb-sec-0 {
+  border: 3px solid #e74c3c !important;
+  border-radius: 6px;
+  box-sizing: border-box;
+}
+.materials-thumbs .thumb-sec-1,
+#materials-gallery .thumb-sec-1 {
+  border: 3px solid #3498db !important;
+  border-radius: 6px;
+  box-sizing: border-box;
+}
+.materials-thumbs .thumb-sec-2,
+#materials-gallery .thumb-sec-2 {
+  border: 3px solid #2ecc71 !important;
+  border-radius: 6px;
+  box-sizing: border-box;
+}
+.materials-thumbs .thumb-sec-3,
+#materials-gallery .thumb-sec-3 {
+  border: 3px solid #f39c12 !important;
+  border-radius: 6px;
+  box-sizing: border-box;
+}
+.materials-thumbs .thumb-sec-4,
+#materials-gallery .thumb-sec-4 {
+  border: 3px solid #9b59b6 !important;
+  border-radius: 6px;
+  box-sizing: border-box;
+}
+.materials-thumbs .thumb-sec-5,
+#materials-gallery .thumb-sec-5 {
+  border: 3px solid #1abc9c !important;
+  border-radius: 6px;
+  box-sizing: border-box;
+}
+.materials-thumbs .thumb-sec-6,
+#materials-gallery .thumb-sec-6 {
+  border: 3px solid #e91e63 !important;
+  border-radius: 6px;
+  box-sizing: border-box;
+}
+.materials-thumbs .thumb-sec-7,
+#materials-gallery .thumb-sec-7 {
+  border: 3px solid #00bcd4 !important;
+  border-radius: 6px;
+  box-sizing: border-box;
+}
+.materials-thumbs .thumb-sec-8,
+#materials-gallery .thumb-sec-8 {
+  border: 3px solid #ff5722 !important;
+  border-radius: 6px;
+  box-sizing: border-box;
+}
+.materials-thumbs .thumb-sec-9,
+#materials-gallery .thumb-sec-9 {
+  border: 3px solid #8e44ad !important;
+  border-radius: 6px;
+  box-sizing: border-box;
+}
+.materials-thumbs .thumb-sec-10,
+#materials-gallery .thumb-sec-10 {
+  border: 3px solid #16a085 !important;
+  border-radius: 6px;
+  box-sizing: border-box;
+}
+.materials-thumbs .thumb-sec-11,
+#materials-gallery .thumb-sec-11 {
+  border: 3px solid #d35400 !important;
+  border-radius: 6px;
+  box-sizing: border-box;
+}
 /* Fit still to thumbnail BOX HEIGHT */
 .materials-thumbs .thumb-img,
 #materials-gallery .thumb-img {
@@ -5153,16 +5396,19 @@ def build_app():
     _head = f'<link rel="icon" href="{_icon_href}" type="image/x-icon">' if _icon_href else ""
     with gr.Blocks(title="Lyrics-Materials") as app:
         gr.Markdown("# Lyrics-Materials — Lyrics → Image Materials")
-        with gr.Tabs():
-            with gr.TabItem("Generation"):
+        with gr.Tabs(selected="management") as main_tabs:
+            _gen["main_tabs"] = main_tabs
+            with gr.TabItem("Management", id="management"):
                 _build_create_tab()
-            with gr.TabItem("Prompting"):
+            with gr.TabItem("Thumbnails", id="thumbnails"):
+                _build_thumbnails_tab()
+            with gr.TabItem("Prompting", id="prompting"):
                 _build_prompting_tab()
-            with gr.TabItem("Configuration"):
+            with gr.TabItem("Configuration", id="configuration"):
                 _build_config_tab()
-            with gr.TabItem("Preferences"):
+            with gr.TabItem("Preferences", id="preferences"):
                 _build_pref_tab()
-            with gr.TabItem("Debug / Info"):
+            with gr.TabItem("Debug / Info", id="debug"):
                 _build_debug_tab()
 
         # Shared across ALL tabs: heading, then status | Exit on the SAME row

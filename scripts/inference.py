@@ -306,7 +306,13 @@ def _load_mode_for_role(cfg: Dict[str, Any], role: str) -> str:
     return configure.normalize_load_mode(str(raw))
 
 
-def _load_mode_args_for(cfg: Dict[str, Any], role: str = "encoder") -> List[str]:
+def _load_mode_args_for(
+    cfg: Dict[str, Any],
+    role: str = "thinking",
+    *,
+    backend: str = "",
+    force_no_mlock: bool = False,
+) -> List[str]:
     """
     Map per-role load mode → llama.cpp CLI flags.
 
@@ -314,26 +320,45 @@ def _load_mode_args_for(cfg: Dict[str, Any], role: str = "encoder") -> List[str]
     (PR #28334). The replacement is a single option:
 
         -lm, --load-mode MODE
-          auto        — mmap when the device supports it (default; One-Shot)
-          none        — no special mode (old --no-mmap)
-          mmap        — memory-map model
-          mlock       — force system to keep model in RAM (no swap)
-          mmap+mlock  — mmap and pin in RAM
-          dio         — DirectIO when available
+          auto / mmap / mlock / mmap+mlock / dio / none
 
     Our UI:
       One-Shot  →  omit flag (binary default = auto / lazy page-in)
-      M-Lock    →  -lm mlock   (pin weights in RAM; never silently degrade)
+      M-Lock    →  intended as ``-lm mlock``, BUT:
 
+    Windows (esp. Vulkan-compiled llama.cpp builds) crash with
+    ``GGML_ASSERT(addr) failed`` in llama-mmap.cpp when ``-lm mlock`` is used —
+    both on CPU (``-ngl 0``) and on GPU. So on Windows we always omit the flag.
+    The UI "M-Lock" still means sequential unload between phases (process exit);
+    it no longer pins host pages via the broken flag.
+
+    On non-Windows CPU backends we still pass ``-lm mlock`` when requested.
     sd-cli has no equivalent — imagegen returns [].
     """
-    if role in ("encoder", "thinking"):
-        if _load_mode_for_role(cfg, role) == configure.LOAD_MODE_MLOCK:
-            # Correct modern flag — bare --mlock is rejected as "invalid argument"
-            return ["-lm", "mlock"]
-        # One-Shot: leave default load-mode (auto)
+    if role not in ("encoder", "thinking"):
         return []
-    return []
+    if force_no_mlock:
+        return []
+    if _load_mode_for_role(cfg, role) != configure.LOAD_MODE_MLOCK:
+        return []
+    # Windows Vulkan-built binaries: -lm mlock aborts (CPU and GPU).
+    if sys.platform == "win32":
+        print(
+            "[llama] M-Lock requested — omitting -lm mlock on Windows "
+            "(Vulkan builds crash with GGML_ASSERT in llama-mmap; "
+            "phase unload still happens via process exit)",
+            flush=True,
+        )
+        return []
+    b = (backend or "").strip().upper()
+    if b.startswith("VULKAN") or b.startswith("CUDA"):
+        print(
+            "[llama] M-Lock requested but backend is GPU — omitting -lm mlock "
+            "(avoids llama-mmap GGML_ASSERT with Vulkan/CUDA)",
+            flush=True,
+        )
+        return []
+    return ["-lm", "mlock"]
 
 
 def _gpu_layers_for(cfg: Dict[str, Any], backend: str, role: str = "encoder",
@@ -354,9 +379,7 @@ def _gpu_layers_for(cfg: Dict[str, Any], backend: str, role: str = "encoder",
                 )
         except (TypeError, ValueError):
             requested = configure.DEFAULT_GPU_LAYERS
-        path = model_path or (
-            cfg.get("thinking_model_path") if role == "thinking" else cfg.get("encoder_model_path")
-        ) or ""
+        path = model_path or configure.resolve_text_model_path(cfg)
         free = configure.vram_free_for_backend(backend)
         ngl = configure.resolve_text_gpu_layers(str(path), requested, backend, free)
         if requested == -1:
@@ -374,36 +397,57 @@ def _gpu_layers_for(cfg: Dict[str, Any], backend: str, role: str = "encoder",
         return configure.DEFAULT_GPU_LAYERS
 
 
-def _llama_backend_args(cfg: Dict[str, Any], role: str = "encoder",
-                        model_path: str = "") -> List[str]:
-    backend_key = "thinking_backend" if role == "thinking" else "encoder_backend"
-    backend = str(cfg.get(backend_key) or cfg.get("encoder_backend") or "CPU")
-    path = model_path or (
-        cfg.get("thinking_model_path") if role == "thinking" else cfg.get("encoder_model_path")
-    ) or ""
+def _llama_backend_args(
+    cfg: Dict[str, Any],
+    role: str = "thinking",
+    model_path: str = "",
+    *,
+    force_no_mlock: bool = False,
+) -> List[str]:
+    """
+    Phase 1 (Prompting) device flags for llama-completion.
+
+    CPU   → ``-ngl 0`` only (no ``-dev``) so Vulkan-compiled binaries stay
+            on host RAM without binding a GPU device.
+    VulkanN / CUDAN → ``-dev … -ngl <layers>``
+    """
+    backend = configure.resolve_prompting_backend(cfg)
+    path = model_path or configure.resolve_text_model_path(cfg)
     extra: List[str] = []
-    if backend.upper().startswith("VULKAN"):
-        m = re.search(r"(\d+)", backend)
-        idx = int(m.group(1)) if m else 0
+    b_up = (backend or "CPU").strip().upper()
+    if b_up.startswith("VULKAN"):
+        m_idx = re.search(r"(\d+)", backend)
+        idx = int(m_idx.group(1)) if m_idx else 0
         ngl = _gpu_layers_for(cfg, backend, role, model_path=str(path))
         extra.extend(["-dev", f"Vulkan{idx}", "-ngl", str(ngl)])
-    elif backend.upper().startswith("CUDA"):
-        m = re.search(r"(\d+)", backend)
-        idx = int(m.group(1)) if m else 0
+    elif b_up.startswith("CUDA"):
+        m_idx = re.search(r"(\d+)", backend)
+        idx = int(m_idx.group(1)) if m_idx else 0
         ngl = _gpu_layers_for(cfg, backend, role, model_path=str(path))
         extra.extend(["-dev", f"CUDA{idx}", "-ngl", str(ngl)])
     else:
+        # Explicit CPU: zero GPU layers, no -dev (Vulkan builds still run on CPU)
         extra.extend(["-ngl", "0"])
-    extra.extend(_load_mode_args_for(cfg, role))
+        print(
+            f"[llama] Prompting on CPU — using -ngl 0 (no -dev); "
+            f"Vulkan-compiled binary will not offload layers",
+            flush=True,
+        )
+    extra.extend(
+        _load_mode_args_for(cfg, role, backend=backend, force_no_mlock=force_no_mlock)
+    )
     return extra
 
 
+
 def _resolve_prompt_model(cfg: Dict[str, Any]) -> Tuple[str, str]:
-    th = (cfg.get("thinking_model_path") or "").strip()
-    if th and Path(th).exists():
-        return th, "thinking"
-    enc = (cfg.get("encoder_model_path") or "").strip()
-    return enc, "encoder"
+    """
+    Single text model (Thinking). Path from thinking_model_path, with
+    legacy fallback to encoder_model_path for older configuration.json.
+    Role is always "thinking" so load-mode / GPU-layer keys stay consistent.
+    """
+    path = configure.resolve_text_model_path(cfg)
+    return path, "thinking"
 
 
 def _backend_device_key(backend: str) -> str:
@@ -427,9 +471,8 @@ def _backend_device_key(backend: str) -> str:
 
 
 def _text_role_backend(cfg: Dict[str, Any], role: str) -> str:
-    if role == "thinking":
-        return str(cfg.get("thinking_backend") or cfg.get("encoder_backend") or "CPU")
-    return str(cfg.get("encoder_backend") or "CPU")
+    # Phase 1 prompting device
+    return configure.resolve_prompting_backend(cfg)
 
 
 def _imagegen_backend(cfg: Dict[str, Any]) -> str:
@@ -449,8 +492,8 @@ def _is_mlock_enabled(cfg: Dict[str, Any], role: str = "text") -> bool:
 
 
 def _same_device_conflict(cfg: Dict[str, Any], text_role: str) -> bool:
-    """True when text model and Flux share one accelerator."""
-    text_key = _backend_device_key(_text_role_backend(cfg, text_role))
+    """True when Prompting Processing and Flux share one accelerator."""
+    text_key = _backend_device_key(configure.resolve_prompting_backend(cfg))
     img_key = _backend_device_key(_imagegen_backend(cfg))
     if text_key == "cpu" or img_key == "cpu":
         return False
@@ -495,64 +538,98 @@ def phase_barrier(label: str = "phase boundary") -> None:
 
 
 def log_phase_plan(cfg: Dict[str, Any], text_role: str) -> None:
-    """Print the two-phase device plan so the user can see unload intent."""
-    text_backend = _text_role_backend(cfg, text_role)
+    """Print the two-phase device plan (Prompting / Encoding / ImageGen)."""
+    prompt_backend = configure.resolve_prompting_backend(cfg)
+    encode_backend = configure.resolve_encoding_backend(cfg)
     img_backend = _imagegen_backend(cfg)
+    prompt_key = _backend_device_key(prompt_backend)
+    encode_key = _backend_device_key(encode_backend)
+    img_key = _backend_device_key(img_backend)
     text_mode = _load_mode_for_role(cfg, text_role)
-    enc_mode = _load_mode_for_role(cfg, "encoder")
     img_mode = _load_mode_for_role(cfg, "imagegen")
     text_mlock = text_mode == configure.LOAD_MODE_MLOCK
-    img_mlock = img_mode == configure.LOAD_MODE_MLOCK
-    conflict = _same_device_conflict(cfg, text_role)
+
     print("[plan] ══════════════════════════════════════════════", flush=True)
-    print(f"[plan] Load modes — Prompts/Thinking: {text_mode if text_role == 'thinking' else enc_mode}"
-          f"  |  Encoder: {enc_mode}  |  ImageGen: {img_mode}", flush=True)
-    print(f"[plan] Phase 1 — assessment + prompts", flush=True)
-    print(f"[plan]   model role : {text_role}", flush=True)
-    print(f"[plan]   backend    : {text_backend}  (device key {_backend_device_key(text_backend)})", flush=True)
-    print(f"[plan]   load mode  : {text_mode}"
-          f"{' (-lm mlock)' if text_mlock else ''}", flush=True)
-    print(f"[plan] Phase 2 — image generation (Flux)", flush=True)
-    print(f"[plan]   backend    : {img_backend}  (device key {_backend_device_key(img_backend)})", flush=True)
-    print(f"[plan]   load mode  : {img_mode} "
-          f"(sd-cli has no --mlock; process exit releases VRAM)", flush=True)
-    if conflict and (text_mlock or img_mlock):
+    print(f"[plan] Load mode — Text model: {text_mode}  |  ImageGen: {img_mode}", flush=True)
+    print(f"[plan] Phase 1 — assessment + prompts (llama-completion)", flush=True)
+    print(f"[plan]   Prompting Processing : {prompt_backend}  ({prompt_key})", flush=True)
+    print(f"[plan]   load mode            : {text_mode}"
+          f"{' (CPU mlock only; skipped on GPU)' if text_mlock else ''}", flush=True)
+    print(f"[plan] Phase 2 — image generation (sd-cli + Flux)", flush=True)
+    print(f"[plan]   ImageGen (diffusion) : {img_backend}  ({img_key})", flush=True)
+    print(f"[plan]   Encoding Processing  : {encode_backend}  ({encode_key})"
+          f"  ← Qwen --llm / TE", flush=True)
+
+    # Guidance for VRAM strategies
+    if prompt_key != "cpu" and prompt_key == img_key:
         print(
-            f"[plan] SAME DEVICE + M-Lock → Thinking will fully unload before "
-            f"Flux loads on {_backend_device_key(text_backend)}. "
-            f"They will NOT be resident together.",
+            f"[plan] Prompting shares {prompt_key} with Flux → Phase 1 fully exits "
+            f"before Flux loads (llama process ends; GPU VRAM freed).",
             flush=True,
         )
-    elif conflict:
+    if encode_key == "cpu" and img_key != "cpu":
         print(
-            f"[plan] Same device ({_backend_device_key(text_backend)}) but One-Shot — "
-            f"still sequential: text phase finishes before Flux.",
+            f"[plan] 8GB-friendly: Encoding on CPU, Flux on {img_key} — "
+            f"Qwen TE stays in system RAM so the GPU can hold Flux.",
             flush=True,
         )
-    else:
+    elif encode_key != "cpu" and encode_key == img_key:
         print(
-            f"[plan] Different devices — text on {_backend_device_key(text_backend)}, "
-            f"Flux on {_backend_device_key(img_backend)}; sequential phases still apply.",
+            f"[plan] Encoding + Flux both on {img_key} — TE and diffusion share "
+            f"the same GPU (needs enough VRAM; try Placement=Split / Encoding=CPU if OOM).",
+            flush=True,
+        )
+    elif encode_key != "cpu" and img_key != "cpu" and encode_key != img_key:
+        print(
+            f"[plan] Encoding on {encode_key}, Flux on {img_key} — dual-GPU split.",
             flush=True,
         )
     print("[plan] ══════════════════════════════════════════════", flush=True)
+
 
 
 
 def _sd_placement_args(cfg: Dict[str, Any], use_gpu: bool, vk_idx: int = 0) -> List[str]:
+    """
+    Build sd-cli --backend / --params-backend from ImageGen + Encoding devices.
+
+    diffusion  ← imagegen_backend (caller supplies use_gpu / vk_idx)
+    te (LLM)   ← encoding_backend  (CPU keeps Qwen off the GPU for 8GB cards)
+    vae        ← Gpu_Only places VAE with diffusion; Split keeps VAE on CPU
+    """
     args: List[str] = []
+    enc_tok = configure.backend_device_token(configure.resolve_encoding_backend(cfg))
+    placement = configure.normalize_placement(
+        str(cfg.get("imagegen_placement", configure.DEFAULT_PLACEMENT))
+    )
     if not use_gpu:
-        args.extend(["--backend", "cpu", "--params-backend", "cpu"])
+        # Full CPU image path
+        te = enc_tok if enc_tok != "cpu" else "cpu"
+        # diffusion is CPU; TE may still request a GPU (unusual) — honour encoding choice
+        if te == "cpu":
+            spec = "cpu"
+            args.extend(["--backend", "cpu", "--params-backend", "cpu"])
+        else:
+            spec = f"diffusion=cpu,te={te},vae=cpu"
+            args.extend(["--backend", spec, "--params-backend", spec])
+        print(f"[sd] placement: {spec if te != 'cpu' else 'cpu'} "
+              f"(imagegen=CPU, encoding={enc_tok})", flush=True)
     else:
         dev = f"vulkan{vk_idx}"
-        placement = configure.normalize_placement(
-            str(cfg.get("imagegen_placement", configure.DEFAULT_PLACEMENT))
-        )
-        if placement == configure.PLACEMENT_GPU_ONLY:
-            spec = f"diffusion={dev},te={dev},vae={dev}"
+        te = enc_tok  # cpu | vulkanN | cudaN
+        if placement == configure.PLACEMENT_GPU_ONLY and te != "cpu":
+            # All modules on accelerators; VAE follows diffusion device
+            vae = dev
         else:
-            spec = f"diffusion={dev},te=cpu,vae=cpu"
+            # Split (default): VAE on CPU to save VRAM — recommended for ≤8GB
+            vae = "cpu"
+        spec = f"diffusion={dev},te={te},vae={vae}"
         args.extend(["--backend", spec, "--params-backend", spec])
+        print(
+            f"[sd] placement: {spec}  "
+            f"(imagegen={dev}, encoding={te}, placement={placement})",
+            flush=True,
+        )
     args.extend(_load_mode_args_for(cfg, "imagegen"))
     return args
 
@@ -757,6 +834,22 @@ def _extract_completion_text(raw_out: str, prompt: str) -> str:
     return _strip_think_tags(text)
 
 
+
+def _llama_output_looks_crashed(raw_out: str, returncode: Optional[int]) -> bool:
+    """True when llama-completion aborted (mmap assert, access violation, etc.)."""
+    low = (raw_out or "").lower()
+    if "ggml_assert" in low or "llama-mmap" in low and "failed" in low:
+        return True
+    if "access violation" in low or "segmentation fault" in low:
+        return True
+    # Windows STATUS_STACK_BUFFER_OVERRUN / STATUS_ACCESS_VIOLATION style codes
+    if returncode is not None and returncode not in (0, 1, -1, None):
+        # 3221226505 = 0xC0000409, 3221225477 = 0xC0000005
+        if returncode in (3221226505, 3221225477) or returncode > 1000:
+            return True
+    return False
+
+
 def _run_llama_completion(
     prompt: str,
     cfg: Dict[str, Any],
@@ -929,6 +1022,16 @@ def _run_llama_completion(
         tail = _extract_completion_text(raw_out, "")
         if len(tail) > len(cleaned):
             cleaned = tail
+
+    # Hard crash (mmap assert / AV): treat as empty so callers retry / fail cleanly
+    if _llama_output_looks_crashed(raw_out, proc.returncode):
+        print(
+            f"[llama] CRASH detected (exit={proc.returncode}) — discarding output. "
+            f"If this persists, try One-Shot load mode (M-Lock flag is omitted on Windows).",
+            flush=True,
+        )
+        return ""
+
     return cleaned
 
 
@@ -1062,7 +1165,7 @@ def generate_project_folder_name(
     if progress_callback:
         progress_callback("Naming project…", 0.03, {"phase": "project"})
 
-    model_path = (cfg.get("encoder_model_path") or "").strip()
+    model_path = configure.resolve_text_model_path(cfg)
     excerpt = "\n".join((lyrics or "").splitlines()[:12])[:1200]
     prompt = (
         "You are naming a folder for a lyric image-materials project. "
@@ -1074,7 +1177,7 @@ def generate_project_folder_name(
     )
     try:
         raw = _run_llama_completion(
-            prompt, cfg, role="encoder", model_path=model_path,
+            prompt, cfg, role="thinking", model_path=model_path,
             n_predict=_NAME_PREDICT, ctx_size=_NAME_CTX,
             temperature=0.6, timeout=_TIMEOUT_NAME,
         )
@@ -1695,7 +1798,7 @@ def generate_visual_prompts(
     """
     model_path, role = _resolve_prompt_model(cfg)
     if not model_path:
-        raise RuntimeError("No Encoder/Thinking model configured for visual prompts.")
+        raise RuntimeError("No Thinking model configured for visual prompts.")
 
     style = cfg.get("style") or configure.STYLE_LIGHT
     template = (
@@ -1795,17 +1898,21 @@ def generate_visual_prompts(
                 f"{sec_people}"
             )
 
+        # Style header is applied later by compose_lyric_still_prompt — keep the
+        # model instruction free of template/style text so it cannot echo into scene.
         instruction = (
-            f"{style_part}\n\n"
+            f"Lyric line:\n{line}\n\n"
             f"Song context: {overall[:350]}\n"
             f"Section ({sec}): {sec_note[:250]}\n"
             f"{char_clause}\n\n"
-            "Describe the visual scene for this lyric line in at most 512 characters. "
-            "One positive paragraph: setting, action, lighting, composition. "
-            "Do not describe the main character's clothing or face. "
-            "Secondary people only if the lyric needs them, each with their own outfit. "
-            "Output the scene description only — nothing else. "
-            "Do not use labels like SCENE, POSE, or BACKGROUND."
+            "Write ONE short visual scene paragraph (max 512 characters) for a "
+            "music-video still of this lyric line. "
+            "Include setting, action, lighting, and composition. "
+            "Do not describe the main character's face or clothing. "
+            "Do not repeat the lyric word-for-word. "
+            "Do not use labels (SCENE, POSE, BACKGROUND). "
+            "Do not quote or restate these instructions. "
+            "Reply with only the scene paragraph — nothing else."
         )
         try:
             text = _run_llama_completion(
@@ -1818,8 +1925,14 @@ def generate_visual_prompts(
         except Exception as e:
             print(f"[prompts] Lyrics Line {line_no} FAILED — empty scene: {e}", flush=True)
             text = ""
-        # Never store the raw lyric as the "scene" — that duplicates Music-video still of:
-        scene_body = _sanitize_visual_prompt(text or "", line, style_part)
+        # Pure scene only — style/lyric header added at image time by compose_*
+        scene_body = _sanitize_visual_prompt(text or "", line, style)
+        if not scene_body:
+            print(
+                f"[prompts] Lyrics Line {line_no}: empty after sanitize "
+                f"(raw was {len((text or '').strip())} chars)",
+                flush=True,
+            )
         prompts.append(scene_body)
 
     print(f"[prompts] === finished {len(prompts)}/{total} prompts ===", flush=True)
@@ -2222,6 +2335,21 @@ _PROMPT_LEAK_MARKERS = (
     "not the main reference",
     "with outfits appropriate to the scene",
     "likeness and wardrobe for the main character",
+    # Instruction bleed seen in Flux --llm logs (Qwen Thinking echo)
+    "describe the visual scene for this lyric",
+    "describe the visual scene",
+    "one positive paragraph",
+    "do not describe the main character",
+    "secondary people only if the lyric",
+    "do not use labels like",
+    "song context:",
+    "at most 512 characters",
+    "in at most 512 characters",
+    "<|im_start|>",
+    "<|im_end|>",
+    "<think>",
+    "</think>",
+    "music-video still of:",
 )
 
 
@@ -2229,21 +2357,78 @@ def _sanitize_visual_prompt(prompt: str, lyric: str, style_hint: str = "") -> st
     """
     Return a pure scene paragraph for the still, or "" if unusable.
 
-    Header, lyric line, and identity lock are assembled separately by
-    compose_lyric_still_prompt — this function must NOT inject those.
-
-    Strips model instruction echoes (CHARACTER: absent…, Figures in this still…)
-    while keeping the real scene sentence that often follows them.
+    Header, lyric, and identity are assembled by compose_lyric_still_prompt —
+    this must return only the scene body (no ChatML, no instruction echo).
     """
     p = (prompt or "").strip()
     if not p:
         return ""
+
+    # Strip think / ChatML debris first
+    p = _strip_think_tags(p)
+    for tok in (
+        "<|im_start|>system", "<|im_start|>user", "<|im_start|>assistant",
+        "<|im_start|>", "<|im_end|>", "<|endoftext|>",
+    ):
+        p = p.replace(tok, " ")
+    p = re.sub(r"</?think>", " ", p, flags=re.I)
+    p = re.sub(r"\s{2,}", " ", p).strip()
+
     lyric_low = (lyric or "").strip().lower().rstrip(" .,;:!?…")
     low = p.lower()
 
-    # Exact lyric used as a stand-in is not a scene description
     if lyric_low and low.rstrip(" .,;:!?…") == lyric_low:
         return ""
+
+    # Cut everything from known instruction phrases onward (echo bleed)
+    cut_phrases = (
+        "describe the visual scene",
+        "one positive paragraph",
+        "do not describe the main character",
+        "secondary people only if",
+        "do not use labels like",
+        "output the scene description only",
+        "output the paragraph only",
+        "reply with only",
+        "write only the visual",
+        "song context:",
+        "likeness and wardrobe",
+        "applied later from the",
+    )
+    cut_at = None
+    for phrase in cut_phrases:
+        idx = low.find(phrase)
+        if idx >= 0 and (cut_at is None or idx < cut_at):
+            cut_at = idx
+    if cut_at is not None:
+        if cut_at < 24:
+            print("[images] prompt is instruction echo — scene omitted", flush=True)
+            return ""
+        p = p[:cut_at].strip().rstrip(" ,;:")
+        low = p.lower()
+
+    # Drop leading style / music-video still echoes (compose adds those)
+    p = re.sub(
+        r"(?is)^\s*(?:photorealistic|cinematic|anime|illustration)[^.]*\.\s*",
+        "",
+        p,
+        count=1,
+    ).strip()
+    p = re.sub(r"(?is)^\s*music-video still of\s*:\s*[^.]+\.\s*", "", p, count=1).strip()
+    # Presence-instruction residue — silhouette/partial wording lives in identity clause now
+    p = re.sub(
+        r"(?is)\b(?:MAIN\s+)?CHARACTER\s*:\s*"
+        r"show the main character[^.]{0,160}\.\s*",
+        "",
+        p,
+    ).strip()
+    p = re.sub(
+        r"(?is)\b(?:MAIN\s+)?CHARACTER\s*:\s*"
+        r"(?:absent from this still|show)[^.]{0,200}\.\s*",
+        "",
+        p,
+    ).strip()
+    low = p.lower()
 
     # --- Recover structured SCENE:/POSE:/BACKGROUND dumps ---
     if re.search(r"(?im)^(SCENE|POSE|BACKGROUND|SETTING|ACTION)\s*[:\-]", p):
@@ -2252,18 +2437,16 @@ def _sanitize_visual_prompt(prompt: str, lyric: str, style_hint: str = "") -> st
             line = raw_line.strip()
             if not line:
                 continue
-            m = re.match(
+            m_lab = re.match(
                 r"^(?:SCENE|POSE|BACKGROUND|SETTING|ACTION|LIGHTING)\s*[:\-]\s*(.+)$",
                 line,
                 re.I,
             )
-            body = (m.group(1).strip() if m else line).strip()
+            body = (m_lab.group(1).strip() if m_lab else line).strip()
             blow = body.lower()
             if not body or blow in ("none", "n/a", "na", "-"):
                 continue
             if any(mk in blow for mk in _PROMPT_LEAK_MARKERS):
-                continue
-            if blow.startswith("if ") and "secondary" in blow:
                 continue
             bits.append(body.rstrip(" .;,"))
         if bits:
@@ -2275,8 +2458,7 @@ def _sanitize_visual_prompt(prompt: str, lyric: str, style_hint: str = "") -> st
             print(f"[images] recovered scene from structured prompt: {scene[:100]}…", flush=True)
             return scene.strip()
 
-    # --- Strip leading instruction echoes, keep the real scene ---
-    # CHARACTER: / MAIN CHARACTER: … (one or more sentences of meta)
+    # Strip leading CHARACTER: / MAIN CHARACTER: meta
     p2 = re.sub(
         r"(?is)^\s*(?:main\s+)?character\s*:\s*"
         r".*?(?:reference person|reference image|main reference)[^.]*\.\s*",
@@ -2292,10 +2474,9 @@ def _sanitize_visual_prompt(prompt: str, lyric: str, style_hint: str = "") -> st
         count=1,
     ).strip()
     p2 = re.sub(r"(?is)\bwith outfits appropriate to the scene\.?\s*", "", p2).strip()
-    p2 = re.sub(r"(?is)\bassistant\.?\s*", " ", p2).strip()
     p2 = re.sub(r"\s{2,}", " ", p2).strip()
 
-    # If still contaminated, keep only sentences without leak markers
+    # Drop sentences that still contain leak markers
     if any(mk in p2.lower() for mk in _PROMPT_LEAK_MARKERS):
         parts = re.split(r"(?<=[.!?])\s+", p2)
         kept = [
@@ -2306,7 +2487,6 @@ def _sanitize_visual_prompt(prompt: str, lyric: str, style_hint: str = "") -> st
         p2 = " ".join(kept).strip()
 
     if not p2 or len(p2) < 20:
-        # Hard instruction-only payload
         if any(mk in low for mk in _PROMPT_LEAK_MARKERS):
             print("[images] prompt looks like instruction leak — scene omitted", flush=True)
             return ""
@@ -2321,19 +2501,27 @@ def _sanitize_visual_prompt(prompt: str, lyric: str, style_hint: str = "") -> st
                 break
         else:
             cut = cut.rsplit(" ", 1)[0]
-        p2 = cut
+        p2 = cut.strip()
+
     return p2.strip()
 
 
 
-def _appearance_bit(cfg: Dict[str, Any]) -> str:
-    """Identity + hair/outfit/age clause from cfg (character-bearing stills only)."""
+
+def _appearance_bit(cfg: Dict[str, Any], presence: str = "full") -> str:
+    """
+    Identity + hair/outfit clause from cfg (character-bearing stills only).
+
+    presence drives wording: silhouette omits face/age/hands so the model
+    can actually render a shadow outline; full keeps the face-match lock.
+    """
     return configure.character_identity_clause(
         hair=cfg.get("hair_style") or "",
         outfit=cfg.get("outfit_worn") or "",
         gender=cfg.get("ref_gender") or "",
         bodyshape=cfg.get("ref_bodyshape") or "",
         age=cfg.get("ref_age"),
+        presence=presence,
     )
 
 
@@ -2370,12 +2558,12 @@ def generate_images_from_prompts(
     if not model_path or not Path(model_path).exists():
         raise RuntimeError(f"Diffuser model not set/found: {model_path or '(empty)'}")
 
-    # Flux.2 --llm text conditioning: reuse Encoder (Qwen3-VL Instruct) path
-    llm_path = (cfg.get("encoder_model_path") or "").strip()
+    # Flux.2 --llm text conditioning: Thinking (Qwen3-VL) GGUF
+    llm_path = configure.resolve_text_model_path(cfg)
     if not llm_path or not Path(llm_path).exists():
         raise RuntimeError(
-            "Encoder (Qwen3-VL) not set/found — required for Flux.2 --llm.\n"
-            "Set Configuration → Encoder → Model location.\n"
+            "Thinking model (Qwen3-VL) not set/found — required for Flux.2 --llm.\n"
+            "Set Configuration → Text Model (Thinking) → Model location.\n"
             f"Current path: {llm_path or '(empty)'}"
         )
 
@@ -2390,7 +2578,7 @@ def generate_images_from_prompts(
     ref_path = (reference_image or "").strip()
     has_ref = bool(ref_path and Path(ref_path).is_file())
     print(f"[images] diffusion = {Path(model_path).name}", flush=True)
-    print(f"[images] encoder/--llm = {Path(llm_path).name}", flush=True)
+    print(f"[images] thinking/--llm = {Path(llm_path).name}", flush=True)
     print(f"[images] vae       = {Path(vae_path).name if vae_path else '(none)'}", flush=True)
 
     out_dir = project_dir if project_dir is not None else configure.get_output_dir()
@@ -2486,6 +2674,7 @@ def generate_images_from_prompts(
         )
         if neg:
             c.extend(["-n", neg])
+            print(f"[sd] negative ({len(neg)} chars): {neg[:220]}…", flush=True)
         c.extend(_sd_placement_args(cfg, use_gpu, vk_idx))
         return c
 
@@ -2564,7 +2753,7 @@ def generate_images_from_prompts(
                 ref_override = str(prev_still)
                 attach_ref = True
                 if use_char_ref:
-                    identity = _appearance_bit(cfg)
+                    identity = _appearance_bit(cfg, presence=pres)
                 beat = (
                     f"Beat {var} of {freq} in a continuous moment: "
                     "same scene, characters, hair, outfit, and lighting language, "
@@ -2588,7 +2777,7 @@ def generate_images_from_prompts(
                 )
             elif use_char_ref:
                 attach_ref = True
-                identity = _appearance_bit(cfg)
+                identity = _appearance_bit(cfg, presence=pres)
                 final_prompt = configure.compose_lyric_still_prompt(
                     image_style=str(cfg.get("image_style") or ""),
                     visual_style=str(
@@ -2880,9 +3069,9 @@ def regenerate_single_still(
     model_path = (cfg.get("imagegen_model_path") or "").strip()
     if not model_path or not Path(model_path).exists():
         raise RuntimeError(f"Diffuser model not set/found: {model_path or '(empty)'}")
-    llm_path = (cfg.get("encoder_model_path") or "").strip()
+    llm_path = configure.resolve_text_model_path(cfg)
     if not llm_path or not Path(llm_path).exists():
-        raise RuntimeError(f"Encoder not set/found: {llm_path or '(empty)'}")
+        raise RuntimeError(f"Thinking model not set/found: {llm_path or '(empty)'}")
     vae_path = _resolve_flux2_vae(cfg, model_path)
     if not vae_path:
         raise RuntimeError(_flux2_vae_help(model_path, (cfg.get("vae_model_path") or "").strip()))
@@ -2910,7 +3099,7 @@ def regenerate_single_still(
     style_hint = str(cfg.get("prompt_template") or cfg.get("style") or "")
     clean_prompt = _sanitize_visual_prompt(prompt, line_text, style_hint)
     scene = (clean_prompt or "").strip()
-    identity = _appearance_bit(cfg) if use_ref else ""
+    identity = _appearance_bit(cfg, presence=pres) if use_ref else ""
     final_prompt = configure.compose_lyric_still_prompt(
         image_style=str(cfg.get("image_style") or ""),
         visual_style=str(
@@ -2993,6 +3182,7 @@ def regenerate_single_still(
         )
         if neg:
             c.extend(["-n", neg])
+            print(f"[sd] negative ({len(neg)} chars): {neg[:220]}…", flush=True)
         c.extend(_sd_placement_args(cfg, use_gpu, vk_idx))
         return c
 
@@ -3216,7 +3406,7 @@ def generate_theme_prompts_from_assessment(
     progress_callback: Optional[Callable] = None,
 ) -> List[str]:
     """
-    Thinking/Encoder writes `n_prompts` distinct ambient worldspace prompts
+    Thinking model writes `n_prompts` distinct ambient worldspace prompts
     from the OVERALL assessment only. Theme stills are fillers for non-lyric
     stretches — no central character, no reference photo.
     """
@@ -3364,9 +3554,9 @@ def _generate_named_still(
     model_path = (cfg.get("imagegen_model_path") or "").strip()
     if not model_path or not Path(model_path).exists():
         raise RuntimeError(f"Diffuser model not set/found: {model_path or '(empty)'}")
-    llm_path = (cfg.get("encoder_model_path") or "").strip()
+    llm_path = configure.resolve_text_model_path(cfg)
     if not llm_path or not Path(llm_path).exists():
-        raise RuntimeError(f"Encoder not set/found: {llm_path or '(empty)'}")
+        raise RuntimeError(f"Thinking model not set/found: {llm_path or '(empty)'}")
     vae_path = _resolve_flux2_vae(cfg, model_path)
     if not vae_path:
         raise RuntimeError(_flux2_vae_help(model_path, (cfg.get("vae_model_path") or "").strip()))
@@ -3446,6 +3636,12 @@ def _generate_named_still(
     )
     if neg:
         cmd.extend(["-n", neg])
+        print(
+            f"[sd] negative cover={bool(cfg.get('cover_mode'))} "
+            f"ambient={bool(cfg.get('ambient_mode'))} "
+            f"({len(neg)} chars): {neg[:220]}…",
+            flush=True,
+        )
     cmd.extend(_sd_placement_args(cfg, use_gpu, vk_idx))
 
     t_img = time.time()
@@ -3525,8 +3721,13 @@ def _build_cover_prompt(
     if overall:
         parts = re.split(r"(?<=[.!?])\s+", overall)
         interpret = " ".join(parts[:2]).strip()
-        if len(interpret) > 280:
-            interpret = interpret[:280].rsplit(" ", 1)[0] + "…"
+        # Word-boundary trim — never leave a dangling letter like "and q."
+        if len(interpret) > 400:
+            cut = interpret[:400]
+            if " " in cut:
+                cut = cut.rsplit(" ", 1)[0]
+            interpret = cut.rstrip(" ,;:") + "…"
+
 
     # Covers are always non-character / no reference (object or metaphysical symbol).
     strategy = "world"
@@ -3557,14 +3758,14 @@ def _build_cover_prompt(
             )
             raw = _run_llama_completion(
                 concept_prompt, cfg, role=role, model_path=model_path,
-                n_predict=120, ctx_size=min(_PROMPT_CTX, 4096),
-                temperature=0.4, timeout=120.0,
+                n_predict=256, ctx_size=min(_PROMPT_CTX, 4096),
+                temperature=0.4, timeout=180.0,
             )
             concept = (raw or "").strip().splitlines()[0].strip()
             # Drop quotes / length runaway
             concept = concept.strip(" \"'`")
-            if len(concept) > 320:
-                concept = concept[:320].rsplit(" ", 1)[0]
+            if len(concept) > 400:
+                concept = concept[:400].rsplit(" ", 1)[0].rstrip(" ,;:")
             if len(concept) < 20:
                 concept = ""
             else:
@@ -3582,21 +3783,24 @@ def _build_cover_prompt(
     mood = str(cfg.get("style") or configure.STYLE_DEFAULT).strip()
     header = f"{style_lead}, {mood}, cinematic composition, coherent lighting." if mood else f"{style_lead}, cinematic composition, coherent lighting."
 
-    # Song title is the primary driver; OVERALL is a light interpretation aid only.
-    body_bits = [
-        f"Album cover still for the song title: {title}.",
-        "No people, no faces, no human figures, no characters.",
-        "One significant object or metaphysical symbol that embodies the song title — "
-        "isolated, high visual impact, clean composition, solid negative space or "
-        "shallow depth of field.",
-    ]
+    # Title-first object/symbol body — no "no people" in positive (that lives in negative).
+    # Target form:
+    #   One significant object or metaphysical symbol that embodies the song title
+    #   "…"; Title interpretation: …
+    body = (
+        f'One significant object or metaphysical symbol that embodies the song title '
+        f'"{title}"'
+    )
     if concept:
-        body_bits.append(f"Symbol concept: {concept}")
-    elif interpret:
-        body_bits.append(
-            f"Title interpretation (mood only, not a character brief): {interpret[:220]}"
-        )
-    cover_prompt = header + " " + " ".join(body_bits)
+        body = f"{body}; {concept.rstrip('.')}"
+    if interpret:
+        interp = interpret.strip()
+        if len(interp) > 400:
+            interp = interp[:400].rsplit(" ", 1)[0].rstrip(" ,;:") + "…"
+        body = f"{body}; Title interpretation: {interp.rstrip('.')}"
+    body = body.rstrip(".;") + "."
+    cover_prompt = f"{header} {body}".strip()
+    print(f"[cover] prompt ({len(cover_prompt)} chars): {cover_prompt[:240]}…", flush=True)
     return cover_prompt, strategy, False
 
 
@@ -3660,9 +3864,9 @@ def generate_cover_image(
         configure.APP_STATE["active_session_id"] = project_dir.name
 
         _diff = (cfg.get("imagegen_model_path") or "").strip()
-        _enc = (cfg.get("encoder_model_path") or "").strip()
+        _enc = configure.resolve_text_model_path(cfg)
         if not _diff or not Path(_diff).is_file() or not _enc or not Path(_enc).is_file():
-            result["message"] = "Encoder + Diffuser models must be configured before generating a cover."
+            result["message"] = "Thinking + Diffuser models must be configured before generating a cover."
             configure.APP_STATE["session_status"] = "idle"
             return result
         vae = _resolve_flux2_vae(cfg, _diff)
@@ -3816,7 +4020,7 @@ def generate_theme_images(
     """
     Theme stills from song assessment:
       1. ensure_project_assessment (OVERALL / CHARACTER / SECTIONS)
-      2. Thinking/Encoder writes Image-Frequency distinct visual prompts from OVERALL
+      2. Thinking model writes Image-Frequency distinct visual prompts from OVERALL
       3. Each prompt → one Flux still (theme-01-….png …)
     """
     clear_cancel_state()
@@ -3864,9 +4068,9 @@ def generate_theme_images(
 
         # Model preflight
         _diff = (cfg.get("imagegen_model_path") or "").strip()
-        _enc = (cfg.get("encoder_model_path") or "").strip()
+        _enc = configure.resolve_text_model_path(cfg)
         if not _diff or not Path(_diff).is_file() or not _enc or not Path(_enc).is_file():
-            result["message"] = "Encoder + Diffuser models must be configured before theme images."
+            result["message"] = "Thinking + Diffuser models must be configured before theme images."
             configure.APP_STATE["session_status"] = "idle"
             return result
         vae = _resolve_flux2_vae(cfg, _diff)
@@ -4168,10 +4372,10 @@ def run_materials_pipeline(
         has_ref = bool(reference_image and Path(reference_image).is_file())
 
         # ── Fail FAST on missing Flux.2 components (before 40+ prompt calls) ──
-        # Text conditioning for Flux.2 uses the Encoder column (Qwen3-VL Instruct).
+        # Text conditioning for Flux.2 uses the Thinking GGUF (Qwen3-VL).
         # VAE must be Flux.2 autoencoder — not Flux.1 ae, not the DiT safetensors.
         _diff = (cfg.get("imagegen_model_path") or "").strip()
-        _enc = (cfg.get("encoder_model_path") or "").strip()
+        _enc = configure.resolve_text_model_path(cfg)
         _vae_cfg = (cfg.get("vae_model_path") or "").strip()
         _vae = _resolve_flux2_vae(cfg, _diff) if _diff else ""
         missing = []
@@ -4182,8 +4386,8 @@ def run_materials_pipeline(
             )
         if not _enc or not Path(_enc).is_file():
             missing.append(
-                f"  • Encoder (Qwen3-VL) (Configuration → Encoder → Model location)\n"
-                f"    Used for prompts AND as Flux.2 --llm text conditioning\n"
+                f"  • Thinking (Qwen3-VL) (Configuration → Text Model → Model location)\n"
+                f"    Used for assessment, prompts, AND as Flux.2 --llm text conditioning\n"
                 f"    current: {_enc or '(empty)'}"
             )
         if not _vae:
@@ -4208,7 +4412,7 @@ def run_materials_pipeline(
         # Keep resolved VAE on cfg so Phase 2 uses the same path
         cfg["vae_model_path"] = _vae
         print(f"[config] diffusion = {Path(_diff).name}", flush=True)
-        print(f"[config] encoder   = {Path(_enc).name}  (also used as Flux --llm)", flush=True)
+        print(f"[config] thinking  = {Path(_enc).name}  (assessment + prompts + Flux --llm)", flush=True)
         print(f"[config] vae       = {Path(_vae).name}", flush=True)
 
         if has_ref:
@@ -4321,7 +4525,7 @@ def run_materials_pipeline(
                 0.34,
                 {"phase": "barrier"},
             )
-        phase_barrier("text → image (unload Thinking/Encoder before Flux)")
+        phase_barrier("text → image (unload Thinking before Flux)")
 
         # ── Phase 2: image generation (Flux only) ────────────────────────
         img_backend = _imagegen_backend(cfg)
