@@ -1,5 +1,5 @@
 # Lyrics-Materials
-Status: Beta - Developing and improving. This is Experimental, I have not made my first video with it yet, it is possible, but the controls need work. Next version will have lots of GOOD new features, and likeness to reference image will be fixed again, but I am working right on the limits of what Flux2-4B is capable of. Note the images shown below were generated with v0.11, things differ per version until I get it pinned down.
+Status: Beta - Developing and improving. This is Experimental. Note the images shown below were generated with v0.20, generation and reference image likeness, is now figured out, and the interface is quite ok.
 
 ### Description:
 It will convert lines of lyrics into AI generated images, one for each line. The idea is one could arrange these in a movie editor, and fade in/out between sections of images, to make simple music videos. One could also take the line of lyrics and the generated images, and feed that into AI video generator to make clips, that could then be assembled.
@@ -55,6 +55,7 @@ Available on [HuggingFace.Co](https://huggingface.co/)...
 - Remember by editing `.\scripts\configure.py` script it is possible to have custom hair/clothes/etc. Ie for clothing you would for example search for something unique like "Rocker" in configure script, and then change, prompt detail and relating GUI option, for that one or one of the others you wont use. 
 - When a session is under-way, ensure to collapse the session slots column on the left, with the little "--><--" button. This will optimize the interface a little.
 - If the Generation page panels relating to Details Mode do not show, try switching back and forth, between Panel Mode's (there are a lot of items to display). 
+- This program uses Flux2-4B, if people like the program and have the money, then please donate ~£250 to my kofi/patreon, and then I will make the program compatible with Qwen3-8b and Flux2-Klein-8b. No point developing what I cant test. 
 
 ### Struture:
 ```
@@ -72,8 +73,8 @@ Lyrics-Materials/
 ```
 
 ### Development:
-- It works, but I want it to work better, improving prompting, until its all working well, and ensuring that the likeness is same as reference image for main character but NOT other characters that may be present in given scenes.
 - Apparently the qwen3-vl-thinking model can generate the prompts AND encode the images? if this is the case, please ensure to shift ALL instruct model duties over to the thinking model, so we can reduce the number of models used  
+- Thumbnails on a new page, to speed up and fix issues on the Generation page, Generation page needs renaming to Management page.
 
 ### Disclaimer:
 - Do not over-load your GPU, it could cause graphics driver crash. As stated, ensure you understand the capabilities of your card. My max settings for 8 GB GPU was 768x512 (no bigger), and image models were loaded in Split mode. If your graphics driver does start to crash due to low ram, then try to close the program (python command prompt is fastest) IMMEDIATELY, and re-think your configurations.
