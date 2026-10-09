@@ -1641,25 +1641,6 @@ def _build_create_tab() -> None:
                         step=0.1,
                         value=float(_g0.get("imagegen_cfg_scale") or configure.DEFAULT_CFG),
                     )
-                _gen["general_negative"] = gr.Textbox(
-                    label="General Negative Prompt",
-                    lines=3,
-                    max_lines=6,
-                    value=(
-                        _g0.get("general_negative_prompt")
-                        or configure.general_negative_for_style(
-                            _g0.get("image_style") or configure.IMAGE_STYLE_DEFAULT
-                        )
-                    ),
-                    placeholder="Style-opposed lead + quality / overlay terms…",
-                    info=(
-                        "Always applied. First phrase tracks Image Style "
-                        "(e.g. Photo → cartoon, anime, pixelated). "
-                        "Alone for stills without people; prepended before "
-                        "Character Negative when people appear."
-                    ),
-                    elem_id="general-negative-box",
-                )
             _gen["details_project_settings"] = _details_settings
 
             # 2 — Name and Lyrics
@@ -1677,6 +1658,14 @@ def _build_create_tab() -> None:
                     placeholder="Paste full lyrics here…\n[Intro]\nFirst line…\n…",
                     value=initial_lyrics,
                     elem_id="lyrics-box",
+                )
+                _gen["negative_prompt"] = gr.Textbox(
+                    label="Negative prompt (saved with the project)",
+                    lines=2,
+                    max_lines=4,
+                    value=getattr(configure, "DEFAULT_NEGATIVE_PROMPT", ""),
+                    placeholder="Things to avoid in every still…",
+                    elem_id="negative-prompt-box",
                 )
             _gen["details_name_lyrics"] = _details_nl
 
@@ -1771,38 +1760,6 @@ def _build_create_tab() -> None:
                         value=initial_outfit,
                         info="Locked wardrobe for character consistency. None = omit.",
                     )
-                _gen["character_negative"] = gr.Textbox(
-                    label="Character Negative Prompt",
-                    lines=3,
-                    max_lines=6,
-                    value=(
-                        _g0.get("character_negative_prompt")
-                        or getattr(configure, "DEFAULT_CHARACTER_NEGATIVE", "")
-                    ),
-                    placeholder="Anatomy terms for character stills…",
-                    info=(
-                        "Anatomy only — applied when people appear. "
-                        "Best left alone for consistent hands / limbs / pose. "
-                        "General Negative is always prepended."
-                    ),
-                    elem_id="character-negative-box",
-                )
-                _gen["multi_character_negative"] = gr.Textbox(
-                    label="Multi-Character Negative Addition",
-                    lines=2,
-                    max_lines=4,
-                    value=(
-                        _g0.get("multi_character_negative")
-                        or getattr(configure, "DEFAULT_MULTI_CHARACTER_NEGATIVE", "")
-                    ),
-                    placeholder="Identity + devices when reference + other people…",
-                    info=(
-                        "Appended only when the main/reference character is present "
-                        "and secondary figures are in the still. Includes devices "
-                        "(phones, headphones) which usually belong to background people."
-                    ),
-                    elem_id="multi-character-negative-box",
-                )
             _gen["details_reference"] = _details_ref
 
             with gr.Row(elem_id="gen-action-row"):
@@ -2087,6 +2044,23 @@ def _execute_lyric_job(job: Any, ctx: Dict[str, Any]) -> str:
     return f"Regenerated lyrics still {int(line_idx) + 1} variant {variant}."
 
 
+def _batch_image_work_active() -> bool:
+    """
+    True while a Cover / Theme / Lyrics *batch* pipeline is actively generating
+    a still (not merely queued). Regen worker must not dequeue jobs into the
+    "Generating" state while this is true — otherwise Lyrics slots flash
+    Generating while Theme still holds the GPU / exclusive sd-cli slot.
+    """
+    if configure.APP_STATE.get("cover_slot_generating") is not None:
+        return True
+    if configure.APP_STATE.get("theme_slot_generating") is not None:
+        return True
+    # Batch lyrics pipeline sets thumb_generating_line while sd-cli runs
+    if configure.APP_STATE.get("thumb_generating_line") is not None:
+        return True
+    return False
+
+
 def _regen_worker_loop() -> None:
     print("[regen-worker] started", flush=True)
     configure.APP_STATE["generating"] = True
@@ -2100,6 +2074,14 @@ def _regen_worker_loop() -> None:
             if not nq and not lq:
                 break
             ctx = dict(configure.APP_STATE.get("regen_worker_ctx") or {})
+
+            # Do not promote queued jobs to "Generating" while a batch Cover /
+            # Theme / Lyrics still is mid sd-cli. Leave them in the queue so the
+            # gallery keeps showing the Queued placeholder.
+            if _batch_image_work_active():
+                time.sleep(0.4)
+                continue
+
             if nq:
                 job = nq.pop(0)
                 configure.APP_STATE["named_regen_queue"] = nq
@@ -2115,13 +2097,23 @@ def _regen_worker_loop() -> None:
                     _mark_named_busy_global(jk, ji, False)
                     configure.APP_STATE["image_gen_t0"] = None
                 continue
+
             if lq:
+                # Prefer any newly arrived named jobs before lyrics
+                nq2 = list(configure.APP_STATE.get("named_regen_queue") or [])
+                if nq2:
+                    continue
+                if _batch_image_work_active():
+                    time.sleep(0.4)
+                    continue
                 job = lq.pop(0)
                 configure.APP_STATE["regen_queue"] = lq
                 if isinstance(job, dict):
                     qi = int(job.get("line_idx", 0))
+                    variant = int(job.get("variant") or 1)
                 else:
                     qi = int(job)
+                    variant = 1
                 q_line = qi + 1
                 _unqueue_line(q_line)
                 busy = set()
@@ -2132,6 +2124,19 @@ def _regen_worker_loop() -> None:
                         pass
                 busy.add(q_line)
                 configure.APP_STATE["regen_busy_lines"] = sorted(busy)
+                # Track per-variant busy key for L2/L3 pages
+                keys = set()
+                for x in (configure.APP_STATE.get("regen_busy_keys") or []):
+                    try:
+                        if isinstance(x, str) and ":" in x:
+                            a, b = x.split(":", 1)
+                            keys.add(f"{int(a)}:{int(b)}")
+                        elif isinstance(x, (list, tuple)) and len(x) >= 2:
+                            keys.add(f"{int(x[0])}:{int(x[1])}")
+                    except (TypeError, ValueError):
+                        pass
+                keys.add(f"{q_line}:{variant}")
+                configure.APP_STATE["regen_busy_keys"] = sorted(keys)
                 try:
                     msg = _execute_lyric_job(job, ctx)
                     print(f"[regen-worker] {msg}", flush=True)
@@ -2146,6 +2151,16 @@ def _regen_worker_loop() -> None:
                             pass
                     busy.discard(q_line)
                     configure.APP_STATE["regen_busy_lines"] = sorted(busy)
+                    keys = set()
+                    for x in (configure.APP_STATE.get("regen_busy_keys") or []):
+                        try:
+                            if isinstance(x, str) and ":" in x:
+                                a, b = x.split(":", 1)
+                                keys.add(f"{int(a)}:{int(b)}")
+                        except (TypeError, ValueError):
+                            pass
+                    keys.discard(f"{q_line}:{variant}")
+                    configure.APP_STATE["regen_busy_keys"] = sorted(keys)
                     configure.APP_STATE["image_gen_t0"] = None
     finally:
         configure.APP_STATE["generating"] = False
@@ -2497,6 +2512,133 @@ def _wire_create_events(status_box) -> None:
         ] + _session_refresh_outputs,
     )
 
+    def _session_form_outputs():
+        """Shared Gradio outputs for Start New / Load Session form resets."""
+        outs = [
+            _gen["song_name"],
+            _gen["lyrics"],
+            _gen["style"],
+            _gen["image_size"],
+            _gen["steps"],
+            _gen["cfg"],
+            _gen["ref_image"],
+            _gen["negative_prompt"],
+            status_box,
+            _gen["active_session_id"],
+            _gen["assess_btn"],
+            _gen["all_assets_btn"],
+            _gen["cover_btn"],
+            _gen["theme_btn"],
+            _gen["run_btn"],
+            _gen["stop_btn"],
+        ]
+        # Optional controls — only when present so counts stay matched
+        for key in (
+            "image_style",
+            "image_frequency",
+            "hair_style",
+            "outfit_worn",
+            "ref_gender",
+            "ref_bodyshape",
+            "ref_age",
+        ):
+            if _gen.get(key) is not None:
+                outs.append(_gen[key])
+        return outs
+
+    def _session_form_updates(
+        *,
+        song="",
+        lyrics="",
+        style=None,
+        image_size=None,
+        steps=None,
+        cfg_scale=None,
+        ref="",
+        negative=None,
+        status="",
+        sid="",
+        image_style=None,
+        image_frequency=None,
+        hair_style=None,
+        outfit_worn=None,
+        ref_gender=None,
+        ref_bodyshape=None,
+        ref_age=None,
+        running=False,
+    ):
+        """Return tuple matching _session_form_outputs() order."""
+        st = style if style in configure.STYLE_CHOICES else configure.STYLE_DEFAULT
+        size = image_size if image_size else configure.DEFAULT_IMAGE_SIZE
+        try:
+            size = configure.normalize_image_size(str(size))
+        except Exception:
+            size = configure.DEFAULT_IMAGE_SIZE
+        stp = int(steps if steps is not None else configure.DEFAULT_STEPS)
+        cfgv = float(cfg_scale if cfg_scale is not None else configure.DEFAULT_CFG)
+        neg = (
+            configure.DEFAULT_NEGATIVE_PROMPT
+            if negative is None
+            else negative
+        )
+        assess_u, all_u, cover_u, theme_u, lyrics_u, stop_u = _action_btn_updates(
+            lyrics or "", song or "", running=running
+        )
+        main = [
+            gr.update(value=song or ""),
+            gr.update(value=lyrics or "", lines=12, max_lines=12),
+            gr.update(value=st),
+            gr.update(value=size),
+            gr.update(value=stp),
+            gr.update(value=cfgv),
+            gr.update(value=ref or ""),
+            gr.update(value=neg),
+            status or "",
+            sid or "",
+            assess_u,
+            all_u,
+            cover_u,
+            theme_u,
+            lyrics_u,
+            stop_u,
+        ]
+        g = configure.load_generation()
+        extras = {
+            "image_style": configure.normalize_image_style(
+                image_style if image_style is not None else (g.get("image_style") or configure.IMAGE_STYLE_DEFAULT)
+            ),
+            "image_frequency": configure.normalize_image_frequency(
+                image_frequency if image_frequency is not None else (g.get("imagegen_frequency") or configure.DEFAULT_IMAGE_FREQUENCY)
+            ),
+            "hair_style": configure.normalize_hair_style(
+                hair_style if hair_style is not None else (g.get("hair_style") or configure.HAIR_STYLE_DEFAULT)
+            ),
+            "outfit_worn": configure.normalize_outfit(
+                outfit_worn if outfit_worn is not None else (g.get("outfit_worn") or configure.OUTFIT_DEFAULT)
+            ),
+            "ref_gender": configure.normalize_gender(
+                ref_gender if ref_gender is not None else (g.get("ref_gender") or configure.GENDER_DEFAULT)
+            ),
+            "ref_bodyshape": configure.normalize_bodyshape(
+                ref_bodyshape if ref_bodyshape is not None else (g.get("ref_bodyshape") or configure.BODYSHAPE_DEFAULT)
+            ),
+            "ref_age": configure.normalize_age(
+                ref_age if ref_age is not None else g.get("ref_age", configure.AGE_DEFAULT)
+            ),
+        }
+        for key in (
+            "image_style",
+            "image_frequency",
+            "hair_style",
+            "outfit_worn",
+            "ref_gender",
+            "ref_bodyshape",
+            "ref_age",
+        ):
+            if _gen.get(key) is not None:
+                main.append(gr.update(value=extras[key]))
+        return tuple(main)
+
     def _select_session(idx: int, session_ids: list):
         if not session_ids or idx < 0 or idx >= len(session_ids):
             return (
@@ -2562,50 +2704,28 @@ def _wire_create_events(status_box) -> None:
                 int(g.get("imagegen_height") or configure.DEFAULT_HEIGHT),
             ))
         )
-        main = (
-            gr.update(value=song),
-            gr.update(value=lyrics, lines=12, max_lines=12),
-            gr.update(value=style if style in configure.STYLE_CHOICES else configure.STYLE_DEFAULT),
-            gr.update(value=size_label),
-            gr.update(value=steps),
-            gr.update(value=cfg_scale),
-            gr.update(value=ref),
-            gr.update(value=(s.get("general_negative_prompt") or getattr(configure, "DEFAULT_GENERAL_NEGATIVE", ""))),
-            gr.update(value=(s.get("character_negative_prompt") or getattr(configure, "DEFAULT_CHARACTER_NEGATIVE", ""))),
-            gr.update(value=(s.get("multi_character_negative") or getattr(configure, "DEFAULT_MULTI_CHARACTER_NEGATIVE", ""))),
-            status,
-            sid,
-        )
-        assess_u, all_u, cover_u, theme_u, lyrics_u, _stop_u = _action_btn_updates(
-            lyrics, song, running=False
+        form = _session_form_updates(
+            song=song,
+            lyrics=lyrics,
+            style=style,
+            image_size=size_label,
+            steps=steps,
+            cfg_scale=cfg_scale,
+            ref=ref,
+            negative=(s.get("negative_prompt") if s.get("negative_prompt") is not None else configure.DEFAULT_NEGATIVE_PROMPT),
+            status=status,
+            sid=sid,
+            running=False,
         )
         refresh = _refresh_session_slots(sid)
-        return main + (assess_u, all_u, cover_u, theme_u, lyrics_u) + tuple(
-            _all_gallery_updates(lyric_paths=list(imgs))
-        ) + tuple(refresh)
+        return form + tuple(_all_gallery_updates(lyric_paths=list(imgs))) + tuple(refresh)
 
     # Wire each select button with its index
     for i, btn in enumerate(_gen["session_select_btns"]):
         btn.click(
             lambda sid_list, i=i: _select_session(i, sid_list or []),
             inputs=[_gen["session_ids"]],
-            outputs=[
-                _gen["song_name"],
-                _gen["lyrics"],
-                _gen["style"],
-                _gen["image_size"],
-                _gen["steps"],
-                _gen["cfg"],
-                _gen["ref_image"],
-                _gen["general_negative"], _gen["character_negative"], _gen["multi_character_negative"],
-                status_box,
-                _gen["active_session_id"],
-                _gen["assess_btn"],
-                _gen["all_assets_btn"],
-                _gen["cover_btn"],
-                _gen["theme_btn"],
-                _gen["run_btn"],
-            ] + _thumb_panel_outputs() + _session_refresh_outputs,
+            outputs=_session_form_outputs() + _thumb_panel_outputs() + _session_refresh_outputs,
         )
 
     def _delete_one(idx: int, session_ids: list, active_id: str):
@@ -2635,44 +2755,23 @@ def _wire_create_events(status_box) -> None:
         configure.APP_STATE["thumb_generating_line"] = None
         configure.APP_STATE["regen_busy_lines"] = []
         configure.APP_STATE["thumb_queued_lines"] = []
-        main = (
-            gr.update(value=""),
-            gr.update(value="", lines=12, max_lines=12),
-            gr.update(value=configure.STYLE_DEFAULT),
-            gr.update(value=configure.DEFAULT_IMAGE_SIZE),
-            gr.update(value=configure.DEFAULT_STEPS),
-            gr.update(value=configure.DEFAULT_CFG),
-            gr.update(value=""),
-            gr.update(value=configure.DEFAULT_NEGATIVE_PROMPT),
-            "New session — enter song name & lyrics, then Generate.",
-            "",
+        form = _session_form_updates(
+            status="New session — enter song name & lyrics, then Generate.",
+            # Keep global generation prefs for style/size/frequency/subject tokens
+            style=configure.STYLE_DEFAULT,
+            image_size=configure.DEFAULT_IMAGE_SIZE,
+            steps=configure.DEFAULT_STEPS,
+            cfg_scale=configure.DEFAULT_CFG,
+            negative=configure.DEFAULT_NEGATIVE_PROMPT,
+            running=False,
         )
-        assess_u, all_u, cover_u, theme_u, lyrics_u, _stop_u = _action_btn_updates(
-            "", "", running=False
+        return form + tuple(_all_gallery_updates(lyric_paths=[])) + tuple(
+            _refresh_session_slots("")
         )
-        return main + (assess_u, all_u, cover_u, theme_u, lyrics_u) + tuple(
-            _all_gallery_updates(lyric_paths=[])
-        ) + tuple(_refresh_session_slots(""))
 
     _gen["start_new_session"].click(
         _start_new,
-        outputs=[
-            _gen["song_name"],
-            _gen["lyrics"],
-            _gen["style"],
-            _gen["image_size"],
-            _gen["steps"],
-            _gen["cfg"],
-            _gen["ref_image"],
-            _gen["general_negative"], _gen["character_negative"], _gen["multi_character_negative"],
-            status_box,
-            _gen["active_session_id"],
-            _gen["assess_btn"],
-            _gen["all_assets_btn"],
-            _gen["cover_btn"],
-            _gen["theme_btn"],
-            _gen["run_btn"],
-        ] + _thumb_panel_outputs() + _session_refresh_outputs,
+        outputs=_session_form_outputs() + _thumb_panel_outputs() + _session_refresh_outputs,
     )
 
     def _ask_delete_all():
@@ -2746,7 +2845,7 @@ def _wire_create_events(status_box) -> None:
     # via a dummy refresh bound after wiring (see build_app).
 
     def _run(
-        lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale, ref_image, hair_style, outfit_worn, general_negative, character_negative, multi_character_negative, active_session_id,
+        lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale, ref_image, hair_style, outfit_worn, negative_prompt, active_session_id,
         progress=gr.Progress(track_tqdm=False),
     ):
         # Idle restore vs running (hide generate trio, show Emergency Stop)
@@ -2780,16 +2879,9 @@ def _wire_create_events(status_box) -> None:
         cfg["imagegen_steps"] = int(steps or configure.DEFAULT_STEPS)
         cfg["imagegen_cfg_scale"] = float(cfg_scale or configure.DEFAULT_CFG)
         cfg["prompt_template"] = configure.prompt_template_for_style(style)
-        cfg["general_negative_prompt"] = (
-            (general_negative if general_negative is not None else getattr(configure, "DEFAULT_GENERAL_NEGATIVE", "")) or ""
+        cfg["negative_prompt"] = (
+            (negative_prompt if negative_prompt is not None else configure.DEFAULT_NEGATIVE_PROMPT) or ""
         )
-        cfg["character_negative_prompt"] = (
-            (character_negative if character_negative is not None else getattr(configure, "DEFAULT_CHARACTER_NEGATIVE", "")) or ""
-        )
-        cfg["multi_character_negative"] = (
-            (multi_character_negative if multi_character_negative is not None else getattr(configure, "DEFAULT_MULTI_CHARACTER_NEGATIVE", "")) or ""
-        )
-        cfg["negative_prompt"] = cfg["general_negative_prompt"]  # legacy key
         cfg["hair_style"] = configure.normalize_hair_style(str(hair_style or ""))
         cfg["outfit_worn"] = configure.normalize_outfit(str(outfit_worn or ""))
         _g_sub = configure.load_generation()
@@ -3008,16 +3100,9 @@ def _wire_create_events(status_box) -> None:
                     cfg_now["imagegen_height"] = _h
                     cfg_now["imagegen_size"] = _sz
                     cfg_now["imagegen_frequency"] = _fq
-                    cfg_now["general_negative_prompt"] = (
-                        (general_negative if general_negative is not None else getattr(configure, "DEFAULT_GENERAL_NEGATIVE", "")) or ""
+                    cfg_now["negative_prompt"] = (
+                        (negative_prompt if negative_prompt is not None else configure.DEFAULT_NEGATIVE_PROMPT) or ""
                     )
-                    cfg_now["character_negative_prompt"] = (
-                        (character_negative if character_negative is not None else getattr(configure, "DEFAULT_CHARACTER_NEGATIVE", "")) or ""
-                    )
-                    cfg_now["multi_character_negative"] = (
-                        (multi_character_negative if multi_character_negative is not None else getattr(configure, "DEFAULT_MULTI_CHARACTER_NEGATIVE", "")) or ""
-                    )
-                    cfg_now["negative_prompt"] = cfg_now["general_negative_prompt"]  # legacy key
                     cfg_now["hair_style"] = configure.normalize_hair_style(str(gnow.get("hair_style") or ""))
                     cfg_now["outfit_worn"] = configure.normalize_outfit(str(gnow.get("outfit_worn") or ""))
                     cfg_now["ref_gender"] = configure.normalize_gender(str(gnow.get("ref_gender") or ""))
@@ -3077,7 +3162,7 @@ def _wire_create_events(status_box) -> None:
             _gen["ref_image"],
             _gen["hair_style"],
             _gen["outfit_worn"],
-            _gen["general_negative"], _gen["character_negative"], _gen["multi_character_negative"],
+            _gen["negative_prompt"],
             _gen["active_session_id"],
         ]
 
@@ -3102,42 +3187,16 @@ def _wire_create_events(status_box) -> None:
                 outputs=[],
             )
 
-    def _on_image_style_change(image_style, current_general):
-        """
-        Persist Image Style and rewrite the style-opposed lead at the start of
-        General Negative Prompt. Preserves a custom body when the user edited
-        past the default general body.
-        """
-        style = configure.normalize_image_style(str(image_style or ""))
-        lead = configure.IMAGE_STYLE_NEGATIVE_LEAD.get(
-            style, configure.IMAGE_STYLE_NEGATIVE_LEAD[configure.IMAGE_STYLE_DEFAULT]
-        )
-        default_body = configure.DEFAULT_GENERAL_NEGATIVE_BODY.strip()
-        cur = (current_general or "").strip()
-        body = default_body
-        if cur:
-            # Strip any known style lead so we keep the user's body text
-            low = cur.lower()
-            stripped = cur
-            for known in configure.IMAGE_STYLE_NEGATIVE_LEAD.values():
-                prefix = known.lower().rstrip(". ")
-                if low.startswith(prefix):
-                    stripped = cur[len(known):].lstrip(" .").strip()
-                    break
-            if stripped:
-                body = stripped
-        new_general = f"{lead.rstrip('. ')}. {body}" if lead else body
+    def _persist_image_style(image_style):
         configure.update_generation({
-            "image_style": style,
-            "general_negative_prompt": new_general,
+            "image_style": configure.normalize_image_style(str(image_style or "")),
         })
-        return new_general
 
-    if _gen.get("image_style") is not None and _gen.get("general_negative") is not None:
+    if _gen.get("image_style") is not None:
         _gen["image_style"].change(
-            _on_image_style_change,
-            inputs=[_gen["image_style"], _gen["general_negative"]],
-            outputs=[_gen["general_negative"]],
+            _persist_image_style,
+            inputs=[_gen["image_style"]],
+            outputs=[],
         )
 
     def _on_image_frequency_change(image_frequency, lyrics, song_name, active_session_id):
@@ -3243,7 +3302,7 @@ def _wire_create_events(status_box) -> None:
     )
 
     def _run_cover(
-        lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale, ref_image, hair_style, outfit_worn, general_negative, character_negative, multi_character_negative, active_session_id,
+        lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale, ref_image, hair_style, outfit_worn, negative_prompt, active_session_id,
         progress=gr.Progress(track_tqdm=False),
     ):
         idle_btns = _action_btn_updates(lyrics, song_name, running=False)
@@ -3273,16 +3332,9 @@ def _wire_create_events(status_box) -> None:
         cfg["imagegen_steps"] = int(steps or configure.DEFAULT_STEPS)
         cfg["imagegen_cfg_scale"] = float(cfg_scale or configure.DEFAULT_CFG)
         cfg["prompt_template"] = configure.prompt_template_for_style(style)
-        cfg["general_negative_prompt"] = (
-            (general_negative if general_negative is not None else getattr(configure, "DEFAULT_GENERAL_NEGATIVE", "")) or ""
+        cfg["negative_prompt"] = (
+            (negative_prompt if negative_prompt is not None else configure.DEFAULT_NEGATIVE_PROMPT) or ""
         )
-        cfg["character_negative_prompt"] = (
-            (character_negative if character_negative is not None else getattr(configure, "DEFAULT_CHARACTER_NEGATIVE", "")) or ""
-        )
-        cfg["multi_character_negative"] = (
-            (multi_character_negative if multi_character_negative is not None else getattr(configure, "DEFAULT_MULTI_CHARACTER_NEGATIVE", "")) or ""
-        )
-        cfg["negative_prompt"] = cfg["general_negative_prompt"]  # legacy key
         cfg["hair_style"] = configure.normalize_hair_style(str(hair_style or ""))
         cfg["outfit_worn"] = configure.normalize_outfit(str(outfit_worn or ""))
         _g_sub = configure.load_generation()
@@ -3374,7 +3426,7 @@ def _wire_create_events(status_box) -> None:
         ) + tuple(_all_gallery_updates()) + tuple(_refresh_session_slots(sid))
 
     def _run_theme(
-        lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale, ref_image, hair_style, outfit_worn, general_negative, character_negative, multi_character_negative, active_session_id,
+        lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale, ref_image, hair_style, outfit_worn, negative_prompt, active_session_id,
         progress=gr.Progress(track_tqdm=False),
     ):
         idle_btns = _action_btn_updates(lyrics, song_name, running=False)
@@ -3404,16 +3456,9 @@ def _wire_create_events(status_box) -> None:
         cfg["imagegen_steps"] = int(steps or configure.DEFAULT_STEPS)
         cfg["imagegen_cfg_scale"] = float(cfg_scale or configure.DEFAULT_CFG)
         cfg["prompt_template"] = configure.prompt_template_for_style(style)
-        cfg["general_negative_prompt"] = (
-            (general_negative if general_negative is not None else getattr(configure, "DEFAULT_GENERAL_NEGATIVE", "")) or ""
+        cfg["negative_prompt"] = (
+            (negative_prompt if negative_prompt is not None else configure.DEFAULT_NEGATIVE_PROMPT) or ""
         )
-        cfg["character_negative_prompt"] = (
-            (character_negative if character_negative is not None else getattr(configure, "DEFAULT_CHARACTER_NEGATIVE", "")) or ""
-        )
-        cfg["multi_character_negative"] = (
-            (multi_character_negative if multi_character_negative is not None else getattr(configure, "DEFAULT_MULTI_CHARACTER_NEGATIVE", "")) or ""
-        )
-        cfg["negative_prompt"] = cfg["general_negative_prompt"]  # legacy key
         cfg["hair_style"] = configure.normalize_hair_style(str(hair_style or ""))
         cfg["outfit_worn"] = configure.normalize_outfit(str(outfit_worn or ""))
         _g_sub = configure.load_generation()
@@ -3508,7 +3553,7 @@ def _wire_create_events(status_box) -> None:
 
 
     def _run_assessment(
-        lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale, ref_image, hair_style, outfit_worn, general_negative, character_negative, multi_character_negative, active_session_id,
+        lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale, ref_image, hair_style, outfit_worn, negative_prompt, active_session_id,
         progress=gr.Progress(track_tqdm=False),
     ):
         """Run song assessment only; enable generate buttons when analysis.txt is saved."""
@@ -3565,16 +3610,9 @@ def _wire_create_events(status_box) -> None:
                 cfg["outfit_worn"] = configure.normalize_outfit(str(outfit_worn or ""))
                 cfg["imagegen_cfg_scale"] = float(cfg_scale or configure.DEFAULT_CFG)
                 cfg["style"] = style or cfg.get("style") or configure.STYLE_LIGHT
-                cfg["general_negative_prompt"] = (
-                    (general_negative if general_negative is not None else getattr(configure, "DEFAULT_GENERAL_NEGATIVE", "")) or ""
+                cfg["negative_prompt"] = (
+                    (negative_prompt if negative_prompt is not None else configure.DEFAULT_NEGATIVE_PROMPT) or ""
                 )
-                cfg["character_negative_prompt"] = (
-                    (character_negative if character_negative is not None else getattr(configure, "DEFAULT_CHARACTER_NEGATIVE", "")) or ""
-                )
-                cfg["multi_character_negative"] = (
-                    (multi_character_negative if multi_character_negative is not None else getattr(configure, "DEFAULT_MULTI_CHARACTER_NEGATIVE", "")) or ""
-                )
-                cfg["negative_prompt"] = cfg["general_negative_prompt"]  # legacy key
                 label = (song_name or "").strip()
                 from scripts.inference import ensure_project_dir, _slugify_folder_name, ensure_project_assessment
                 slug = _slugify_folder_name(label, fallback="")
@@ -3671,7 +3709,7 @@ def _wire_create_events(status_box) -> None:
     )
 
     def _run_all_assets(
-        lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale, ref_image, hair_style, outfit_worn, general_negative, character_negative, multi_character_negative, active_session_id,
+        lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale, ref_image, hair_style, outfit_worn, negative_prompt, active_session_id,
         progress=gr.Progress(track_tqdm=False),
     ):
         """
@@ -3721,10 +3759,7 @@ def _wire_create_events(status_box) -> None:
             "imagegen_frequency": freq,
             "imagegen_steps": int(steps or configure.DEFAULT_STEPS),
             "imagegen_cfg_scale": float(cfg_scale or configure.DEFAULT_CFG),
-            "general_negative_prompt": general_negative or getattr(configure, "DEFAULT_GENERAL_NEGATIVE", ""),
-            "character_negative_prompt": character_negative or getattr(configure, "DEFAULT_CHARACTER_NEGATIVE", ""),
-            "multi_character_negative": multi_character_negative or getattr(configure, "DEFAULT_MULTI_CHARACTER_NEGATIVE", ""),
-            "negative_prompt": general_negative or getattr(configure, "DEFAULT_GENERAL_NEGATIVE", ""),
+            "negative_prompt": negative_prompt or configure.DEFAULT_NEGATIVE_PROMPT,
             "hair_style": configure.normalize_hair_style(str(hair_style or "")),
             "outfit_worn": configure.normalize_outfit(str(outfit_worn or "")),
             "ref_gender": configure.normalize_gender(str(configure.load_generation().get("ref_gender") or "")),
@@ -3974,7 +4009,7 @@ def _wire_create_events(status_box) -> None:
             _refresh_session_slots(active_session_id or "")
         )
 
-    def _do_regen(line_idx: int, image_size, image_frequency, steps, cfg_scale, ref_image, general_negative, character_negative, multi_character_negative, active_session_id):
+    def _do_regen(line_idx: int, image_size, image_frequency, steps, cfg_scale, ref_image, negative_prompt, active_session_id):
         """
         Regenerate ONE still. Puts a status-bar message immediately, then clears
         that slot and runs sd-cli for that line only (queue-aware).
@@ -4032,28 +4067,11 @@ def _wire_create_events(status_box) -> None:
 
         line_no = resolved_idx + 1
 
-        # Persist negative prompt sections on the project
-        gen_neg = (general_negative or "").strip() or getattr(configure, "DEFAULT_GENERAL_NEGATIVE", "")
-        char_neg = (character_negative or "").strip() or getattr(configure, "DEFAULT_CHARACTER_NEGATIVE", "")
-        multi_neg = (multi_character_negative or "").strip() or getattr(configure, "DEFAULT_MULTI_CHARACTER_NEGATIVE", "")
+        # Persist negative prompt on the project
+        neg = (negative_prompt or "").strip()
         try:
-            configure.save_session_meta(Path(proj), {
-                "general_negative_prompt": gen_neg,
-                "character_negative_prompt": char_neg,
-                "multi_character_negative": multi_neg,
-                "negative_prompt": gen_neg,
-            })
-            (Path(proj) / "negative_prompt.txt").write_text(
-                "=== General Negative Prompt ===\n" + gen_neg + "\n\n"
-                "=== Character Negative Prompt ===\n" + char_neg + "\n\n"
-                "=== Multi-Character Negative Addition ===\n" + multi_neg + "\n",
-                encoding="utf-8",
-            )
-            configure.update_generation({
-                "general_negative_prompt": gen_neg,
-                "character_negative_prompt": char_neg,
-                "multi_character_negative": multi_neg,
-            })
+            configure.save_session_meta(Path(proj), {"negative_prompt": neg})
+            (Path(proj) / "negative_prompt.txt").write_text(neg + "\n", encoding="utf-8")
         except Exception:
             pass
 
@@ -4080,11 +4098,15 @@ def _wire_create_events(status_box) -> None:
         cfg_now["image_style"] = configure.normalize_image_style(
             gnow.get("image_style") or configure.IMAGE_STYLE_DEFAULT
         )
+        # Visual style (light/dark/colourful) — required for lyric header mood words
+        prefs = configure.load_preferences()
+        cfg_now["style"] = (
+            prefs.get("style")
+            or gnow.get("style")
+            or configure.STYLE_DEFAULT
+        )
         cfg_now["imagegen_frequency"] = freq
-        cfg_now["general_negative_prompt"] = gen_neg
-        cfg_now["character_negative_prompt"] = char_neg
-        cfg_now["multi_character_negative"] = multi_neg
-        cfg_now["negative_prompt"] = gen_neg
+        cfg_now["negative_prompt"] = neg
         configure.update_generation({
             "imagegen_width": w,
             "imagegen_height": h,
@@ -4153,9 +4175,13 @@ def _wire_create_events(status_box) -> None:
                     msg = f"Regenerating still {line_no}…"
                 elif mine_queued:
                     nq = len(configure.APP_STATE.get("regen_queue") or [])
+                    nn = len(configure.APP_STATE.get("named_regen_queue") or [])
+                    extra = ""
+                    if nn or _batch_image_work_active():
+                        extra = " (waiting for Cover/Theme or other image work)"
                     msg = (
-                        f"Queued still {line_no} "
-                        f"(runs after current image work finishes — {nq} lyric job(s) waiting)."
+                        f"Queued still {line_no}{extra} — "
+                        f"{nq} lyric job(s) waiting."
                     )
                 else:
                     msg = f"Regenerated still {line_no}."
@@ -4233,7 +4259,7 @@ def _wire_create_events(status_box) -> None:
         q.append(item)
         configure.APP_STATE["named_regen_queue"] = q
 
-    def _build_named_cfg(image_size, steps, cfg_scale, general_negative, character_negative, multi_character_negative):
+    def _build_named_cfg(image_size, steps, cfg_scale, negative_prompt):
         c = _cfg()
         cfg = dict(c)
         size_label = configure.normalize_image_size(str(image_size or configure.DEFAULT_IMAGE_SIZE))
@@ -4243,16 +4269,9 @@ def _wire_create_events(status_box) -> None:
         cfg["imagegen_size"] = size_label
         cfg["imagegen_steps"] = int(steps or configure.DEFAULT_STEPS)
         cfg["imagegen_cfg_scale"] = float(cfg_scale or configure.DEFAULT_CFG)
-        cfg["general_negative_prompt"] = (
-            (general_negative if general_negative is not None else getattr(configure, "DEFAULT_GENERAL_NEGATIVE", "")) or ""
+        cfg["negative_prompt"] = (
+            (negative_prompt if negative_prompt is not None else configure.DEFAULT_NEGATIVE_PROMPT) or ""
         )
-        cfg["character_negative_prompt"] = (
-            (character_negative if character_negative is not None else getattr(configure, "DEFAULT_CHARACTER_NEGATIVE", "")) or ""
-        )
-        cfg["multi_character_negative"] = (
-            (multi_character_negative if multi_character_negative is not None else getattr(configure, "DEFAULT_MULTI_CHARACTER_NEGATIVE", "")) or ""
-        )
-        cfg["negative_prompt"] = cfg["general_negative_prompt"]  # legacy key
         gnow = configure.load_generation()
         cfg["hair_style"] = configure.normalize_hair_style(str(gnow.get("hair_style") or ""))
         cfg["outfit_worn"] = configure.normalize_outfit(str(gnow.get("outfit_worn") or ""))
@@ -4306,9 +4325,7 @@ def _wire_create_events(status_box) -> None:
         steps,
         cfg_scale,
         ref_image,
-        general_negative,
-        character_negative,
-        multi_character_negative,
+        negative_prompt,
         active_session_id,
     ):
         """Enqueue a cover/theme regen. A background worker runs sd-cli serially
@@ -4330,7 +4347,7 @@ def _wire_create_events(status_box) -> None:
             )
             return
 
-        cfg = _build_named_cfg(image_size, steps, cfg_scale, general_negative, character_negative, multi_character_negative)
+        cfg = _build_named_cfg(image_size, steps, cfg_scale, negative_prompt)
         configure.APP_STATE["regen_worker_ctx"] = {
             "proj": proj,
             "cfg": cfg,
@@ -4408,7 +4425,7 @@ def _wire_create_events(status_box) -> None:
             functools.partial(_do_regen, i),
             inputs=[
                 _gen["image_size"], _gen["image_frequency"], _gen["steps"], _gen["cfg"],
-                _gen["ref_image"], _gen["general_negative"], _gen["character_negative"], _gen["multi_character_negative"], _gen["active_session_id"],
+                _gen["ref_image"], _gen["negative_prompt"], _gen["active_session_id"],
             ],
             outputs=_regen_outputs,
             show_progress="minimal",
@@ -4427,7 +4444,7 @@ def _wire_create_events(status_box) -> None:
             functools.partial(_do_regen_named, "cover", i),
             inputs=[
                 _gen["image_size"], _gen["image_frequency"], _gen["steps"], _gen["cfg"],
-                _gen["ref_image"], _gen["general_negative"], _gen["character_negative"], _gen["multi_character_negative"], _gen["active_session_id"],
+                _gen["ref_image"], _gen["negative_prompt"], _gen["active_session_id"],
             ],
             outputs=_regen_outputs,
             show_progress="minimal",
@@ -4444,7 +4461,7 @@ def _wire_create_events(status_box) -> None:
             functools.partial(_do_regen_named, "theme", i),
             inputs=[
                 _gen["image_size"], _gen["image_frequency"], _gen["steps"], _gen["cfg"],
-                _gen["ref_image"], _gen["general_negative"], _gen["character_negative"], _gen["multi_character_negative"], _gen["active_session_id"],
+                _gen["ref_image"], _gen["negative_prompt"], _gen["active_session_id"],
             ],
             outputs=_regen_outputs,
             show_progress="minimal",
