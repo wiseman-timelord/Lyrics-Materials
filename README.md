@@ -34,7 +34,7 @@ Available on [HuggingFace.Co](https://huggingface.co/)...
 - Lyrics should be in format of (as many chorus as you like)...
 ```
 [Intro]
-**intro lyrics**
+**intro**
 
 [Chorus 1]
 **chorus**
