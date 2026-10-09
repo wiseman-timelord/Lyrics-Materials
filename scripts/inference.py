@@ -1190,12 +1190,30 @@ def _load_analysis_from_disk(project_dir: Path) -> Optional[Dict[str, Any]]:
     }
 
 
+def _normalize_presence_token(raw: str) -> str:
+    """Map a presence label to none|silhouette|partial|full only."""
+    t = (raw or "").strip().lower()
+    # Take first token only (guards against leaked instruction text)
+    token = re.split(r"[\s,;:]+", t, maxsplit=1)[0] if t else "none"
+    if token in ("none", "silhouette", "partial", "full"):
+        return token
+    # Heuristic: long instruction residue → none (do not attach ref)
+    if len(t) > 24 or "absent" in t or "without the reference" in t:
+        return "none"
+    return "none"
+
+
 def _load_prompts_from_disk(
     project_dir: Path, expected_lines: int,
 ) -> Tuple[Optional[List[str]], Optional[List[str]]]:
     """
     Parse prompts.txt written by the pipeline.
     Returns (prompts, presence_per_line) or (None, None) if incomplete/missing.
+
+    Presence is ONLY read from the formal `character: <token>` line that appears
+    before `--- prompt ---`. Lines inside the prompt body that happen to start
+    with "CHARACTER:" (model instruction echo) must NOT overwrite presence —
+    that bug made regen attach the reference image when presence was none.
     """
     path = project_dir / "prompts.txt"
     if not path.exists():
@@ -1212,20 +1230,21 @@ def _load_prompts_from_disk(
     in_prompt = False
 
     def _commit():
-        nonlocal current_prompt, current_pres
+        nonlocal current_prompt, current_pres, in_prompt
         if in_prompt or current_prompt:
             prompts.append("\n".join(current_prompt).strip())
-            presence.append(current_pres)
+            presence.append(_normalize_presence_token(current_pres))
         current_prompt = []
         current_pres = "none"
+        in_prompt = False
 
     for raw in text.splitlines():
         if raw.startswith("=== line "):
             if prompts or current_prompt or in_prompt:
                 _commit()
-            in_prompt = False
             continue
-        if raw.lower().startswith("character:"):
+        # Formal presence line — only before the prompt body
+        if (not in_prompt) and raw.lower().startswith("character:"):
             current_pres = raw.split(":", 1)[1].strip().lower() or "none"
             continue
         if raw.strip() == "--- prompt ---":
@@ -2198,6 +2217,11 @@ _PROMPT_LEAK_MARKERS = (
     "describe pose, action, and framing only",
     "output the scene description only",
     "output the paragraph only",
+    "main character: absent",
+    "scene without the reference person",
+    "not the main reference",
+    "with outfits appropriate to the scene",
+    "likeness and wardrobe for the main character",
 )
 
 
@@ -2208,90 +2232,98 @@ def _sanitize_visual_prompt(prompt: str, lyric: str, style_hint: str = "") -> st
     Header, lyric line, and identity lock are assembled separately by
     compose_lyric_still_prompt — this function must NOT inject those.
 
-    Also recovers usable content from models that emit SCENE:/POSE:/BACKGROUND:
-    labels, and drops pure instruction echoes.
+    Strips model instruction echoes (CHARACTER: absent…, Figures in this still…)
+    while keeping the real scene sentence that often follows them.
     """
     p = (prompt or "").strip()
     if not p:
         return ""
-    low = p.lower()
     lyric_low = (lyric or "").strip().lower().rstrip(" .,;:!?…")
+    low = p.lower()
 
     # Exact lyric used as a stand-in is not a scene description
     if lyric_low and low.rstrip(" .,;:!?…") == lyric_low:
         return ""
 
-    # Hard instruction-echo
-    if (
-        any(m in low for m in _PROMPT_LEAK_MARKERS)
-        or low.lstrip().startswith("section (")
-        or low.lstrip().startswith("main character:")
-        or low.lstrip().startswith("in 512 characters")
-    ):
-        # May still salvage POSE/BACKGROUND body below
-        pass
-    else:
-        # Normal dense paragraph path
-        if len(p) > 512:
-            cut = p[:512]
-            for sep in (". ", "! ", "? ", "; "):
-                pos = cut.rfind(sep)
-                if pos > 200:
-                    cut = cut[: pos + 1]
-                    break
-            else:
-                cut = cut.rsplit(" ", 1)[0]
-            p = cut
-        # Reject if still mostly instruction-ish after trim
-        if any(m in p.lower() for m in _PROMPT_LEAK_MARKERS):
+    # --- Recover structured SCENE:/POSE:/BACKGROUND dumps ---
+    if re.search(r"(?im)^(SCENE|POSE|BACKGROUND|SETTING|ACTION)\s*[:\-]", p):
+        bits: List[str] = []
+        for raw_line in re.split(r"[\r\n]+", p):
+            line = raw_line.strip()
+            if not line:
+                continue
+            m = re.match(
+                r"^(?:SCENE|POSE|BACKGROUND|SETTING|ACTION|LIGHTING)\s*[:\-]\s*(.+)$",
+                line,
+                re.I,
+            )
+            body = (m.group(1).strip() if m else line).strip()
+            blow = body.lower()
+            if not body or blow in ("none", "n/a", "na", "-"):
+                continue
+            if any(mk in blow for mk in _PROMPT_LEAK_MARKERS):
+                continue
+            if blow.startswith("if ") and "secondary" in blow:
+                continue
+            bits.append(body.rstrip(" .;,"))
+        if bits:
+            scene = ". ".join(bits)
+            if scene[-1] not in ".!?":
+                scene += "."
+            if len(scene) > 512:
+                scene = scene[:512].rsplit(" ", 1)[0]
+            print(f"[images] recovered scene from structured prompt: {scene[:100]}…", flush=True)
+            return scene.strip()
+
+    # --- Strip leading instruction echoes, keep the real scene ---
+    # CHARACTER: / MAIN CHARACTER: … (one or more sentences of meta)
+    p2 = re.sub(
+        r"(?is)^\s*(?:main\s+)?character\s*:\s*"
+        r".*?(?:reference person|reference image|main reference)[^.]*\.\s*",
+        "",
+        p,
+        count=1,
+    ).strip()
+    p2 = re.sub(
+        r"(?is)^\s*figures in this still\s*(?:\([^)]*\))?\s*:?\s*"
+        r".*?(?:with outfits appropriate to the scene\.?\s*)?",
+        "",
+        p2,
+        count=1,
+    ).strip()
+    p2 = re.sub(r"(?is)\bwith outfits appropriate to the scene\.?\s*", "", p2).strip()
+    p2 = re.sub(r"(?is)\bassistant\.?\s*", " ", p2).strip()
+    p2 = re.sub(r"\s{2,}", " ", p2).strip()
+
+    # If still contaminated, keep only sentences without leak markers
+    if any(mk in p2.lower() for mk in _PROMPT_LEAK_MARKERS):
+        parts = re.split(r"(?<=[.!?])\s+", p2)
+        kept = [
+            s.strip()
+            for s in parts
+            if s.strip() and not any(mk in s.lower() for mk in _PROMPT_LEAK_MARKERS)
+        ]
+        p2 = " ".join(kept).strip()
+
+    if not p2 or len(p2) < 20:
+        # Hard instruction-only payload
+        if any(mk in low for mk in _PROMPT_LEAK_MARKERS):
             print("[images] prompt looks like instruction leak — scene omitted", flush=True)
             return ""
-        return p.strip()
-
-    # Recover from SCENE:/POSE:/BACKGROUND: structured dumps
-    bits: List[str] = []
-    # Split on labeled lines
-    for raw_line in re.split(r"[\r\n]+", p):
-        line = raw_line.strip()
-        if not line:
-            continue
-        m = re.match(
-            r"^(?:SCENE|POSE|BACKGROUND|SETTING|ACTION|LIGHTING)\s*[:\-]\s*(.+)$",
-            line,
-            re.I,
-        )
-        body = (m.group(1).strip() if m else line).strip()
-        blow = body.lower()
-        if not body or blow in ("none", "n/a", "na", "-"):
-            continue
-        if any(m2 in blow for m2 in _PROMPT_LEAK_MARKERS):
-            continue
-        if blow.startswith("if ") and "secondary" in blow:
-            continue
-        if blow.startswith("background characters are (") or blow.startswith("background characters are if"):
-            continue
-        # Drop empty "Background characters are" with no real content
-        if re.match(r"^background characters are\s*$", blow):
-            continue
-        bits.append(body.rstrip(" .;,"))
-
-    if not bits:
-        print("[images] structured prompt unusable — scene omitted", flush=True)
         return ""
 
-    scene = ". ".join(bits)
-    if scene and scene[-1] not in ".!?":
-        scene += "."
-    if len(scene) > 512:
-        cut = scene[:512]
-        for sep in (". ", "! ", "? "):
+    if len(p2) > 512:
+        cut = p2[:512]
+        for sep in (". ", "! ", "? ", "; "):
             pos = cut.rfind(sep)
-            if pos > 120:
+            if pos > 200:
                 cut = cut[: pos + 1]
                 break
-        scene = cut
-    print(f"[images] recovered scene from structured prompt: {scene[:100]}…", flush=True)
-    return scene.strip()
+        else:
+            cut = cut.rsplit(" ", 1)[0]
+        p2 = cut
+    return p2.strip()
+
 
 
 def _appearance_bit(cfg: Dict[str, Any]) -> str:
@@ -2472,7 +2504,7 @@ def generate_images_from_prompts(
 
         pres = "none"
         if presence_per_line and i < len(presence_per_line):
-            pres = (presence_per_line[i] or "none").lower()
+            pres = _normalize_presence_token(presence_per_line[i] or "none")
         use_char_ref = bool(has_ref and pres != "none")
         clean_prompt = _sanitize_visual_prompt(prompt, line_text, style_hint)
         prev_still: Optional[Path] = None  # progressive chain within this line
@@ -2823,9 +2855,10 @@ def regenerate_single_still(
     line_no = int(line_index) + 1
     line_text = lines[line_index]
     prompt = prompts[line_index]
+    # Presence must be a clean token — never instruction residue from prompts.txt
     pres = "none"
     if presence and line_index < len(presence):
-        pres = (presence[line_index] or "none").lower()
+        pres = _normalize_presence_token(presence[line_index] or "none")
 
     # Keep the existing still on disk until the new one is written (sd-cli -o
     # overwrites). Pre-deleting made the gallery show "No Image" and shifted
