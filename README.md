@@ -15,20 +15,17 @@ It convert lines of lyrics into AI generated images, one for each line. The idea
 ![Generation_Page](https://github.com/wiseman-timelord/Lyrics-Materials/blob/main/media/Configuration_Page.jpg)
 
 ### Features:
-- **Local Tool**; paste lyrics → one still per non-marker lyric line → `output/<song_name>/` folder of numbered PNGs for use in external AI video tools.
-- **Clever Model Handling;** If Thinking and ImageGen share the same Vulkan device and either uses M-Lock, Thinking fully unloads before Flux loads — they are never resident together.
-- **Two-phase orchestration;** Phase 1 = assessment + prompts (Thinking preferred, else Encoder),  Phase 2 = image generation (Flux on its backend)
-- **llama.cpp;** (`llama-completion`) for song analysis + per-line visual prompts.
-- **stable-diffusion.cpp;** (`sd-cli`) for Flux.2-klein stills.
-- **ffmpeg;** for utility/probe use only — not used for materials output.
 - **User Character;** controls for, Reference Image, Character Gender, Bodyshape, Physical Age 25-95, Hair Style, Outfit Worn.
+- **Clever Model Handling;** configure the Encoding processes to, OtherGPU or CPU, to extend Flux2 GPU Memory, while still generating Prompts on GPU too.
+- **Local Tool;** not requiring the use of online antigenic services to create your own local model based music slideshows.
+- **libraries;** llama.cpp for song analysis + per-line visual prompts, stable-diffusion.cpp for Flux.2-klein. ffmpeg for utility/probe.
 
 ### Models
 Available on [HuggingFace.Co](https://huggingface.co/)...  
 - Encoder/Prompting: [Huihui-Qwen3-VL-4B-Thinking-abliterated-GGUF](https://huggingface.co/mradermacher/Huihui-Qwen3-VL-4B-Thinking-abliterated-GGUF) for Rich analysis + prompts when set (I used q4).
 - Diffuser: [flux-2-klein-4b-GGUF](https://huggingface.co/models?search=flux2%204b%20gguf) Image generation (one of those, cant remember which one I used) (I used q8).
 - VAE: [diffusion_pytorch_model.safetensors](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B/resolve/main/vae/diffusion_pytorch_model.safetensors?download=true) the other image generation file (one file).
-- Note the mmproj is not used, and if present then is auto-moved to `models\mmproj\`
+- Note the mmproj from the Qwen3-VL-4B is not used, and if present then is auto-moved to `**model_folder**\mmproj\`, saving complication in the scripts, but the mmproj is superseded by Flux2.
 - Program designed for Portrait mode monitor, but it should/will work on Landscape too just with some sliders.
 
 ### Instructions:
