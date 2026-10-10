@@ -1,8 +1,8 @@
 # Lyrics-Materials
-Status: Beta - Developing and improving. This is Experimental. Note the images shown below were generated with v0.25, generation and reference image likeness, is now figured out, and the interface is quite ok.
+Status: Beta - Mid-Late development, improving, correcting. Note the images shown below were generated with v0.25.
 
 ### Description:
-It will convert lines of lyrics into AI generated images, one for each line. The idea is one could arrange these in a movie editor, and fade in/out between sections of images, to make simple music videos. One could also take the line of lyrics and the generated images, and feed that into AI video generator to make clips, that could then be assembled.
+It convert lines of lyrics into AI generated images, one for each line. The idea is one could arrange these in a movie editor, and fade in/out between sections of images, to make simple music videos. One could also take the line of lyrics and the generated images, and feed that into AI video generator to make clips, that could then be assembled.
 
 ### Media:
 - Here is the Initial Project Page where the user sets things up (v0.25)...
@@ -21,6 +21,7 @@ It will convert lines of lyrics into AI generated images, one for each line. The
 - **llama.cpp;** (`llama-completion`) for song analysis + per-line visual prompts.
 - **stable-diffusion.cpp;** (`sd-cli`) for Flux.2-klein stills.
 - **ffmpeg;** for utility/probe use only — not used for materials output.
+- **User Character;** controls for, Reference Image, Character Gender, Bodyshape, Physical Age 25-95, Hair Style, Outfit Worn.
 
 ### Models
 Available on [HuggingFace.Co](https://huggingface.co/)...  
@@ -32,7 +33,7 @@ Available on [HuggingFace.Co](https://huggingface.co/)...
 - Program designed for Portrait mode monitor, but it should/will work on Landscape too just with some sliders.
 
 ### Instructions:
-- These are my current instructions for using the program...(Note; If you are unsure as to if Flux2 will be ok with your settings and VRam settings, then you may want Task Manager open at this stage, with the python process selected ready to End Task if you get VRam overload on model load, while to also be able to monitor goings on with the GPU memory/shaders if everything goes ok. 
+- These are my current instructions for using the program...(Note; If you are unsure as to if Flux2 will be ok with your settings and VRam settings, then open Task Manager, there check python process, and monitor GPU memory/shaders. 
 - As I have repeating stated "for 8GB VRam you would want image settings to, 768x512 or 640x360 (half 720p), that is with Diffuser Placement set to "Split". I would assume one could load the complete Flux2 model to GPU on 12GB card, but then Encoder must be loaded at same time, so possibly still need cpu for Encoder if Full; failure to take consideration may crash or mess up graphics drivers, worse case scenario requiring factory reset install.)
 1. The program will start, you will be in a new project, so collapse the left pane, unless you are going to hop sessions.
 2. User enters **song name** (folder slug) and pastes lyrics; optional (advised) single **reference image** for central character.
@@ -82,9 +83,11 @@ Lyrics-Materials/
 ```
 
 ### Development:
-- Apparently the qwen3-vl-thinking model can generate the prompts AND encode the images? if this is the case, please ensure to shift ALL instruct model duties over to the thinking model, so we can reduce the number of models used  
-- Thumbnails on a new page, to speed up and fix issues on the Generation page, Generation page needs renaming to Management page.
+- The outfits need improving, current list is from Image Glamour plus 2 for artist, though after review. For more range, enumerate common outfit types, and create larger list, also 
+- add another control for footwear, ie, black-boots, manila-boots, black-shoes, manila-shoes, black-trainers, manila-trainers, none-specified (no text segment in prompt).
+
 - Option to have NONE of the images with background/other characters; option for all scenes will as are appropriate ONLY feature reference character or just the scene. 
 
 ### Disclaimer:
+- Warnings of quantum-weirdness in advance, but if you are familiar with Flux-2-Klein and qwen3-4b-thinking, this seems to be a good showcasing of what it can do, but you yourself are the one whom pulls the lever on your own configurations and Lyrics, then unexpected results will occur, because I probably havn't seen it before, one can always use the Negative prompt to filter out their phobias/fears in a box on the bottom of panel at location of  `Management > Name and Lyrics`.
 - Do not over-load your GPU, it could cause graphics driver crash. As stated, ensure you understand the capabilities of your card. My max settings for 8 GB GPU was 768x512 (no bigger), and image models were loaded in Split mode. If your graphics driver does start to crash due to low ram, then try to close the program (python command prompt is fastest) IMMEDIATELY, and re-think your configurations.
