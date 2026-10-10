@@ -9,6 +9,8 @@ Models:
 """
 from __future__ import annotations
 
+import threading
+
 import configparser
 import json
 import os
@@ -615,6 +617,33 @@ STYLE_CHOICES = [STYLE_LIGHT, STYLE_DARK, STYLE_COLORFUL]
 # Default visual style for new projects / fresh installs
 STYLE_DEFAULT = STYLE_DARK
 
+
+def normalize_style(value: str | None) -> str:
+    """
+    Map a UI / session / prefs visual-style value to a canonical STYLE_CHOICES entry.
+    Empty / unknown values fall back to STYLE_DEFAULT (dark and gloomy), never to
+    STYLE_LIGHT unless the user explicitly selected it.
+    """
+    v = (value or "").strip()
+    if v in STYLE_CHOICES:
+        return v
+    low = v.lower().replace("_", " ").replace("-", " ")
+    aliases = {
+        "light": STYLE_LIGHT,
+        "bright": STYLE_LIGHT,
+        "light and bright": STYLE_LIGHT,
+        "dark": STYLE_DARK,
+        "gloomy": STYLE_DARK,
+        "dark and gloomy": STYLE_DARK,
+        "colorful": STYLE_COLORFUL,
+        "colourful": STYLE_COLORFUL,
+        "wild": STYLE_COLORFUL,
+        "colorful and wild": STYLE_COLORFUL,
+        "colourful and wild": STYLE_COLORFUL,
+    }
+    return aliases.get(low, STYLE_DEFAULT)
+
+
 # ---------------------------------------------------------------------------
 # Image style (lead word at the start of every still prompt)
 # ---------------------------------------------------------------------------
@@ -770,7 +799,7 @@ OUTFIT_WORDS = {
     OUTFIT_SMART_CASUAL_FEMALE: "black-tshirt with grey-short-skirt outfit",
     OUTFIT_JOGGERS: "black-crop-top with grey-jogging-shorts outfit",
     OUTFIT_ROCKER: "long-black-leather-coat with black shirt and grey-jeans outfit",
-    OUTFIT_DARKONES: "black-hooded-coat and grey-jeans outfit",
+    OUTFIT_DARKONES: "black-teflon hooded-hiphop-coat zipped-up with hood-down, grey-jeans, and black-boots",
     OUTFIT_SKIMPY: "skimpy-revealing version of same outfit",
     OUTFIT_NONE: "",
 }
@@ -994,19 +1023,9 @@ def character_identity_clause(
     presence: str = "full",
 ) -> str:
     """
-    Character lock after the scene / lyric line.
+    Natural-language character lock for Flux --llm (no instructional CHARACTER: prefix).
 
     presence = silhouette | partial | full (default full)
-
-    **silhouette** — no face/age/hands lock (those fight a shadow outline):
-      CHARACTER: show the gender male from the reference image as silhouette or
-      shadow outline, and hair … and bodyshape of …, wearing a ….
-
-    **full / partial** — face-match identity lock:
-      Depicted in the middle of the scene, the single individual with the exact
-      same face as the gender male shown in the reference image, that in the
-      generated image are, 45 years old and bodyshape of exotic and hair …
-      and anatomically correct hands, wearing a …
     """
     gp = gender_phrase(gender) if gender else ""
     bp = bodyshape_phrase(bodyshape)
@@ -1016,52 +1035,36 @@ def character_identity_clause(
     if pres not in ("none", "silhouette", "partial", "full"):
         pres = "full"
 
-    gender_bit = f"the gender {gp}" if gp else "the subject"
+    subject = f"a {gp}" if gp else "the subject"
 
-    # --- Silhouette / shadow: omit face, age, hands ---
     if pres == "silhouette":
-        bits: List[str] = []
+        bits: List[str] = [
+            f"silhouette or shadow outline of {subject} matching the reference image"
+        ]
         if hp:
             bits.append(f"hair {hp}")
         if bp:
-            bits.append(f"bodyshape of {bp}")
-        tail = ""
-        if bits:
-            tail = ", and " + " and ".join(bits)
+            bits.append(f"{bp} build")
         if op:
-            tail = f"{tail}, wearing a {op}" if tail else f", wearing a {op}"
-        core = (
-            f"CHARACTER: show {gender_bit} from the reference image as "
-            f"silhouette or shadow outline{tail}."
-        )
-        return core
+            bits.append(f"wearing {op}")
+        return ", ".join(bits) + "."
 
-    # --- Full / partial: face-match identity lock ---
-    attrs: List[str] = []
-    if age is not None and str(age).strip() != "":
-        attrs.append(age_phrase(age))
-    if bp:
-        attrs.append(f"bodyshape of {bp}")
-    if hp:
-        attrs.append(f"hair {hp}")
-    attrs.append("anatomically correct hands")
-    attr_bit = " and ".join(attrs)
-
-    core = (
-        "Depicted in the middle of the scene, the single individual with the exact "
-        f"same face as {gender_bit} shown in the reference image, that in the "
-        f"generated image are, {attr_bit}"
-    )
-    if op:
-        core = f"{core}, wearing a {op}."
-    else:
-        core = core + "."
+    # full / partial — face-match identity lock in natural prose
+    bits = [
+        f"single individual matching the face of {subject} in the reference image"
+    ]
     if pres == "partial":
-        core = (
-            "CHARACTER: show the main character partially (cropped, turned, or distant). "
-            + core
-        )
-    return core
+        bits.append("partially visible (cropped, turned, or mid-distance)")
+    if age is not None and str(age).strip() != "":
+        bits.append(age_phrase(age))
+    if bp:
+        bits.append(f"{bp} build")
+    if hp:
+        bits.append(f"hair {hp}")
+    bits.append("anatomically correct hands")
+    if op:
+        bits.append(f"wearing {op}")
+    return ", ".join(bits) + "."
 
 
 def still_header(image_style: str = "", visual_style: str = "") -> str:
@@ -1089,20 +1092,16 @@ def compose_lyric_still_prompt(
     """
     Full positive prompt for a lyric still:
 
-      {header} Music-video still of: {lyric}. [{scene}] [{identity}] [{sequence}]
+      {header} [{scene}] [{identity}] [{sequence}]
 
-    Scene sits between the lyric sentence and the identity lock when present.
-    Lyric trailing punctuation is cleaned so we never emit ",.".
+    Prefer the Phase-1 scene paragraph. Only fall back to a light lyric cue when
+    the scene is missing — never restatement of the lyric twice.
     """
     header = still_header(image_style, visual_style)
-    # Strip trailing sentence punctuation / commas from the lyric line
     lyric_s = (lyric or "").strip().rstrip(" .,;:!?…")
     parts: List[str] = [header]
-    if lyric_s:
-        parts.append(f"Music-video still of: {lyric_s}.")
 
     scene_s = (scene or "").strip()
-    # Drop scene if empty, duplicate of lyric, instruction echo, or music-video still echo
     if scene_s:
         low = scene_s.lower().strip()
         lyric_low = lyric_s.lower()
@@ -1114,6 +1113,10 @@ def compose_lyric_still_prompt(
             "<|im_start|>",
             "<think>",
             "song context:",
+            "main character:",
+            "character:",
+            "framing note",
+            "cinematic music-video moment expressing the lyric mood",
         )
         if low.startswith("music-video still"):
             scene_s = ""
@@ -1123,11 +1126,15 @@ def compose_lyric_still_prompt(
             scene_s = ""
         elif "music-video still of:" in low and len(scene_s) < 100:
             scene_s = ""
+
     if scene_s:
         scene_s = scene_s.rstrip(" ,;:")
         if scene_s and scene_s[-1] not in ".!?":
             scene_s += "."
         parts.append(scene_s)
+    elif lyric_s:
+        # No usable scene — light lyric cue only (not a full "Music-video still of")
+        parts.append(f"Visual moment for the lyric: {lyric_s}.")
 
     id_s = (identity or "").strip()
     if id_s:
@@ -1168,8 +1175,9 @@ STYLE_PROMPT_TEMPLATES = {
 
 def prompt_template_for_style(style: str) -> str:
     """Return the editable prompt template for a style (from prompting.json)."""
+    key = normalize_style(style)
     data = load_prompting()
-    return data.get(style) or STYLE_PROMPT_TEMPLATES.get(style, STYLE_PROMPT_TEMPLATES[STYLE_LIGHT])
+    return data.get(key) or STYLE_PROMPT_TEMPLATES.get(key, STYLE_PROMPT_TEMPLATES[STYLE_DEFAULT])
 
 
 # Section timing is set by the user via editable markers on the audio
@@ -1706,23 +1714,71 @@ def affinity_mask(n_threads: Optional[int] = None) -> int:
 
 def _load_json_with_defaults(path: Path, defaults: Dict[str, Any]) -> Dict[str, Any]:
     data = dict(defaults)
-    if path.exists():
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-            if isinstance(loaded, dict):
-                data.update(loaded)
-        except (json.JSONDecodeError, OSError):
-            pass
+    with _JSON_IO_LOCK:
+        if path.exists():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    data.update(loaded)
+            except (json.JSONDecodeError, OSError):
+                pass
     return data
 
 
+# One lock for every JSON read/write in this process. On Windows, os.replace()
+# fails with WinError 5 (Access is denied) if *any* handle is open on the
+# destination (the Gradio poll thread reading generation.json, the regen worker
+# writing it, antivirus/indexer scans...). Serialising in-process access and
+# retrying the replace removes that race.
+_JSON_IO_LOCK = threading.RLock()
+
+
+def _replace_with_retry(tmp: Path, path: Path, attempts: int = 12) -> None:
+    """os.replace with back-off for transient Windows sharing violations."""
+    import time as _time
+    delay = 0.03
+    last_err: Optional[BaseException] = None
+    for _ in range(attempts):
+        try:
+            os.replace(str(tmp), str(path))
+            return
+        except PermissionError as e:       # WinError 5 / 32
+            last_err = e
+            _time.sleep(delay)
+            delay = min(delay * 1.7, 0.5)
+    # Last resort: write straight into the destination (not atomic, but the
+    # data is saved rather than lost), then drop the temp file.
+    try:
+        with open(tmp, "r", encoding="utf-8") as src:
+            payload = src.read()
+        with open(path, "w", encoding="utf-8") as dst:
+            dst.write(payload)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return
+    except OSError:
+        pass
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    if last_err is not None:
+        raise last_err
+
+
 def _save_json_atomic(path: Path, data: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-    tmp.replace(path)
+    with _JSON_IO_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Unique temp name per call so two writers never share one .tmp file.
+        tmp = path.with_name(
+            f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        _replace_with_retry(tmp, path)
 
 
 # ---------------------------------------------------------------------------
@@ -1874,17 +1930,23 @@ def _default_preferences() -> Dict[str, Any]:
 
 
 def load_preferences() -> Dict[str, Any]:
-    return _load_json_with_defaults(get_preferences_path(), _default_preferences())
+    data = _load_json_with_defaults(get_preferences_path(), _default_preferences())
+    data["style"] = normalize_style(data.get("style"))
+    return data
 
 
 def save_preferences(data: Dict[str, Any]) -> None:
     filtered = {k: v for k, v in data.items() if k in PREFERENCES_KEYS}
+    if "style" in filtered:
+        filtered["style"] = normalize_style(filtered.get("style"))
     _save_json_atomic(get_preferences_path(), filtered)
 
 
 def update_preferences(updates: Dict[str, Any]) -> Dict[str, Any]:
     data = load_preferences()
     data.update({k: v for k, v in updates.items() if k in PREFERENCES_KEYS})
+    if "style" in data:
+        data["style"] = normalize_style(data.get("style"))
     save_preferences(data)
     return data
 
@@ -2112,7 +2174,7 @@ def load_session_meta(project_dir: Path) -> Dict[str, Any]:
     defaults: Dict[str, Any] = {
         "song_name": project_dir.name,
         "lyrics": "",
-        "style": STYLE_LIGHT,
+        "style": STYLE_DEFAULT,
         "steps": DEFAULT_STEPS,
         "cfg_scale": DEFAULT_CFG,
         "reference_image": "",
@@ -2132,12 +2194,16 @@ def load_session_meta(project_dir: Path) -> Dict[str, Any]:
             defaults.update(data)
     except (json.JSONDecodeError, OSError):
         pass
+    # Always canonicalise style so empty / legacy values become STYLE_DEFAULT
+    defaults["style"] = normalize_style(defaults.get("style"))
     return defaults
 
 
 def save_session_meta(project_dir: Path, updates: Dict[str, Any]) -> Dict[str, Any]:
     data = load_session_meta(project_dir)
     data.update(updates or {})
+    if "style" in data:
+        data["style"] = normalize_style(data.get("style"))
     import time as _time
     data["updated"] = _time.time()
     if not data.get("created"):
@@ -2145,10 +2211,7 @@ def save_session_meta(project_dir: Path, updates: Dict[str, Any]) -> Dict[str, A
     path = _session_meta_path(project_dir)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        tmp.replace(path)
+        _save_json_atomic(path, data)
     except OSError as e:
         print(f"[session] could not write meta: {e}", flush=True)
     return data
@@ -2234,7 +2297,7 @@ def list_sessions() -> List[Dict[str, Any]]:
             "mtime": mtime,
             "image_paths": images,
             "lyrics": meta.get("lyrics") or "",
-            "style": meta.get("style") or STYLE_LIGHT,
+            "style": normalize_style(meta.get("style")),
             "steps": meta.get("steps", DEFAULT_STEPS),
             "cfg_scale": meta.get("cfg_scale", DEFAULT_CFG),
             "reference_image": meta.get("reference_image") or "",
@@ -2266,7 +2329,7 @@ def get_session_by_id(session_id: str) -> Optional[Dict[str, Any]]:
             "mtime": float(meta.get("updated") or p.stat().st_mtime),
             "image_paths": images,
             "lyrics": meta.get("lyrics") or "",
-            "style": meta.get("style") or STYLE_LIGHT,
+            "style": normalize_style(meta.get("style")),
             "steps": meta.get("steps", DEFAULT_STEPS),
             "cfg_scale": meta.get("cfg_scale", DEFAULT_CFG),
             "reference_image": meta.get("reference_image") or "",

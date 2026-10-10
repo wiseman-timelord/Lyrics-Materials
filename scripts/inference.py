@@ -7,6 +7,7 @@ from __future__ import annotations
 import gc
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -70,6 +71,103 @@ def last_image_gen_seconds() -> float:
         return float(configure.load_generation().get("last_image_gen_seconds") or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Per-still timer bookkeeping (shared by Cover / Theme / Lyrics / Regenerate)
+#
+#   image_gen_t0         live timer start for the still currently generating
+#                        (None whenever no still is generating)
+#   last_image_gen_seconds  the estimate shown for the NEXT still; overwritten
+#                        with the measured time the instant a still is saved
+#   still_finished_secs  measured time of the still that just finished
+#   still_finished_at    wall-clock moment that still was saved
+#   still_done_seq       counter bumped on every saved still; UI loops watch it
+#                        to break out of the timer/percent loop immediately
+# ---------------------------------------------------------------------------
+
+def mark_still_started(t0: Optional[float] = None) -> None:
+    """A new still has begun: start a fresh timer and clear the finish markers."""
+    configure.APP_STATE["image_gen_t0"] = float(t0) if t0 else time.time()
+    configure.APP_STATE["still_finished_at"] = None
+    configure.APP_STATE["still_finished_secs"] = None
+
+
+def clear_still_markers() -> None:
+    """Next still is about to be announced: forget the previous still's finish."""
+    configure.APP_STATE["still_finished_at"] = None
+    configure.APP_STATE["still_finished_secs"] = None
+
+
+def mark_still_saved(wall: float) -> float:
+    """
+    The still is on disk. Store its measured duration as the new estimate,
+    stop the live timer and bump still_done_seq so every UI loop leaves its
+    timer/percent loop on its very next pass.
+    """
+    sec = max(0.1, float(wall))
+    record_last_image_gen_seconds(sec)
+    configure.APP_STATE["image_gen_t0"] = None
+    configure.APP_STATE["still_finished_secs"] = round(sec, 1)
+    configure.APP_STATE["still_finished_at"] = time.time()
+    try:
+        seq = int(configure.APP_STATE.get("still_done_seq") or 0) + 1
+    except (TypeError, ValueError):
+        seq = 1
+    configure.APP_STATE["still_done_seq"] = seq
+    return sec
+
+
+def ensure_still_marked(t_start: float) -> float:
+    """
+    Callers invoke this after a successful still. If the sd-cli runner already
+    marked the save (normal case) its measured time is returned untouched, so
+    process teardown / file moves never inflate the next estimate. Otherwise
+    the still is marked now using the time since t_start.
+    """
+    try:
+        at = float(configure.APP_STATE.get("still_finished_at") or 0)
+        secs = float(configure.APP_STATE.get("still_finished_secs") or 0)
+    except (TypeError, ValueError):
+        at, secs = 0.0, 0.0
+    if secs > 0 and at >= float(t_start) - 0.001:
+        return secs
+    return mark_still_saved(time.time() - float(t_start))
+
+
+_PNG_IEND = b"\x00\x00\x00\x00IEND\xaeB`\x82"
+
+
+def _out_path_from_cmd(cmd: List[str]) -> Optional[Path]:
+    for i, c in enumerate(cmd[:-1]):
+        if str(c) in ("-o", "--output"):
+            return Path(str(cmd[i + 1]))
+    return None
+
+
+def _still_file_ready(path: Optional[Path], since: float, prev_size: int) -> Tuple[bool, int]:
+    """
+    True once sd-cli's output file is fully written (PNG: IEND trailer present;
+    other formats: size unchanged across two polls). Files older than `since`
+    are ignored so a previous still at the same path is never mistaken for the
+    new one. Returns (ready, current_size).
+    """
+    if path is None:
+        return False, 0
+    try:
+        st = path.stat()
+    except OSError:
+        return False, 0
+    if st.st_mtime < since - 1.0 or st.st_size < 64:
+        return False, st.st_size
+    if path.suffix.lower() == ".png":
+        try:
+            with open(path, "rb") as f:
+                f.seek(-12, os.SEEK_END)
+                return f.read(12) == _PNG_IEND, st.st_size
+        except OSError:
+            return False, st.st_size
+    return (prev_size > 0 and st.st_size == prev_size), st.st_size
 
 
 def maybe_bleep_section() -> None:
@@ -198,6 +296,9 @@ def emergency_stop() -> str:
     msg = "Pipeline stopped by user."
     if n:
         msg += f" Terminated {n} process(es)."
+    # Always release the running latch (even if no project folder yet)
+    configure.APP_STATE["session_status"] = "stopped"
+    configure.APP_STATE["generating"] = False
     # Persist partial progress so the session can be resumed
     try:
         pf = configure.APP_STATE.get("current_project_folder") or ""
@@ -207,7 +308,6 @@ def emergency_stop() -> str:
                 "phase": "stopped",
                 "images_done": len(imgs),
             })
-            configure.APP_STATE["session_status"] = "stopped"
             configure.APP_STATE["generation_output_paths"] = imgs
     except Exception as e:
         print(f"[stop] session meta update failed: {e}", flush=True)
@@ -729,7 +829,7 @@ _ANALYSIS_CTX = 16384
 # 512 truncated mid-Intro and left later sections blank.
 _ANALYSIS_PREDICT = 2048
 _PROMPT_CTX = 4096
-_PROMPT_PREDICT = 180
+_PROMPT_PREDICT = 280
 
 # Generation timeouts (seconds) — analysis can run long with large n_predict
 _TIMEOUT_NAME = 120.0
@@ -822,6 +922,34 @@ def _extract_completion_text(raw_out: str, prompt: str) -> str:
     for end in ("<|im_end|>", "<|endoftext|>", "[end of text]"):
         if end in text:
             text = text.split(end)[0].strip()
+
+    # Drop leaked role headers / system prompt echoes (plain text form)
+    text = re.sub(
+        r"(?is)^\s*(?:system|user|assistant)\s*"
+        r"(?:You are a precise music-video art director\.?\s*)?"
+        r"(?:Follow the user's structure exactly\.?\s*)?"
+        r"(?:Write real sentences, not keyword lists\.?\s*)?",
+        "",
+        text,
+    ).strip()
+    text = re.sub(
+        r"(?is)\bYou are a precise music-video art director\.?\s*"
+        r"Follow the user's structure exactly\.?\s*"
+        r"Write real sentences, not keyword lists\.?\s*",
+        "",
+        text,
+    ).strip()
+    # If the model echoed the user instruction, keep text after the last cue
+    for cue in (
+        "Write only the scene description.",
+        "Cover setting, action, and lighting",
+        "Describe a music-video still",
+    ):
+        if cue.lower() in text.lower():
+            idx = text.lower().rfind(cue.lower())
+            tail = text[idx + len(cue):].strip(" \n:.-")
+            if len(tail) > 40:
+                text = tail
 
     # Prefer structured assessment body
     upper = text.upper()
@@ -1411,7 +1539,7 @@ def _snapshot_session(
         "song_name": (song_name or cfg.get("project_label") or project_dir.name).strip()
         or project_dir.name,
         "lyrics": lyrics if lyrics is not None else "",
-        "style": cfg.get("style") or configure.STYLE_LIGHT,
+        "style": configure.normalize_style(cfg.get("style")),
         "steps": int(cfg.get("imagegen_steps") or configure.DEFAULT_STEPS),
         "cfg_scale": float(cfg.get("imagegen_cfg_scale") or configure.DEFAULT_CFG),
         "reference_image": reference_image or "",
@@ -1800,11 +1928,11 @@ def generate_visual_prompts(
     if not model_path:
         raise RuntimeError("No Thinking model configured for visual prompts.")
 
-    style = cfg.get("style") or configure.STYLE_LIGHT
+    style = configure.normalize_style(cfg.get("style"))
     template = (
         cfg.get("prompt_template")
         or configure.prompt_template_for_style(style)
-        or configure.STYLE_PROMPT_TEMPLATES[configure.STYLE_LIGHT]
+        or configure.STYLE_PROMPT_TEMPLATES[configure.STYLE_DEFAULT]
     )
 
     line_section: Dict[int, str] = {}
@@ -1865,10 +1993,9 @@ def generate_visual_prompts(
                     "each with their own distinct outfit. "
                 )
             char_clause = (
-                f"MAIN CHARACTER: {how}. "
-                "Likeness and wardrobe for the main character are applied later from the "
-                "reference image and UI — describe pose, action, and framing only, not "
-                f"main-character clothing. Notes: {char_guide or 'match the reference subject.'} "
+                f"Show the main figure {how}. "
+                "Pose and action only — no face or clothing detail. "
+                f"{(char_guide or '')[:120]} "
                 f"{sec_people}"
             )
         elif has_character_ref and pres == "none":
@@ -1882,7 +2009,7 @@ def generate_visual_prompts(
                     "Environment, objects, or anonymous figures only as the lyric suggests. "
                 )
             char_clause = (
-                "MAIN CHARACTER: absent from this still — scene without the reference person. "
+                "The main figure is not in this still. "
                 f"{sec_people}"
             )
         else:
@@ -1900,37 +2027,44 @@ def generate_visual_prompts(
 
         # Style header is applied later by compose_lyric_still_prompt — keep the
         # model instruction free of template/style text so it cannot echo into scene.
+        # Keep presence guidance outside the model text to reduce echo.
+        presence_hint = ""
+        if has_character_ref and pres == "silhouette":
+            presence_hint = "The main figure appears only as a silhouette or shadow.\n"
+        elif has_character_ref and pres == "partial":
+            presence_hint = "The main figure is partial (cropped, turned, or distant).\n"
+        elif has_character_ref and pres == "full":
+            presence_hint = "The main figure is present in frame.\n"
+        elif has_character_ref and pres == "none":
+            presence_hint = "The main figure is absent from this still.\n"
         instruction = (
-            f"Lyric line:\n{line}\n\n"
-            f"Song context: {overall[:350]}\n"
-            f"Section ({sec}): {sec_note[:250]}\n"
-            f"{char_clause}\n\n"
-            "Write ONE short visual scene paragraph (max 512 characters) for a "
-            "music-video still of this lyric line. "
-            "Include setting, action, lighting, and composition. "
-            "Do not describe the main character's face or clothing. "
-            "Do not repeat the lyric word-for-word. "
-            "Do not use labels (SCENE, POSE, BACKGROUND). "
-            "Do not quote or restate these instructions. "
-            "Reply with only the scene paragraph — nothing else."
+            f"Lyric: {line}\n"
+            f"Context: {overall[:200]}\n"
+            f"Section ({sec}): {sec_note[:140]}\n"
+            f"{presence_hint}"
+            f"{char_clause}\n"
+            "Describe the setting, action, and lighting in one short paragraph "
+            "(40–90 words). Output the scene only."
         )
         try:
             text = _run_llama_completion(
                 instruction, cfg, role=role, model_path=model_path,
-                n_predict=min(_PROMPT_PREDICT, 160), ctx_size=_PROMPT_CTX,
-                temperature=0.8, timeout=_TIMEOUT_PROMPT,
+                n_predict=_PROMPT_PREDICT, ctx_size=_PROMPT_CTX,
+                temperature=0.75, timeout=_TIMEOUT_PROMPT,
             )
-            preview = (text or "").strip().replace("\n", " ")[:120]
-            print(f"[prompts] Lyrics Line {line_no} OK — scene preview: {preview}…", flush=True)
         except Exception as e:
             print(f"[prompts] Lyrics Line {line_no} FAILED — empty scene: {e}", flush=True)
             text = ""
         # Pure scene only — style/lyric header added at image time by compose_*
         scene_body = _sanitize_visual_prompt(text or "", line, style)
-        if not scene_body:
+        if scene_body:
+            preview = scene_body.replace("\n", " ")[:140]
+            print(f"[prompts] Lyrics Line {line_no} OK — scene: {preview}", flush=True)
+        else:
+            raw_prev = (text or "").strip().replace("\n", " ")[:100]
             print(
                 f"[prompts] Lyrics Line {line_no}: empty after sanitize "
-                f"(raw was {len((text or '').strip())} chars)",
+                f"(raw {len((text or '').strip())} chars: {raw_prev!r})",
                 flush=True,
             )
         prompts.append(scene_body)
@@ -1958,11 +2092,18 @@ def _run_sd_cli_once(cmd: List[str], exe: Path, timeout: float = 600.0) -> Tuple
         return _run_sd_cli_once_unlocked(cmd, exe, timeout=timeout)
 
 
+# Seconds sd-cli is allowed to keep running after its image is on disk
+# (model teardown / VRAM release). Past this it is stopped so the next image
+# or phase can start immediately.
+_SD_POST_SAVE_GRACE = 3.0
+
+
 def _run_sd_cli_once_unlocked(cmd: List[str], exe: Path, timeout: float = 600.0) -> Tuple[str, int]:
     if "-v" not in cmd and "--verbose" not in cmd:
         cmd = list(cmd) + ["-v"]
     print("[sd-cli] " + " ".join(str(c) for c in cmd), flush=True)
     print(f"[sd-cli] starting (timeout {timeout:.0f}s) — streaming output…", flush=True)
+    out_path = _out_path_from_cmd(cmd)
     t0 = time.time()
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -1971,20 +2112,62 @@ def _run_sd_cli_once_unlocked(cmd: List[str], exe: Path, timeout: float = 600.0)
         bufsize=1,
     )
     register_process(proc)
+    # The live timer for THIS still starts exactly when sd-cli starts, so the
+    # time measured at save is directly comparable with the estimate shown.
+    mark_still_started(t0)
+
+    # Reader thread: readline() can block for many seconds with no output, so
+    # the main loop polls a queue and can also watch the output file itself.
+    line_q: "queue.Queue[Optional[str]]" = queue.Queue()
+
+    def _reader(stream) -> None:
+        try:
+            for ln in iter(stream.readline, ""):
+                line_q.put(ln)
+        except Exception:
+            pass
+        finally:
+            line_q.put(None)
+
+    assert proc.stdout is not None
+    reader = threading.Thread(target=_reader, args=(proc.stdout,), daemon=True)
+    reader.start()
+
     tail: List[str] = []
     saved_ok = False
+    saved_at = 0.0
+    released_after_save = False
     model_loaded = False
     rc = -1
     flags: List[str] = []
+    prev_size = 0
+    last_file_poll = 0.0
+
+    def _on_saved(via: str) -> None:
+        """Image is on disk — stop the timer, store the time, signal the UI NOW."""
+        nonlocal saved_ok, saved_at
+        if saved_ok:
+            return
+        saved_ok = True
+        saved_at = time.time()
+        try:
+            wall = mark_still_saved(saved_at - t0)
+            print(
+                f"[sd-cli] image saved ({via}) — timer stopped at {wall:.1f}s; "
+                f"estimate for the next still is now {wall:.0f}s",
+                flush=True,
+            )
+        except Exception:
+            pass
+
     try:
-        deadline = time.time() + timeout
-        assert proc.stdout is not None
+        deadline = t0 + timeout
         while True:
             if is_cancel_requested():
                 proc.kill()
                 flags.append("[[CANCELLED]] sd-cli was stopped by a cancel request.")
                 break
-            if time.time() > deadline:
+            if not saved_ok and time.time() > deadline:
                 proc.kill()
                 print(f"[sd-cli] TIMEOUT after {time.time() - t0:.1f}s", flush=True)
                 flags.append(
@@ -1992,26 +2175,48 @@ def _run_sd_cli_once_unlocked(cmd: List[str], exe: Path, timeout: float = 600.0)
                     f"(limit {timeout:.0f}s) before saving an image."
                 )
                 break
-            line = proc.stdout.readline()
-            if line == "" and proc.poll() is not None:
-                break
-            if not line:
-                time.sleep(0.02)
-                continue
-            text_line = line.rstrip("\n\r")
-            tail.append(text_line)
-            if len(tail) > 250:
-                tail = tail[-200:]
-            print(f"[sd-cli] {text_line}", flush=True)
-            low = text_line.lower()
-            if "images saved" in low or "save result image" in low and "success" in low:
-                saved_ok = True
-            if not model_loaded and any(
-                k in low for k in ("loaded", "load model", "diffusion", "vae", "tensor")
-            ):
-                if "load" in low or "loaded" in low:
+            try:
+                line = line_q.get(timeout=0.1)
+            except queue.Empty:
+                line = ""
+            if line is None:
+                break  # sd-cli closed its output (exited)
+            if line:
+                text_line = line.rstrip("\n\r")
+                tail.append(text_line)
+                if len(tail) > 250:
+                    tail = tail[-200:]
+                print(f"[sd-cli] {text_line}", flush=True)
+                low = text_line.lower()
+                if "images saved" in low or ("save result" in low and "success" in low):
+                    _on_saved("log")
+                if not model_loaded and ("load" in low) and any(
+                    k in low for k in ("loaded", "load model", "diffusion", "vae", "tensor")
+                ):
                     model_loaded = True
                     print(f"[sd-cli] *** MODEL ACTIVITY ({time.time() - t0:.1f}s) ***", flush=True)
+            # Do not rely on log text alone: also watch the output file.
+            now = time.time()
+            if not saved_ok and out_path is not None and now - last_file_poll >= 0.2:
+                last_file_poll = now
+                ready, prev_size = _still_file_ready(out_path, t0, prev_size)
+                if ready:
+                    _on_saved("output file complete")
+            # Image is saved: give sd-cli a short grace to exit by itself, then
+            # release it so the timer loop, the next image and the next phase
+            # are never held up by process teardown.
+            if saved_ok and proc.poll() is None and (time.time() - saved_at) > _SD_POST_SAVE_GRACE:
+                print(
+                    f"[sd-cli] still running {time.time() - saved_at:.1f}s after save — "
+                    "releasing it so the next step can start",
+                    flush=True,
+                )
+                released_after_save = True
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                break
         try:
             proc.wait(timeout=8)
         except Exception:
@@ -2024,6 +2229,8 @@ def _run_sd_cli_once_unlocked(cmd: List[str], exe: Path, timeout: float = 600.0)
             except Exception:
                 pass
         rc = proc.returncode if proc.returncode is not None else -1
+        if released_after_save and saved_ok:
+            rc = 0
     except Exception as e:
         print(f"[sd-cli] stream error: {e}", flush=True)
         try:
@@ -2038,13 +2245,20 @@ def _run_sd_cli_once_unlocked(cmd: List[str], exe: Path, timeout: float = 600.0)
         except Exception:
             pass
         unregister_process(proc)
+        try:
+            reader.join(timeout=1.0)
+        except Exception:
+            pass
+        if not saved_ok:
+            # Failed / cancelled / timed out: no live timer may linger.
+            configure.APP_STATE["image_gen_t0"] = None
         # Drop child handles so the OS can reclaim Vulkan allocations
         try:
             del proc
         except Exception:
             pass
         gc.collect()
-        time.sleep(0.25)
+        time.sleep(0.1)
 
     elapsed = time.time() - t0
     print(f"[sd-cli] finished in {elapsed:.1f}s  exit={rc}", flush=True)
@@ -2313,36 +2527,32 @@ def _write_sd_failure_log(out_dir: Path, line_no: int, attempt: str, cmd: List[s
 
 # Strong instruction-echo markers only (avoid false positives on ordinary scene text)
 _PROMPT_LEAK_MARKERS = (
-    "reply with only the visual description",
-    "character: do not show the reference",
-    "character: show the reference character",
-    "no preamble, no quotes",
-    "no section labels",
-    "--- prompt ---",
-    "character notes:",
-    "omit main-character clothing",
-    "ui-locked",
-    "write only the visual scene",
-    "in 512 characters, write",
-    "if secondary people",
-    "one short line like",
+    "main character:",
+    "character:",
+    "likeness and wardrobe",
+    "describe pose, action",
     "applied later from the",
-    "describe pose, action, and framing only",
-    "output the scene description only",
-    "output the paragraph only",
-    "main character: absent",
-    "scene without the reference person",
-    "not the main reference",
-    "with outfits appropriate to the scene",
-    "likeness and wardrobe for the main character",
-    # Instruction bleed seen in Flux --llm logs (Qwen Thinking echo)
-    "describe the visual scene for this lyric",
-    "describe the visual scene",
+    "reference image and ui",
+    "framing note",
+    "do not copy this text",
+    "do not describe the main",
+    "do not write character",
+    "do not repeat the lyric",
+    "do not quote or restate",
+    "reply with only",
+    "write one visual",
+    "write only the scene",
+    "song context:",
+    "output the scene",
     "one positive paragraph",
-    "do not describe the main character",
+    "or any instruction text",
+    "no preamble, no labels",
+    "inspired by this lyric",
+    "about 80",
+    "40–90 words",
+    "describe the visual scene",
     "secondary people only if the lyric",
     "do not use labels like",
-    "song context:",
     "at most 512 characters",
     "in at most 512 characters",
     "<|im_start|>",
@@ -2350,15 +2560,48 @@ _PROMPT_LEAK_MARKERS = (
     "<think>",
     "</think>",
     "music-video still of:",
+    "precise music-video art director",
+    "follow the user's structure",
+    "write real sentences",
+    "show the main figure",
+    "show the main character only",
+    "pose and action only",
+    "no face or clothing detail",
 )
+
+
+def _strip_prompt_chatml(text: str) -> str:
+    """Remove ChatML / think tags if they ever leak into a positive prompt string."""
+    p = (text or "").strip()
+    if not p:
+        return ""
+    for tok in (
+        "<|im_start|>system", "<|im_start|>user", "<|im_start|>assistant",
+        "<|im_start|>", "<|im_end|>", "<|endoftext|>",
+        "<think>", "</think>",
+    ):
+        p = p.replace(tok, " ")
+    p = re.sub(r"\s{2,}", " ", p).strip()
+    return p
+
+
+def _lyric_scene_fallback(lyric: str) -> str:
+    """Minimal visual scene when Phase-1 sanitize emptied the model output."""
+    line = (lyric or "").strip().rstrip(" .,;:!?…")
+    if not line:
+        return "Cinematic music-video moment with coherent lighting and clear composition."
+    return (
+        f"Cinematic music-video moment expressing the lyric mood of “{line}”, "
+        "clear setting, expressive staging, coherent lighting."
+    )
 
 
 def _sanitize_visual_prompt(prompt: str, lyric: str, style_hint: str = "") -> str:
     """
     Return a pure scene paragraph for the still, or "" if unusable.
 
-    Header, lyric, and identity are assembled by compose_lyric_still_prompt —
-    this must return only the scene body (no ChatML, no instruction echo).
+    Models often echo instruction lines (CHARACTER:, MAIN CHARACTER:, etc.) before
+    the real scene. Strip those; keep the descriptive prose that follows.
     """
     p = (prompt or "").strip()
     if not p:
@@ -2369,71 +2612,77 @@ def _sanitize_visual_prompt(prompt: str, lyric: str, style_hint: str = "") -> st
     for tok in (
         "<|im_start|>system", "<|im_start|>user", "<|im_start|>assistant",
         "<|im_start|>", "<|im_end|>", "<|endoftext|>",
+        "<think>", "</think>",
     ):
         p = p.replace(tok, " ")
-    p = re.sub(r"</?think>", " ", p, flags=re.I)
+    # Plain-text role / system-prompt echoes from ChatML extraction failures
+    p = re.sub(
+        r"(?is)\b(?:system|user|assistant)\s+"
+        r"(?:You are a precise music-video art director\.?\s*)?"
+        r"(?:Follow the user's structure exactly\.?\s*)?"
+        r"(?:Write real sentences, not keyword lists\.?\s*)?",
+        " ",
+        p,
+    )
+    p = re.sub(
+        r"(?is)\bYou are a precise music-video art director\.?\s*"
+        r"Follow the user's structure exactly\.?\s*"
+        r"Write real sentences, not keyword lists\.?\s*",
+        " ",
+        p,
+    )
+    p = re.sub(
+        r"(?is)\bShow the main figure\b[^.]{0,160}\.",
+        " ",
+        p,
+    )
     p = re.sub(r"\s{2,}", " ", p).strip()
-
-    lyric_low = (lyric or "").strip().lower().rstrip(" .,;:!?…")
     low = p.lower()
+    lyric_low = (lyric or "").strip().lower()
 
     if lyric_low and low.rstrip(" .,;:!?…") == lyric_low:
         return ""
 
-    # Cut everything from known instruction phrases onward (echo bleed)
-    cut_phrases = (
-        "describe the visual scene",
-        "one positive paragraph",
-        "do not describe the main character",
-        "secondary people only if",
-        "do not use labels like",
-        "output the scene description only",
-        "output the paragraph only",
-        "reply with only",
-        "write only the visual",
-        "song context:",
-        "likeness and wardrobe",
-        "applied later from the",
+    # Aggressively drop leading / interspersed instruction-echo blocks
+    # that models copy from our prompt template.
+    echo_block = re.compile(
+        r"(?is)\b(?:main\s+)?character\s*:\s*"
+        r".{0,400}?(?=(?:[.!?]\s+[A-Z\"\u201c])|\Z)"
     )
-    cut_at = None
-    for phrase in cut_phrases:
-        idx = low.find(phrase)
-        if idx >= 0 and (cut_at is None or idx < cut_at):
-            cut_at = idx
-    if cut_at is not None:
-        if cut_at < 24:
-            print("[images] prompt is instruction echo — scene omitted", flush=True)
-            return ""
-        p = p[:cut_at].strip().rstrip(" ,;:")
-        low = p.lower()
+    p = echo_block.sub(" ", p)
+    p = re.sub(
+        r"(?is)\b(?:framing note|likeness and wardrobe|describe pose, action|"
+        r"applied later from the|reference image and ui|"
+        r"do not copy this text|do not describe the main character|"
+        r"reply with only|write one (?:short )?visual|song context:|"
+        r"output the scene|one positive paragraph)\b[^.]{0,200}\.?\s*",
+        " ",
+        p,
+    )
+    p = re.sub(r"(?is)^\s*(?:scene|pose|background|setting|action)\s*[:\-]\s*", "", p)
+    p = re.sub(r"\s{2,}", " ", p).strip(" ,;:-")
 
-    # Drop leading style / music-video still echoes (compose adds those)
-    p = re.sub(
-        r"(?is)^\s*(?:photorealistic|cinematic|anime|illustration)[^.]*\.\s*",
-        "",
-        p,
-        count=1,
-    ).strip()
-    p = re.sub(r"(?is)^\s*music-video still of\s*:\s*[^.]+\.\s*", "", p, count=1).strip()
-    # Presence-instruction residue — silhouette/partial wording lives in identity clause now
-    p = re.sub(
-        r"(?is)\b(?:MAIN\s+)?CHARACTER\s*:\s*"
-        r"show the main character[^.]{0,160}\.\s*",
-        "",
-        p,
-    ).strip()
-    p = re.sub(
-        r"(?is)\b(?:MAIN\s+)?CHARACTER\s*:\s*"
-        r"(?:absent from this still|show)[^.]{0,200}\.\s*",
-        "",
-        p,
-    ).strip()
-    low = p.lower()
+    # Drop pure instruction sentences; keep descriptive ones
+    parts = re.split(r"(?<=[.!?])\s+", p)
+    kept: list = []
+    for s in parts:
+        s = s.strip()
+        if not s:
+            continue
+        sl = s.lower()
+        if any(mk in sl for mk in _PROMPT_LEAK_MARKERS):
+            continue
+        if sl.startswith(("main character", "character:", "framing note")):
+            continue
+        if lyric_low and sl.rstrip(".!?…") == lyric_low:
+            continue
+        kept.append(s)
+    p2 = " ".join(kept).strip()
 
-    # --- Recover structured SCENE:/POSE:/BACKGROUND dumps ---
-    if re.search(r"(?im)^(SCENE|POSE|BACKGROUND|SETTING|ACTION)\s*[:\-]", p):
-        bits: List[str] = []
-        for raw_line in re.split(r"[\r\n]+", p):
+    # Recover structured SCENE:/POSE: dumps if still empty
+    if len(p2) < 40 and re.search(r"(?im)^(SCENE|POSE|BACKGROUND|SETTING|ACTION)\s*[:\-]", prompt or ""):
+        bits: list = []
+        for raw_line in re.split(r"[\r\n]+", prompt or ""):
             line = raw_line.strip()
             if not line:
                 continue
@@ -2450,62 +2699,30 @@ def _sanitize_visual_prompt(prompt: str, lyric: str, style_hint: str = "") -> st
                 continue
             bits.append(body.rstrip(" .;,"))
         if bits:
-            scene = ". ".join(bits)
-            if scene[-1] not in ".!?":
-                scene += "."
-            if len(scene) > 512:
-                scene = scene[:512].rsplit(" ", 1)[0]
-            print(f"[images] recovered scene from structured prompt: {scene[:100]}…", flush=True)
-            return scene.strip()
+            p2 = ". ".join(bits)
+            if p2[-1] not in ".!?":
+                p2 += "."
 
-    # Strip leading CHARACTER: / MAIN CHARACTER: meta
-    p2 = re.sub(
-        r"(?is)^\s*(?:main\s+)?character\s*:\s*"
-        r".*?(?:reference person|reference image|main reference)[^.]*\.\s*",
-        "",
-        p,
-        count=1,
-    ).strip()
-    p2 = re.sub(
-        r"(?is)^\s*figures in this still\s*(?:\([^)]*\))?\s*:?\s*"
-        r".*?(?:with outfits appropriate to the scene\.?\s*)?",
-        "",
-        p2,
-        count=1,
-    ).strip()
-    p2 = re.sub(r"(?is)\bwith outfits appropriate to the scene\.?\s*", "", p2).strip()
-    p2 = re.sub(r"\s{2,}", " ", p2).strip()
-
-    # Drop sentences that still contain leak markers
-    if any(mk in p2.lower() for mk in _PROMPT_LEAK_MARKERS):
-        parts = re.split(r"(?<=[.!?])\s+", p2)
-        kept = [
-            s.strip()
-            for s in parts
-            if s.strip() and not any(mk in s.lower() for mk in _PROMPT_LEAK_MARKERS)
-        ]
-        p2 = " ".join(kept).strip()
-
-    if not p2 or len(p2) < 20:
-        if any(mk in low for mk in _PROMPT_LEAK_MARKERS):
-            print("[images] prompt looks like instruction leak — scene omitted", flush=True)
-            return ""
+    if len(p2) < 40:
+        print(
+            f"[images] scene unusable after sanitize "
+            f"(kept {len(p2)} chars from {len(prompt or '')} raw)",
+            flush=True,
+        )
         return ""
 
-    if len(p2) > 512:
-        cut = p2[:512]
+    if len(p2) > 700:
+        cut = p2[:700]
         for sep in (". ", "! ", "? ", "; "):
             pos = cut.rfind(sep)
-            if pos > 200:
+            if pos > 280:
                 cut = cut[: pos + 1]
                 break
-        else:
-            cut = cut.rsplit(" ", 1)[0]
         p2 = cut.strip()
 
-    return p2.strip()
-
-
+    if p2 and p2[-1] not in ".!?":
+        p2 += "."
+    return p2
 
 
 def _appearance_bit(cfg: Dict[str, Any], presence: str = "full") -> str:
@@ -2696,6 +2913,13 @@ def generate_images_from_prompts(
             pres = _normalize_presence_token(presence_per_line[i] or "none")
         use_char_ref = bool(has_ref and pres != "none")
         clean_prompt = _sanitize_visual_prompt(prompt, line_text, style_hint)
+        if not (clean_prompt or "").strip():
+            clean_prompt = _lyric_scene_fallback(line_text)
+            print(
+                f"[images] line {line_no}: empty scene after sanitize — "
+                f"using lyric fallback",
+                flush=True,
+            )
         prev_still: Optional[Path] = None  # progressive chain within this line
 
         for var in range(1, freq + 1):
@@ -2733,6 +2957,7 @@ def generate_images_from_prompts(
                 f"[images] Lyrics Line {line_no}/{total} [{var}/{freq}]: {line_text}",
                 flush=True,
             )
+            clear_still_markers()
             if progress_callback:
                 progress_callback(
                     f"Image {line_no}/{total} [{var}/{freq}]: {line_text[:50]}",
@@ -2808,11 +3033,13 @@ def generate_images_from_prompts(
                     sequence_bit=seq_bit.strip(" []") if seq_bit else "",
                 )
 
+            final_prompt = _strip_prompt_chatml(final_prompt)
+            print(f"[images] final prompt ({len(final_prompt)} chars): {final_prompt[:220]}…", flush=True)
             cmd = _build_sd_cmd(
                 final_prompt, img_path, attach_ref=attach_ref, ref_override=ref_override,
             )
             t_img = time.time()
-            configure.APP_STATE["image_gen_t0"] = t_img
+            mark_still_started(t_img)
             out, rc = _run_sd_cli_once(cmd, exe)
             found = _find_still_for_line(
                 out_dir, line_no, variant=var if freq > 1 else None,
@@ -2862,11 +3089,9 @@ def generate_images_from_prompts(
                 sz = dest.stat().st_size
             except OSError:
                 sz = 0
-            img_elapsed = time.time() - t_img
-            # Always record the *actual* duration so the next still's estimate
-            # reflects recent speed — never pad to match a previous slow run.
-            record_last_image_gen_seconds(img_elapsed)
-            configure.APP_STATE["image_gen_t0"] = None
+            # The runner stored the measured time (and stopped the timer) the
+            # instant the PNG was complete; teardown never inflates the estimate.
+            img_elapsed = ensure_still_marked(t_img)
             print(
                 f"[images] saved {dest.name} ({sz} bytes) in {img_elapsed:.1f}s",
                 flush=True,
@@ -2914,7 +3139,7 @@ def regenerate_named_still(
     has_ref = bool((reference_image or "").strip() and Path(reference_image).is_file())
     project_dir = dest.parent
     analysis = _load_analysis_from_disk(project_dir) or {}
-    style = str(cfg.get("style") or configure.STYLE_LIGHT)
+    style = configure.normalize_style(cfg.get("style"))
     style_hint = configure.prompt_template_for_style(style)
     label = (song_name or project_dir.name or "song").strip()
     title = label.replace("_", " ").strip() or label
@@ -2962,7 +3187,7 @@ def regenerate_named_still(
             except OSError:
                 pass
         if not prompt:
-            overall = (analysis.get("overall") or "").strip()
+            overall = _scrub_people_language((analysis.get("overall") or "").strip())
             prompt = (
                 f"{configure.image_style_lead(cfg.get('image_style') or '')}, "
                 f"{style}, cinematic composition, coherent lighting. "
@@ -2970,6 +3195,8 @@ def regenerate_named_still(
                 "Environment and atmosphere only — no person, no character, no face, "
                 "no silhouette, no humanoid subject. No readable text, logos, or watermarks."
             )
+        else:
+            prompt = _scrub_people_language(prompt) or prompt
         prompt = (
             f"{prompt.strip()} "
             "Atmospheric worldspace still with no central character portrait, "
@@ -3099,6 +3326,9 @@ def regenerate_single_still(
     style_hint = str(cfg.get("prompt_template") or cfg.get("style") or "")
     clean_prompt = _sanitize_visual_prompt(prompt, line_text, style_hint)
     scene = (clean_prompt or "").strip()
+    if not scene:
+        scene = _lyric_scene_fallback(line_text)
+        print(f"[regen] empty scene after sanitize — using lyric fallback", flush=True)
     identity = _appearance_bit(cfg, presence=pres) if use_ref else ""
     final_prompt = configure.compose_lyric_still_prompt(
         image_style=str(cfg.get("image_style") or ""),
@@ -3112,6 +3342,8 @@ def regenerate_single_still(
         identity=identity,
         sequence_bit="",
     )
+    final_prompt = _strip_prompt_chatml(final_prompt)
+    print(f"[regen] final prompt ({len(final_prompt)} chars): {final_prompt[:220]}…", flush=True)
 
     freq_label = configure.normalize_image_frequency(
         cfg.get("imagegen_frequency") or configure.DEFAULT_IMAGE_FREQUENCY
@@ -3192,6 +3424,7 @@ def regenerate_single_still(
         print("[regen] ref image OMITTED", flush=True)
 
     t_img = time.time()
+    mark_still_started(t_img)
     out, rc = _run_sd_cli_once(_one_cmd(attach_ref=use_ref), exe)
     found = partial if partial.is_file() else None
     if found is None:
@@ -3237,8 +3470,7 @@ def regenerate_single_still(
     except OSError:
         dest = found if found is not None else img_path
 
-    img_elapsed = time.time() - t_img
-    record_last_image_gen_seconds(img_elapsed)
+    img_elapsed = ensure_still_marked(t_img)
     kept = []
     for p in (configure.APP_STATE.get("generation_output_paths") or []):
         try:
@@ -3432,8 +3664,9 @@ def generate_theme_prompts_from_assessment(
         "Rules for EVERY prompt:\n"
         "- Worldspace only: architecture, landscape, weather, light, colour, atmosphere, scale\n"
         "- Empty of people: no person, character, face, body, silhouette, figure, crowd, "
-        "humanoid, protagonist, or implied human presence\n"
+        "humanoid, protagonist, lone figure, navigator, or implied human presence\n"
         "- Do not name or describe any character from the song\n"
+        "- Do not narrate anyone walking, standing, or navigating the space\n"
         "- One dense positive paragraph suitable for Flux\n"
         "- No text, logos, captions, or lyrics in the image\n"
         "- No 'Prompt:' labels, no quotes, no preamble\n\n"
@@ -3589,7 +3822,7 @@ def _generate_named_still(
     except OSError:
         pass
 
-    configure.APP_STATE["image_gen_t0"] = time.time()
+    # (timer is started by the sd-cli runner at the moment the process starts)
     clean = _sanitize_visual_prompt(prompt, "", str(cfg.get("style") or ""))
     style_lead = configure.image_style_lead(
         cfg.get("image_style") or configure.IMAGE_STYLE_DEFAULT
@@ -3645,6 +3878,7 @@ def _generate_named_still(
     cmd.extend(_sd_placement_args(cfg, use_gpu, vk_idx))
 
     t_img = time.time()
+    mark_still_started(t_img)
     out, rc = _run_sd_cli_once(cmd, exe)
     # Prefer the partial we asked for; fall back to newest matching partial stem
     found = partial if partial.is_file() else None
@@ -3681,9 +3915,7 @@ def _generate_named_still(
         if found is not None and found.is_file():
             dest_final = found
         print(f"[named] replace warning: {e}", flush=True)
-    img_elapsed = time.time() - t_img
-    record_last_image_gen_seconds(img_elapsed)
-    configure.APP_STATE["image_gen_t0"] = None
+    img_elapsed = ensure_still_marked(t_img)
     try:
         sz = dest_final.stat().st_size
     except OSError:
@@ -3692,6 +3924,68 @@ def _generate_named_still(
     gc.collect()
     return dest_final
 
+
+
+
+def _scrub_people_language(text: str) -> str:
+    """
+    Strip or neutralize wording that invites people / characters / faces
+    into Cover or Theme stills. Used on LLM concept sentences and
+    OVERALL-derived interpretation snippets before they enter the final
+    positive prompt.
+    """
+    t = (text or "").strip()
+    if not t:
+        return ""
+    # Full-sentence patterns that centre a human subject
+    patterns = [
+        r"(?i)\b(?:a|the|one)\s+(?:lone\s+)?(?:figure|person|man|woman|girl|boy|child|human|character|protagonist|singer|stranger)\b[^.;]*[.;]?",
+        r"(?i)\b(?:figures?|people|humans?|persons?|faces?|portraits?|silhouettes?|crowds?|bodies)\b[^.;]*[.;]?",
+        r"(?i)\b(?:he|she|they)\s+(?:walks?|stands?|sits?|navigates?|moves?|looks?|stares?|runs?|waits?)\b[^.;]*[.;]?",
+        r"(?i)\b(?:close[- ]?up\s+of\s+a\s+face|portrait\s+of|the\s+singer|the\s+protagonist|the\s+character)\b[^.;]*[.;]?",
+        r"(?i)\bhumanoid\b[^.;]*[.;]?",
+    ]
+    out = t
+    for pat in patterns:
+        out = re.sub(pat, " ", out)
+    out = re.sub(r"\s{2,}", " ", out).strip(" ,;:-")
+    # If scrubbing emptied the text, drop it entirely
+    if len(out) < 12:
+        return ""
+    return out
+
+
+_TEXT_TRIGGER_RE = re.compile(
+    r"(?i)\b(?:etched|engraved|inscribed|inscription|carved\s+(?:with|into)|"
+    r"written|writing|lettering|lettered|letters?|words?|text|caption|label(?:led|ed)?|"
+    r"sign(?:age)?|sticker|stamped|imprinted|embossed|typography|typed|"
+    r"graffiti|banner|poster|tag(?:ged)?)\b"
+)
+
+
+def _scrub_text_language(text: str, title: str = "") -> str:
+    """
+    Remove anything that invites Flux to paint readable words on the subject:
+    quoted strings, the literal title, and etched/engraved/lettering wording.
+
+    Flux.2 renders quoted phrases (and often the bare title words) as lettering
+    on the object — e.g. a cover showing "not trust" etched into a surface.
+    """
+    t = (text or "").strip()
+    if not t:
+        return ""
+    # Quoted phrases of any kind (straight or curly)
+    t = re.sub(r'"[^"]*"|\u201c[^\u201d]*\u201d|\u2018[^\u2019]*\u2019', " ", t)
+    # The literal song title, if it leaked into the concept / interpretation
+    ttl = (title or "").strip()
+    if ttl:
+        t = re.sub(re.escape(ttl), " ", t, flags=re.IGNORECASE)
+    # Sentence fragments that talk about text/etching/inscriptions
+    parts = re.split(r"(?<=[.;!?])\s+|\s+[;—–]\s+", t)
+    kept = [x for x in parts if x and not _TEXT_TRIGGER_RE.search(x)]
+    t = " ".join(kept)
+    t = re.sub(r"\s{2,}", " ", t).strip(" ,;:-")
+    return t if len(t) >= 12 else ""
 
 
 def _build_cover_prompt(
@@ -3751,9 +4045,16 @@ def _build_cover_prompt(
                 "Rules:\n"
                 "- The image idea must make a viewer think of the song title itself.\n"
                 "- Literal or metaphorical is fine, but the title's meaning must be obvious.\n"
+                "- Subject MUST be a single significant OBJECT, artifact, prop, or metaphysical SYMBOL "
+                "placed cleanly in the song's worldspace — never a person, figure, face, silhouette, "
+                "body, crowd, or humanoid presence.\n"
+                "- Do NOT describe a lone figure, navigator, walker, portrait, or any human subject.\n"
                 "- Do NOT describe a generic ambient corridor, crowd, or mood board.\n"
-                "- No text, letters, logos, or watermarks in the image.\n"
-                "- Describe a single focused subject (close-up or strong symbol), not a busy scene.\n"
+                "- No text, letters, words, numbers, logos, or watermarks in the image.\n"
+                "- Do NOT repeat the song title or any of its words in your sentence.\n"
+                "- Do NOT mention etching, engraving, carving, inscriptions, labels, signs, or writing "
+                "on the object; its surfaces must be plain and unmarked.\n"
+                "- Describe a single focused non-human subject (object or symbol), not a busy scene.\n"
                 "- Reply with ONE sentence only. No preamble.\n"
             )
             raw = _run_llama_completion(
@@ -3769,7 +4070,12 @@ def _build_cover_prompt(
             if len(concept) < 20:
                 concept = ""
             else:
-                print(f"[cover] title concept: {concept[:120]}", flush=True)
+                concept = _scrub_people_language(concept)
+                concept = _scrub_text_language(concept, title)
+                if concept:
+                    print(f"[cover] title concept: {concept[:120]}", flush=True)
+                else:
+                    print("[cover] title concept scrubbed (people language) — omitted", flush=True)
         except Exception as e:
             print(f"[cover] concept LLM skipped: {e}", flush=True)
             concept = ""
@@ -3781,24 +4087,46 @@ def _build_cover_prompt(
         cfg.get("image_style") or configure.IMAGE_STYLE_DEFAULT
     )
     mood = str(cfg.get("style") or configure.STYLE_DEFAULT).strip()
-    header = f"{style_lead}, {mood}, cinematic composition, coherent lighting." if mood else f"{style_lead}, cinematic composition, coherent lighting."
+    header = (
+        f"{style_lead}, {mood}, cinematic composition, coherent lighting."
+        if mood
+        else f"{style_lead}, cinematic composition, coherent lighting."
+    )
 
-    # Title-first object/symbol body — no "no people" in positive (that lives in negative).
+    # Title-first object/symbol body. Reinforce no-people in the POSITIVE so
+    # Flux does not lean on people language that may leak from assessment.
     # Target form:
     #   One significant object or metaphysical symbol that embodies the song title
-    #   "…"; Title interpretation: …
-    body = (
-        f'One significant object or metaphysical symbol that embodies the song title '
-        f'"{title}"'
-    )
+    #   "…"; Title interpretation: … Empty of people …
+    interpret = _scrub_people_language(interpret) if interpret else ""
+    interpret = _scrub_text_language(interpret, title) if interpret else ""
+
+    # IMPORTANT: the literal title is NOT placed in the image prompt. Flux
+    # paints quoted / title words onto the subject as etched lettering (and
+    # garbles them). The title only steers the LLM concept sentence and the
+    # assessment-derived interpretation; if neither is available we fall back
+    # to the title as an unquoted theme phrase.
     if concept:
-        body = f"{body}; {concept.rstrip('.')}"
+        body = f"One significant object or metaphysical symbol: {concept.rstrip('.')}"
+    elif interpret:
+        body = "One significant object or metaphysical symbol that embodies this theme"
+    else:
+        body = (
+            "One significant object or metaphysical symbol that embodies the theme of "
+            f"{title.lower().rstrip('.')}"
+        )
     if interpret:
         interp = interpret.strip()
         if len(interp) > 400:
             interp = interp[:400].rsplit(" ", 1)[0].rstrip(" ,;:") + "…"
-        body = f"{body}; Title interpretation: {interp.rstrip('.')}"
-    body = body.rstrip(".;") + "."
+        body = f"{body}; theme: {interp.rstrip('.')}"
+    body = (
+        body.rstrip(".;")
+        + ". Presented cleanly in the song worldspace — no people, no faces, "
+          "no figures, no silhouettes, no humanoid subjects, no character portraits. "
+          "All surfaces are smooth and unmarked, free of lettering, inscriptions, "
+          "engraving or symbols that resemble writing."
+    )
     cover_prompt = f"{header} {body}".strip()
     print(f"[cover] prompt ({len(cover_prompt)} chars): {cover_prompt[:240]}…", flush=True)
     return cover_prompt, strategy, False
@@ -3958,6 +4286,7 @@ def generate_cover_image(
             configure.APP_STATE["cover_slot_generating"] = i
             idx = start_idx + i
             dest = project_dir / f"cover-{idx:02d}-{slug}.png"
+            clear_still_markers()
             if progress_callback:
                 progress_callback(
                     f"Generating cover still {i + 1}/{cover_n}…",
@@ -4204,16 +4533,15 @@ def generate_theme_images(
                 else f"{style_lead}, cinematic composition, coherent lighting."
             )
             scene = (tprompt or "").strip()
-            # Drop accidental character language from model output
-            low = scene.lower()
-            for bad in (
-                "the protagonist", "the character", "a man ", "a woman ",
-                "close-up of a face", "portrait of", "the singer",
-            ):
-                if bad in low:
-                    print(f"[theme] scrubbed character cue {bad!r} from prompt", flush=True)
-                    scene = scene  # keep scene; ambient negative + suffix handle people
-                    break
+            # Drop accidental character / people language from model output
+            scrubbed = _scrub_people_language(scene)
+            if scrubbed != scene:
+                print(
+                    f"[theme] scrubbed people language from prompt "
+                    f"({len(scene)} → {len(scrubbed)} chars)",
+                    flush=True,
+                )
+                scene = scrubbed or scene
             final = (
                 f"{header} Ambient worldspace still from the song's OVERALL setting. "
                 f"{scene} "
@@ -4226,6 +4554,7 @@ def generate_theme_images(
                 f"{_ascii_line_slug(song_name or label, max_len=32) or 'theme'}.png"
             )
             dest = project_dir / fname
+            clear_still_markers()
             if progress_callback:
                 progress_callback(
                     f"encoding & generating still",
@@ -4275,6 +4604,171 @@ def generate_theme_images(
     return result
 
 
+
+
+
+def run_prompts_pipeline(
+    lyrics: str,
+    cfg: Dict[str, Any],
+    song_name: str = "",
+    reference_image: str = "",
+    progress_callback: Optional[Callable] = None,
+    resume_folder: str = "",
+    force: bool = True,
+) -> Dict[str, Any]:
+    """
+    Phase-1 only: ensure analysis exists, then generate (or force re-generate)
+    per-line visual prompts into prompts.txt. Does not run image generation.
+    """
+    clear_cancel_state()
+    configure.APP_STATE["session_status"] = "running"
+    t0 = time.time()
+    result: Dict[str, Any] = {
+        "success": False,
+        "message": "",
+        "project_folder": "",
+        "prompt_count": 0,
+        "elapsed_seconds": 0.0,
+        "session_id": "",
+    }
+    try:
+        cfg = dict(cfg)
+        parsed = parse_lyrics(lyrics)
+        lines = lyric_lines_only(parsed)
+        if not lines:
+            result["message"] = "No lyric lines found (section headers and blanks are skipped)."
+            configure.APP_STATE["session_status"] = "idle"
+            return result
+
+        label = _slugify_folder_name(
+            (song_name or cfg.get("project_label") or "").strip(),
+            fallback="",
+        )
+        if resume_folder and Path(resume_folder).is_dir():
+            project_dir = ensure_project_dir(
+                folder_label=label or Path(resume_folder).name,
+                resume_path=resume_folder,
+                sequential=False,
+            )
+        else:
+            if not label:
+                result["message"] = "Song name is required — enter a name above the lyrics."
+                configure.APP_STATE["session_status"] = "idle"
+                return result
+            cur = (configure.APP_STATE.get("current_project_folder") or "").strip()
+            if cur and Path(cur).is_dir():
+                project_dir = ensure_project_dir(
+                    folder_label=label,
+                    resume_path=cur,
+                    sequential=False,
+                )
+            else:
+                project_dir = ensure_project_dir(
+                    folder_label=label,
+                    resume_path="",
+                    sequential=False,
+                )
+
+        result["project_folder"] = str(project_dir)
+        result["session_id"] = project_dir.name
+
+        try:
+            (project_dir / "lyrics.txt").write_text(lyrics or "", encoding="utf-8")
+        except OSError:
+            pass
+
+        has_ref = False
+        ref_src = (reference_image or "").strip()
+        if ref_src and Path(ref_src).is_file():
+            has_ref = True
+
+        analysis = _load_analysis_from_disk(project_dir)
+        if analysis is None:
+            if progress_callback:
+                progress_callback("Running assessment for prompts…", 0.05, {"phase": "analysis"})
+            analysis = analyze_song_and_sections(
+                lyrics, parsed, cfg,
+                has_character_ref=has_ref,
+                progress_callback=progress_callback,
+            )
+            if is_cancel_requested():
+                configure.APP_STATE["session_status"] = "stopped"
+                result["message"] = "Cancelled during analysis."
+                return result
+            try:
+                _write_analysis_file(project_dir, analysis)
+            except Exception as e:
+                print(f"[prompts] could not write analysis: {e}", flush=True)
+        else:
+            print("[prompts] using existing analysis.txt", flush=True)
+
+        if force:
+            for name in ("prompts.txt", "character_map.txt"):
+                try:
+                    p = project_dir / name
+                    if p.is_file():
+                        p.unlink()
+                except OSError:
+                    pass
+
+        if progress_callback:
+            progress_callback(
+                f"Generating prompts for {len(lines)} lyric lines…",
+                0.12,
+                {"phase": "prompts", "total": len(lines)},
+            )
+        prompts, presence_per_line = generate_visual_prompts(
+            lines, parsed, analysis or {}, cfg,
+            has_character_ref=has_ref,
+            progress_callback=progress_callback,
+        )
+        if is_cancel_requested():
+            configure.APP_STATE["session_status"] = "stopped"
+            result["message"] = "Cancelled during prompt generation."
+            return result
+        if not prompts:
+            configure.APP_STATE["session_status"] = "idle"
+            result["message"] = "Prompt generation produced nothing."
+            return result
+
+        try:
+            with open(project_dir / "prompts.txt", "w", encoding="utf-8") as f:
+                for i, (line, pr) in enumerate(zip(lines, prompts), 1):
+                    pres = presence_per_line[i - 1] if i - 1 < len(presence_per_line) else "?"
+                    f.write(
+                        f"=== line {i} ===\n{line}\n"
+                        f"character: {pres}\n"
+                        f"--- prompt ---\n{pr}\n\n"
+                    )
+            with open(project_dir / "character_map.txt", "w", encoding="utf-8") as f:
+                f.write("section → presence (none|silhouette|partial|full)\n")
+                for lab, val in ((analysis or {}).get("character_presence") or {}).items():
+                    f.write(f"{lab}: {val}\n")
+                f.write("\nper-line:\n")
+                for i, (line, pres) in enumerate(zip(lines, presence_per_line), 1):
+                    f.write(f"{i:03d} [{pres}] {line}\n")
+        except OSError as e:
+            print(f"[prompts] could not write prompts.txt: {e}", flush=True)
+
+        _snapshot_session(
+            project_dir, lyrics=lyrics, song_name=song_name or label, cfg=cfg,
+            reference_image=reference_image or "", phase="prompts", line_count=len(lines),
+        )
+        n_ok = sum(1 for p in prompts if (p or "").strip())
+        result["success"] = True
+        result["prompt_count"] = n_ok
+        result["elapsed_seconds"] = time.time() - t0
+        result["message"] = (
+            f"Lyrics prompts ready: {n_ok}/{len(lines)} scenes "
+            f"({result['elapsed_seconds']:.0f}s)."
+        )
+        configure.APP_STATE["session_status"] = "idle"
+        return result
+    except Exception as e:
+        result["message"] = f"Prompts pipeline error: {e}"
+        configure.APP_STATE["session_status"] = "idle"
+        print(f"[prompts] ERROR: {e}", flush=True)
+        return result
 
 
 def run_materials_pipeline(
