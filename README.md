@@ -1,5 +1,5 @@
 # Lyrics-Materials
-Status: Beta - Developing and improving. This is Experimental. Note the images shown below were generated with v0.20, generation and reference image likeness, is now figured out, and the interface is quite ok.
+Status: Beta - Developing and improving. This is Experimental. Note the images shown below were generated with v0.25, generation and reference image likeness, is now figured out, and the interface is quite ok.
 
 ### Description:
 It will convert lines of lyrics into AI generated images, one for each line. The idea is one could arrange these in a movie editor, and fade in/out between sections of images, to make simple music videos. One could also take the line of lyrics and the generated images, and feed that into AI video generator to make clips, that could then be assembled.
