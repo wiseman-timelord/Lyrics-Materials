@@ -57,7 +57,7 @@ Available on [HuggingFace.Co](https://huggingface.co/)...
 - Remember by editing `.\scripts\configure.py` script it is possible to have custom hair/clothes/etc. Ie for clothing you would for example search for something unique like "Rocker" in configure script, and then change, prompt detail and relating GUI option, for that one or one of the others you wont use. 
 - When a session is under-way, ensure to collapse the session slots column on the left, with the little "--><--" button. This will optimize the interface a little.
 - If the Generation page panels relating to Details Mode do not show, try switching back and forth, between Panel Mode's (there are a lot of items to display). 
-- This program uses Flux2-4B, if people like the program and have the money, then please donate ~£250 to my kofi/patreon, and then I will make the program compatible with Qwen3-8b and Flux2-Klein-8b. No point developing what I cant test. 
+- This program uses Flux2-4B, if people would prefer a similar program, but that can make motion music videos, then I would need someone to donate enough to get a 16GB GPU, albeit I could also make Lyrics-Materials compatible with Qwen3-8b and Flux2-Klein-8b. No point developing what I cant test/use. 
 
 ### Struture:
 ```
