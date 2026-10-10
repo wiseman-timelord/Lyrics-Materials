@@ -51,6 +51,7 @@ Available on [HuggingFace.Co](https://huggingface.co/)...
 ```
 
 ### Notation:
+- Got your own lyrics, but need your own songs to make AI music slideshow videos on your own hardware with my gradually becoming awesome program Lyrics-Materials, then why not give [Suno](https://suno.com/invite/@wisemantimelord) a GO, or at least register with that link, and likely they likely give me bottle-caps in-turn.
 - Ensure that the reference image is not HUGE, and I advise trimming it down to, torso and head, or bust and head, then setting the bodyshape correctly. Limiting the reference image to, smaller body area and full head, assists with facial likeness. 
 - At 8 Steps per image, most things turn out ok, but at 10 steps the eyes will more likely be correct and not weird looking. At 12 steps, its going to take forever, but I assume the eyes will be 100% correct at that point. 
 - Remember by editing `.\scripts\configure.py` script it is possible to have custom hair/clothes/etc. Ie for clothing you would for example search for something unique like "Rocker" in configure script, and then change, prompt detail and relating GUI option, for that one or one of the others you wont use. 
