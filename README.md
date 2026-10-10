@@ -81,7 +81,7 @@ Lyrics-Materials/
 ### Development:
 - The outfits need improving, current list is from Image Glamour plus 2 for artist, though after review. For more range, enumerate common outfit types, and create larger list, also 
 - add another control for footwear, ie, black-boots, manila-boots, black-shoes, manila-shoes, black-trainers, manila-trainers, none-specified (no text segment in prompt).
-
+- Its not meant to be moving the mmproj to ".\models\mmproj\*", its instead supposed to be creating a mmproj folder in the location where the actual model being used is in, and moving it there.
 - Option to have NONE of the images with background/other characters; option for all scenes will as are appropriate ONLY feature reference character or just the scene. 
 
 ### Disclaimer:
