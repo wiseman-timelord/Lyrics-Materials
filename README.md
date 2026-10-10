@@ -15,7 +15,7 @@ It convert lines of lyrics into AI generated images, one for each line. The idea
 ![Generation_Page](https://github.com/wiseman-timelord/Lyrics-Materials/blob/main/media/Configuration_Page.jpg)
 
 ### Features:
-- **User Character;** controls for, Reference Image, Character Gender, Bodyshape, Physical Age 25-95, Hair Style, Outfit Worn.
+- **User Character;** controls for, Reference Image, Gender, Bodyshape, Physical Age 25-95, Hair Style, Outfit Worn.
 - **Clever Model Handling;** configure the Encoding processes to, OtherGPU or CPU, to extend Flux2 GPU Memory, while still generating Prompts on GPU too.
 - **Local Tool;** not requiring the use of online antigenic services to create your own local model based music slideshows.
 - **libraries;** llama.cpp for song analysis + per-line visual prompts, stable-diffusion.cpp for Flux.2-klein. ffmpeg for utility/probe.
