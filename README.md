@@ -23,6 +23,7 @@ Available on [HuggingFace.Co](https://huggingface.co/)...
 - Diffuser: [flux-2-klein-4b-GGUF](https://huggingface.co/models?search=flux2%204b%20gguf) Image generation (one of those, cant remember which one I used) (I used q8).
 - VAE: [diffusion_pytorch_model.safetensors](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B/resolve/main/vae/diffusion_pytorch_model.safetensors?download=true) the other image generation file (one file).
 - Note the mmproj is not used, and if present then is auto-moved to `models\mmproj\`
+- Program designed for Portrait mode monitor, but it should/will work on Landscape too just with some sliders.
 
 ### Instructions:
 - These are my current instructions for using the program...(Note; If you are unsure as to if Flux2 will be ok with your settings and VRam settings, then you may want Task Manager open at this stage, with the python process selected ready to End Task if you get VRam overload on model load, while to also be able to monitor goings on with the GPU memory/shaders if everything goes ok. 
