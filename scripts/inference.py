@@ -2739,6 +2739,7 @@ def _appearance_bit(cfg: Dict[str, Any], presence: str = "full") -> str:
         bodyshape=cfg.get("ref_bodyshape") or "",
         age=cfg.get("ref_age"),
         presence=presence,
+        footwear=cfg.get("footwear") or "",
     )
 
 
@@ -2821,6 +2822,9 @@ def generate_images_from_prompts(
         cfg.get("imagegen_frequency") or configure.DEFAULT_IMAGE_FREQUENCY
     )
     freq = configure.frequency_lyrics_per_line(freq_label)
+    if freq <= 0:
+        print("[images] Lyrics/line count is 0 — lyric still generation disabled.", flush=True)
+        return []
     seq_hints = configure.image_frequency_hints(freq_label)
     print(f"[images] frequency = {freq_label} → {freq} still(s) per lyric line", flush=True)
     cfg_scale = float(cfg.get("imagegen_cfg_scale") or configure.DEFAULT_CFG)
@@ -4247,6 +4251,13 @@ def generate_cover_image(
         target_n = configure.frequency_cover_count(
             cfg.get("imagegen_frequency") or configure.DEFAULT_IMAGE_FREQUENCY
         )
+        if target_n <= 0:
+            result["success"] = True
+            result["message"] = "Cover count is 0 — cover generation disabled."
+            result["project_folder"] = str(project_dir)
+            result["session_id"] = project_dir.name
+            configure.APP_STATE["session_status"] = "idle"
+            return result
         # Count existing covers so "Complete" only fills the remainder;
         # when already at target, wipe and fully re-generate.
         existing_covers = sorted(project_dir.glob("cover-*.png"))
@@ -4445,6 +4456,13 @@ def generate_theme_images(
             cfg.get("imagegen_frequency") or configure.DEFAULT_IMAGE_FREQUENCY
         )
         target_theme = configure.frequency_theme_count(freq_label)
+        if target_theme <= 0:
+            result["success"] = True
+            result["message"] = "Theme count is 0 — theme generation disabled."
+            result["project_folder"] = str(project_dir)
+            result["session_id"] = project_dir.name
+            configure.APP_STATE["session_status"] = "idle"
+            return result
         existing_themes = sorted(project_dir.glob("theme-*.png"))
         existing_theme_n = len(existing_themes)
         # Complete: fill remainder; already full: wipe and re-generate all

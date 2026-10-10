@@ -199,32 +199,38 @@ def _can_run_assessment(lyrics: str = "", song_name: str = "") -> bool:
 
 
 def _can_create(lyrics: str, song_name: str = "") -> bool:
-    """Full lyrics slideshow: needs assessment + song name + lyrics + models."""
+    """Full lyrics slideshow: needs assessment + song name + lyrics + models + L > 0."""
     if not (lyrics or "").strip():
         return False
     if not (song_name or "").strip():
         return False
     if not _models_configured():
+        return False
+    if configure.frequency_lyrics_per_line(_current_freq_label()) <= 0:
         return False
     return _assessment_exists()
 
 
 def _can_cover(song_name: str = "") -> bool:
-    """Cover image: needs assessment + song name + models."""
+    """Cover image: needs assessment + song name + models + Cover count > 0."""
     if not (song_name or "").strip():
         return False
     if not _models_configured():
+        return False
+    if configure.frequency_cover_count(_current_freq_label()) <= 0:
         return False
     return _assessment_exists()
 
 
 def _can_theme(lyrics: str = "", song_name: str = "") -> bool:
-    """Theme images: needs assessment + lyrics + song name + models."""
+    """Theme images: needs assessment + lyrics + song name + models + Theme count > 0."""
     if not (lyrics or "").strip():
         return False
     if not (song_name or "").strip():
         return False
     if not _models_configured():
+        return False
+    if configure.frequency_theme_count(_current_freq_label()) <= 0:
         return False
     return _assessment_exists()
 
@@ -267,7 +273,7 @@ def _cover_counts() -> tuple:
     slots are missing.
     """
     folder = (configure.APP_STATE.get("current_project_folder") or "").strip()
-    expected = max(1, configure.frequency_cover_count(_current_freq_label()))
+    expected = max(0, configure.frequency_cover_count(_current_freq_label()))
     if not folder or not Path(folder).is_dir():
         return 0, expected
     smap = _named_slot_map("cover", folder)
@@ -278,7 +284,7 @@ def _cover_counts() -> tuple:
 def _theme_counts() -> tuple:
     """(have, expected) for theme stills under current frequency."""
     folder = (configure.APP_STATE.get("current_project_folder") or "").strip()
-    expected = max(1, configure.frequency_theme_count(_current_freq_label()))
+    expected = max(0, configure.frequency_theme_count(_current_freq_label()))
     if not folder or not Path(folder).is_dir():
         return 0, expected
     smap = _named_slot_map("theme", folder)
@@ -315,17 +321,17 @@ def _partial_theme_state() -> bool:
 
 def _cover_complete() -> bool:
     have, expected = _cover_counts()
-    return expected > 0 and have >= expected
+    return expected <= 0 or have >= expected
 
 
 def _theme_complete() -> bool:
     have, expected = _theme_counts()
-    return expected > 0 and have >= expected
+    return expected <= 0 or have >= expected
 
 
 def _lyrics_complete(lyrics: str = "") -> bool:
     have, expected = _lyrics_counts(lyrics)
-    return expected > 0 and have >= expected
+    return expected <= 0 or have >= expected
 
 
 def _all_assets_complete(lyrics: str = "") -> bool:
@@ -2015,6 +2021,9 @@ def _build_create_tab() -> None:
     initial_outfit = configure.normalize_outfit(
         g0_init.get("outfit_worn") or configure.OUTFIT_DEFAULT
     )
+    initial_footwear = configure.normalize_footwear(
+        g0_init.get("footwear") or configure.FOOTWEAR_DEFAULT
+    )
     initial_gender = configure.normalize_gender(
         g0_init.get("ref_gender") or configure.GENDER_DEFAULT
     )
@@ -2346,7 +2355,13 @@ def _build_create_tab() -> None:
                             label="Outfit Worn",
                             choices=configure.OUTFIT_CHOICES,
                             value=initial_outfit,
-                            info="Locked wardrobe for character consistency. None = omit.",
+                            info="Locked wardrobe for main character. None = omit.",
+                        )
+                        _gen["footwear"] = gr.Dropdown(
+                            label="Footwear",
+                            choices=configure.FOOTWEAR_CHOICES,
+                            value=initial_footwear,
+                            info="Appended after clothing. none-specified = omit from prompt.",
                         )
             _gen["details_reference"] = _details_ref
 
@@ -3108,6 +3123,7 @@ def _wire_create_events(status_box) -> None:
             "image_frequency",
             "hair_style",
             "outfit_worn",
+            "footwear",
             "ref_gender",
             "ref_bodyshape",
             "ref_age",
@@ -3135,6 +3151,7 @@ def _wire_create_events(status_box) -> None:
         image_frequency=None,
         hair_style=None,
         outfit_worn=None,
+        footwear=None,
         ref_gender=None,
         ref_bodyshape=None,
         ref_age=None,
@@ -3197,6 +3214,9 @@ def _wire_create_events(status_box) -> None:
             "outfit_worn": configure.normalize_outfit(
                 outfit_worn if outfit_worn is not None else (g.get("outfit_worn") or configure.OUTFIT_DEFAULT)
             ),
+            "footwear": configure.normalize_footwear(
+                footwear if footwear is not None else (g.get("footwear") or configure.FOOTWEAR_DEFAULT)
+            ),
             "ref_gender": configure.normalize_gender(
                 ref_gender if ref_gender is not None else (g.get("ref_gender") or configure.GENDER_DEFAULT)
             ),
@@ -3215,6 +3235,7 @@ def _wire_create_events(status_box) -> None:
             "image_frequency",
             "hair_style",
             "outfit_worn",
+            "footwear",
             "ref_gender",
             "ref_bodyshape",
             "ref_age",
@@ -3537,6 +3558,9 @@ def _wire_create_events(status_box) -> None:
         )
         cfg["hair_style"] = configure.normalize_hair_style(str(hair_style or ""))
         cfg["outfit_worn"] = configure.normalize_outfit(str(outfit_worn or ""))
+        cfg["footwear"] = configure.normalize_footwear(
+            str(configure.load_generation().get("footwear") or "")
+        )
         _g_sub = configure.load_generation()
         cfg["ref_gender"] = configure.normalize_gender(str(_g_sub.get("ref_gender") or ""))
         cfg["ref_bodyshape"] = configure.normalize_bodyshape(str(_g_sub.get("ref_bodyshape") or ""))
@@ -3746,6 +3770,9 @@ def _wire_create_events(status_box) -> None:
                     )
                     cfg_now["hair_style"] = configure.normalize_hair_style(str(gnow.get("hair_style") or ""))
                     cfg_now["outfit_worn"] = configure.normalize_outfit(str(gnow.get("outfit_worn") or ""))
+                    cfg_now["footwear"] = configure.normalize_footwear(
+                        str(configure.load_generation().get("footwear") or "")
+                    )
                     cfg_now["ref_gender"] = configure.normalize_gender(str(gnow.get("ref_gender") or ""))
                     cfg_now["ref_bodyshape"] = configure.normalize_bodyshape(str(gnow.get("ref_bodyshape") or ""))
                     cfg_now["ref_age"] = configure.normalize_age(gnow.get("ref_age", configure.AGE_DEFAULT))
@@ -3806,20 +3833,21 @@ def _wire_create_events(status_box) -> None:
             _gen["active_session_id"],
         ]
 
-    def _persist_subject_tokens(hair_style, outfit_worn, ref_gender, ref_bodyshape, ref_age):
+    def _persist_subject_tokens(hair_style, outfit_worn, footwear, ref_gender, ref_bodyshape, ref_age):
         configure.update_generation({
             "hair_style": configure.normalize_hair_style(str(hair_style or "")),
             "outfit_worn": configure.normalize_outfit(str(outfit_worn or "")),
+            "footwear": configure.normalize_footwear(str(footwear or "")),
             "ref_gender": configure.normalize_gender(str(ref_gender or "")),
             "ref_bodyshape": configure.normalize_bodyshape(str(ref_bodyshape or "")),
             "ref_age": configure.normalize_age(ref_age),
         })
 
     _subject_token_inputs = [
-        _gen["hair_style"], _gen["outfit_worn"],
+        _gen["hair_style"], _gen["outfit_worn"], _gen["footwear"],
         _gen["ref_gender"], _gen["ref_bodyshape"], _gen["ref_age"],
     ]
-    for _tok in ("hair_style", "outfit_worn", "ref_gender", "ref_bodyshape", "ref_age"):
+    for _tok in ("hair_style", "outfit_worn", "footwear", "ref_gender", "ref_bodyshape", "ref_age"):
         if _gen.get(_tok) is not None:
             _gen[_tok].change(
                 _persist_subject_tokens,
@@ -4013,6 +4041,9 @@ def _wire_create_events(status_box) -> None:
         cfg["prompt_template"] = configure.prompt_template_for_style(style)
         cfg["hair_style"] = configure.normalize_hair_style(str(hair_style or ""))
         cfg["outfit_worn"] = configure.normalize_outfit(str(outfit_worn or ""))
+        cfg["footwear"] = configure.normalize_footwear(
+            str(configure.load_generation().get("footwear") or "")
+        )
         _g_sub = configure.load_generation()
         cfg["ref_gender"] = configure.normalize_gender(str(_g_sub.get("ref_gender") or ""))
         cfg["ref_bodyshape"] = configure.normalize_bodyshape(str(_g_sub.get("ref_bodyshape") or ""))
@@ -4156,6 +4187,9 @@ def _wire_create_events(status_box) -> None:
         )
         cfg["hair_style"] = configure.normalize_hair_style(str(hair_style or ""))
         cfg["outfit_worn"] = configure.normalize_outfit(str(outfit_worn or ""))
+        cfg["footwear"] = configure.normalize_footwear(
+            str(configure.load_generation().get("footwear") or "")
+        )
         _g_sub = configure.load_generation()
         cfg["ref_gender"] = configure.normalize_gender(str(_g_sub.get("ref_gender") or ""))
         cfg["ref_bodyshape"] = configure.normalize_bodyshape(str(_g_sub.get("ref_bodyshape") or ""))
@@ -4285,6 +4319,9 @@ def _wire_create_events(status_box) -> None:
         )
         cfg["hair_style"] = configure.normalize_hair_style(str(hair_style or ""))
         cfg["outfit_worn"] = configure.normalize_outfit(str(outfit_worn or ""))
+        cfg["footwear"] = configure.normalize_footwear(
+            str(configure.load_generation().get("footwear") or "")
+        )
         _g_sub = configure.load_generation()
         cfg["ref_gender"] = configure.normalize_gender(str(_g_sub.get("ref_gender") or ""))
         cfg["ref_bodyshape"] = configure.normalize_bodyshape(str(_g_sub.get("ref_bodyshape") or ""))
@@ -4419,6 +4456,9 @@ def _wire_create_events(status_box) -> None:
                 cfg["imagegen_steps"] = int(steps or configure.DEFAULT_STEPS)
                 cfg["hair_style"] = configure.normalize_hair_style(str(hair_style or ""))
                 cfg["outfit_worn"] = configure.normalize_outfit(str(outfit_worn or ""))
+                cfg["footwear"] = configure.normalize_footwear(
+                    str(configure.load_generation().get("footwear") or "")
+                )
                 cfg["imagegen_cfg_scale"] = float(cfg_scale or configure.DEFAULT_CFG)
                 cfg["style"] = configure.normalize_style(
                     style
@@ -4589,6 +4629,7 @@ def _wire_create_events(status_box) -> None:
             "negative_prompt": negative_prompt or configure.DEFAULT_NEGATIVE_PROMPT,
             "hair_style": configure.normalize_hair_style(str(hair_style or "")),
             "outfit_worn": configure.normalize_outfit(str(outfit_worn or "")),
+            "footwear": configure.normalize_footwear(str(configure.load_generation().get("footwear") or "")),
             "ref_gender": configure.normalize_gender(str(configure.load_generation().get("ref_gender") or "")),
             "ref_bodyshape": configure.normalize_bodyshape(str(configure.load_generation().get("ref_bodyshape") or "")),
             "ref_age": configure.normalize_age(configure.load_generation().get("ref_age", configure.AGE_DEFAULT)),
@@ -4928,6 +4969,9 @@ def _wire_create_events(status_box) -> None:
         cfg_now["imagegen_size"] = size_label
         cfg_now["hair_style"] = configure.normalize_hair_style(str(gnow.get("hair_style") or ""))
         cfg_now["outfit_worn"] = configure.normalize_outfit(str(gnow.get("outfit_worn") or ""))
+        cfg_now["footwear"] = configure.normalize_footwear(
+            str(configure.load_generation().get("footwear") or "")
+        )
         cfg_now["ref_gender"] = configure.normalize_gender(str(gnow.get("ref_gender") or ""))
         cfg_now["ref_bodyshape"] = configure.normalize_bodyshape(str(gnow.get("ref_bodyshape") or ""))
         cfg_now["ref_age"] = configure.normalize_age(gnow.get("ref_age", configure.AGE_DEFAULT))
@@ -5099,6 +5143,9 @@ def _wire_create_events(status_box) -> None:
         gnow = configure.load_generation()
         cfg["hair_style"] = configure.normalize_hair_style(str(gnow.get("hair_style") or ""))
         cfg["outfit_worn"] = configure.normalize_outfit(str(gnow.get("outfit_worn") or ""))
+        cfg["footwear"] = configure.normalize_footwear(
+            str(configure.load_generation().get("footwear") or "")
+        )
         cfg["ref_gender"] = configure.normalize_gender(str(gnow.get("ref_gender") or ""))
         cfg["ref_bodyshape"] = configure.normalize_bodyshape(str(gnow.get("ref_bodyshape") or ""))
         cfg["ref_age"] = configure.normalize_age(gnow.get("ref_age", configure.AGE_DEFAULT))

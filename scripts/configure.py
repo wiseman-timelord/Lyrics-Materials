@@ -5,7 +5,7 @@ Models:
   Text     : Qwen3-VL-4B Thinking (assessment, prompts, Flux.2 --llm encoding)
              Prefer Huihui-Qwen3-VL-4B-Thinking-abliterated*.gguf
   Diffuser : FLUX.2-klein-4B (Q8)
-  mmproj quarantined under models/mmproj/ (not used for pure-text loads)
+  mmproj moved beside the active model into <model_dir>/mmproj/ (not used for pure-text loads)
 """
 from __future__ import annotations
 
@@ -222,7 +222,6 @@ def ensure_data_dirs() -> None:
     for d in (
         get_data_dir(),
         get_models_dir(),
-        get_mmproj_quarantine_dir(),
         get_output_dir(),
         get_llama_bin_dir(),
         get_sd_bin_dir(),
@@ -232,7 +231,7 @@ def ensure_data_dirs() -> None:
         get_ref_cache_dir(),
     ):
         d.mkdir(parents=True, exist_ok=True)
-    # Keep vision projectors out of models/ root so pure-text loads stay clean
+    # Move mmproj*.gguf into <model_dir>/mmproj/ (beside the GGUF, not project-root)
     quarantine_mmproj_files()
 
 
@@ -248,7 +247,7 @@ THINKING_MODEL_HINT = (
     "Qwen3-VL-4B-Thinking*.gguf"
 )
 TEXT_MODEL_HINT = THINKING_MODEL_HINT  # single text model role
-MMPROJ_HINT = "mmproj*.gguf  (quarantined under models/mmproj/ — not used for pure text)"
+MMPROJ_HINT = "mmproj*.gguf  (moved to <model_dir>/mmproj/ — not used for pure text)"
 DIFFUSER_MODEL_HINT = "flux-2-klein-4b-Q8_0.gguf  OR  diffusion_pytorch_model_4b.safetensors"
 VAE_HINT = "flux2_ae.safetensors (Flux.2 VAE from black-forest-labs/FLUX.2-dev — NOT Flux.1 ae.safetensors)"
 
@@ -502,36 +501,90 @@ def identify_text_model_variant(path_str: str) -> str:
     return "Text" if path_str else ""
 
 
-def get_mmproj_quarantine_dir() -> Path:
+def get_mmproj_quarantine_dir(model_dir: Optional[Path] = None) -> Path:
+    """
+    mmproj lives next to the model being used: <model_dir>/mmproj/.
+
+    Not under the project models/mmproj/ tree unless the model itself lives there.
+    """
+    if model_dir is not None:
+        return Path(model_dir) / "mmproj"
     return get_models_dir() / "mmproj"
 
 
-def quarantine_mmproj_files() -> List[str]:
+def _quarantine_mmproj_in_dir(directory: Path) -> List[str]:
     """
-    Move mmproj*.gguf from models/ root into models/mmproj/ so llama.cpp
-    does not auto-attach vision projector during pure-text loads.
+    Move any mmproj*.gguf sitting directly in `directory` into directory/mmproj/.
+    Leaves files already inside a mmproj/ subfolder alone.
     """
-    models = get_models_dir()
-    dest = get_mmproj_quarantine_dir()
-    dest.mkdir(parents=True, exist_ok=True)
     moved: List[str] = []
-    if not models.is_dir():
+    try:
+        root = Path(directory)
+    except Exception:
         return moved
-    for p in list(models.iterdir()):
+    if not root.is_dir():
+        return moved
+    dest = root / "mmproj"
+    for p in list(root.iterdir()):
         if not p.is_file():
             continue
-        name = p.name
-        low = name.lower()
+        low = p.name.lower()
         if not low.startswith("mmproj") or not low.endswith(".gguf"):
             continue
-        target = dest / name
         try:
+            dest.mkdir(parents=True, exist_ok=True)
+            target = dest / p.name
             if target.exists():
                 p.unlink(missing_ok=True)
-                moved.append(f"{name} (duplicate removed)")
+                moved.append(f"{p.name} → {dest} (duplicate removed)")
             else:
                 shutil.move(str(p), str(target))
-                moved.append(name)
+                moved.append(f"{p.name} → {dest}")
+        except OSError as e:
+            print(f"[mmproj] could not quarantine {p}: {e}", flush=True)
+    return moved
+
+
+def quarantine_mmproj_files(model_path: str = "") -> List[str]:
+    """
+    Move mmproj*.gguf into an mmproj/ folder beside the model in use.
+
+    1. If model_path is set, quarantine mmproj files in that model's directory.
+    2. Also scan project models/ and its immediate subfolders (any GGUF home).
+    llama.cpp auto-picks mmproj next to a GGUF; keeping it under mmproj/ stops
+    pure-text loads from attaching vision weights by accident.
+    """
+    moved: List[str] = []
+    seen: set = set()
+
+    def _do(d: Path) -> None:
+        try:
+            key = str(d.resolve())
+        except Exception:
+            key = str(d)
+        if key in seen:
+            return
+        seen.add(key)
+        moved.extend(_quarantine_mmproj_in_dir(d))
+
+    mp = (model_path or "").strip()
+    if mp:
+        p = Path(mp).expanduser()
+        try:
+            if p.is_file():
+                _do(p.parent)
+            elif p.is_dir():
+                _do(p)
+        except OSError:
+            pass
+
+    models = get_models_dir()
+    if models.is_dir():
+        _do(models)
+        try:
+            for sub in models.iterdir():
+                if sub.is_dir() and sub.name.lower() != "mmproj":
+                    _do(sub)
         except OSError:
             pass
     return moved
@@ -543,12 +596,18 @@ def resolve_text_model_path(cfg: Optional[Dict[str, Any]] = None) -> str:
 
     Prefer thinking_model_path; fall back to encoder_model_path so older
     configuration.json files keep working until the user re-saves Configuration.
+    When a path is resolved, any mmproj*.gguf beside it is moved into
+    <model_dir>/mmproj/ so llama.cpp does not auto-attach vision weights.
     """
     data = cfg if isinstance(cfg, dict) else load_configuration()
     th = (data.get("thinking_model_path") or "").strip()
-    if th:
-        return th
-    return (data.get("encoder_model_path") or "").strip()
+    path = th if th else (data.get("encoder_model_path") or "").strip()
+    if path:
+        try:
+            quarantine_mmproj_files(path)
+        except Exception:
+            pass
+    return path
 
 
 def resolve_prompting_backend(cfg: Optional[Dict[str, Any]] = None) -> str:
@@ -794,15 +853,89 @@ OUTFIT_CONCRETE = [
 OUTFIT_DEFAULT = OUTFIT_NONE
 OUTFIT_TOKEN = "<outfit_worn>"
 OUTFIT_WORDS = {
-    OUTFIT_SMART_SUIT: "smart-suit with unbuttoned-shirt outfit",
-    OUTFIT_SMART_CASUAL_MALE: "black-tshirt with grey-smart-jeans outfit",
-    OUTFIT_SMART_CASUAL_FEMALE: "black-tshirt with grey-short-skirt outfit",
-    OUTFIT_JOGGERS: "black-crop-top with grey-jogging-shorts outfit",
-    OUTFIT_ROCKER: "long-black-leather-coat with black shirt and grey-jeans outfit",
-    OUTFIT_DARKONES: "black-teflon hooded-hiphop-coat zipped-up with hood-down, grey-jeans, and black-boots",
+    OUTFIT_SMART_SUIT: "smart-suit with unbuttoned-shirt",
+    OUTFIT_SMART_CASUAL_MALE: "black-tshirt with grey-smart-jeans",
+    OUTFIT_SMART_CASUAL_FEMALE: "black-tshirt with grey-short-skirt",
+    OUTFIT_JOGGERS: "black-crop-top with grey-jogging-shorts",
+    OUTFIT_ROCKER: "long-black-leather-coat with black shirt and grey-jeans",
+    OUTFIT_DARKONES: "black-teflon hooded-hiphop-coat zipped-up with hood-down, grey-jeans",
     OUTFIT_SKIMPY: "skimpy-revealing version of same outfit",
     OUTFIT_NONE: "",
 }
+
+# ---------------------------------------------------------------------------
+# Footwear (subject token — optional; none-specified omits from prompt)
+# Placed after clothing in identity / appearance clauses.
+# ---------------------------------------------------------------------------
+FOOTWEAR_BLACK_BOOTS = "black-boots"
+FOOTWEAR_MANILA_BOOTS = "manila-boots"
+FOOTWEAR_BLACK_SHOES = "black-shoes"
+FOOTWEAR_MANILA_SHOES = "manila-shoes"
+FOOTWEAR_BLACK_TRAINERS = "black-trainers"
+FOOTWEAR_MANILA_TRAINERS = "manila-trainers"
+FOOTWEAR_NONE = "none-specified"
+FOOTWEAR_CHOICES = [
+    FOOTWEAR_BLACK_BOOTS,
+    FOOTWEAR_MANILA_BOOTS,
+    FOOTWEAR_BLACK_SHOES,
+    FOOTWEAR_MANILA_SHOES,
+    FOOTWEAR_BLACK_TRAINERS,
+    FOOTWEAR_MANILA_TRAINERS,
+    FOOTWEAR_NONE,
+]
+FOOTWEAR_DEFAULT = FOOTWEAR_NONE
+FOOTWEAR_TOKEN = "<footwear>"
+FOOTWEAR_WORDS = {
+    FOOTWEAR_BLACK_BOOTS: "black boots",
+    FOOTWEAR_MANILA_BOOTS: "manila boots",
+    FOOTWEAR_BLACK_SHOES: "black shoes",
+    FOOTWEAR_MANILA_SHOES: "manila shoes",
+    FOOTWEAR_BLACK_TRAINERS: "black trainers",
+    FOOTWEAR_MANILA_TRAINERS: "manila trainers",
+    FOOTWEAR_NONE: "",
+}
+
+
+def normalize_footwear(value: str) -> str:
+    v = (value or "").strip()
+    if not v:
+        return FOOTWEAR_DEFAULT
+    if v in FOOTWEAR_CHOICES:
+        return v
+    low = v.lower().replace("_", "-").replace(" ", "-")
+    for c in FOOTWEAR_CHOICES:
+        if c.lower() == low:
+            return c
+    aliases = {
+        "none": FOOTWEAR_NONE,
+        "none-specified": FOOTWEAR_NONE,
+        "boots": FOOTWEAR_BLACK_BOOTS,
+        "shoes": FOOTWEAR_BLACK_SHOES,
+        "trainers": FOOTWEAR_BLACK_TRAINERS,
+        "sneakers": FOOTWEAR_BLACK_TRAINERS,
+    }
+    return aliases.get(low, FOOTWEAR_DEFAULT)
+
+
+def footwear_phrase(value: str) -> str:
+    """Concrete footwear description, or empty when none-specified."""
+    key = normalize_footwear(value)
+    if key == FOOTWEAR_NONE:
+        return ""
+    return (FOOTWEAR_WORDS.get(key) or "").strip()
+
+
+def clothing_and_footwear_phrase(outfit: str = "", footwear: str = "") -> str:
+    """
+    Combined wardrobe clause for the main character.
+    Footwear is appended after clothing when both are set.
+    Returns empty string when neither contributes text.
+    """
+    op = outfit_phrase(outfit)
+    fp = footwear_phrase(footwear)
+    if op and fp:
+        return f"{op}, {fp}"
+    return op or fp
 
 
 def normalize_outfit(value: str) -> str:
@@ -989,10 +1122,12 @@ def subject_appearance_clause(
     gender: str = "",
     bodyshape: str = "",
     age=None,
+    footwear: str = "",
 ) -> str:
     """
     Build optional identity/appearance text for character-bearing prompts.
-    Hair/outfit omitted when None; gender/bodyshape/age default to concrete words.
+    Hair/outfit/footwear omitted when None; gender/bodyshape/age default to concrete words.
+    Footwear is placed after clothing when both are present.
     """
     bits: List[str] = []
     gp = gender_phrase(gender) if gender else ""
@@ -1004,11 +1139,11 @@ def subject_appearance_clause(
     if age is not None and str(age).strip() != "":
         bits.append(age_phrase(age))
     hp = hair_style_phrase(hair)
-    op = outfit_phrase(outfit)
+    wear = clothing_and_footwear_phrase(outfit, footwear)
     if hp:
         bits.append(f"hair {hp}")
-    if op:
-        bits.append(f"wearing a {op}")
+    if wear:
+        bits.append(f"wearing a {wear}")
     if not bits:
         return ""
     return "Subject appearance: " + "; ".join(bits) + "."
@@ -1021,16 +1156,18 @@ def character_identity_clause(
     bodyshape: str = "",
     age=None,
     presence: str = "full",
+    footwear: str = "",
 ) -> str:
     """
     Natural-language character lock for Flux --llm (no instructional CHARACTER: prefix).
 
     presence = silhouette | partial | full (default full)
+    Footwear is appended after clothing when both are set.
     """
     gp = gender_phrase(gender) if gender else ""
     bp = bodyshape_phrase(bodyshape)
     hp = hair_style_phrase(hair)
-    op = outfit_phrase(outfit)
+    wear = clothing_and_footwear_phrase(outfit, footwear)
     pres = (presence or "full").strip().lower()
     if pres not in ("none", "silhouette", "partial", "full"):
         pres = "full"
@@ -1045,8 +1182,8 @@ def character_identity_clause(
             bits.append(f"hair {hp}")
         if bp:
             bits.append(f"{bp} build")
-        if op:
-            bits.append(f"wearing {op}")
+        if wear:
+            bits.append(f"wearing {wear}")
         return ", ".join(bits) + "."
 
     # full / partial — face-match identity lock in natural prose
@@ -1062,8 +1199,8 @@ def character_identity_clause(
     if hp:
         bits.append(f"hair {hp}")
     bits.append("anatomically correct hands")
-    if op:
-        bits.append(f"wearing {op}")
+    if wear:
+        bits.append(f"wearing {wear}")
     return ", ".join(bits) + "."
 
 
@@ -1375,15 +1512,15 @@ def merge_negative_prompt(
 # Image frequency: independent Cover / Theme / Lyrics-per-line counts
 # Stored in generation.json as cover_count, theme_count, lyrics_per_line.
 # imagegen_frequency remains a synthesized "C#/T#/L#" label for compatibility.
-COVER_COUNT_MIN = 1
+COVER_COUNT_MIN = 0
 COVER_COUNT_MAX = 6
 DEFAULT_COVER_COUNT = 1
 
-THEME_COUNT_MIN = 1
+THEME_COUNT_MIN = 0
 THEME_COUNT_MAX = 12
 DEFAULT_THEME_COUNT = 2
 
-LYRICS_PER_LINE_MIN = 1
+LYRICS_PER_LINE_MIN = 0
 LYRICS_PER_LINE_MAX = 5
 DEFAULT_LYRICS_PER_LINE = 1
 
@@ -1421,25 +1558,31 @@ IMAGE_FREQUENCY_SEQUENCE = {
 
 def clamp_cover_count(value) -> int:
     try:
-        n = int(value)
+        n = int(float(value))
     except (TypeError, ValueError):
-        n = DEFAULT_COVER_COUNT
+        return DEFAULT_COVER_COUNT
+    if n < 0:
+        n = 0
     return max(COVER_COUNT_MIN, min(COVER_COUNT_MAX, n))
 
 
 def clamp_theme_count(value) -> int:
     try:
-        n = int(value)
+        n = int(float(value))
     except (TypeError, ValueError):
-        n = DEFAULT_THEME_COUNT
+        return DEFAULT_THEME_COUNT
+    if n < 0:
+        n = 0
     return max(THEME_COUNT_MIN, min(THEME_COUNT_MAX, n))
 
 
 def clamp_lyrics_per_line(value) -> int:
     try:
-        n = int(value)
+        n = int(float(value))
     except (TypeError, ValueError):
-        n = DEFAULT_LYRICS_PER_LINE
+        return DEFAULT_LYRICS_PER_LINE
+    if n < 0:
+        n = 0
     return max(LYRICS_PER_LINE_MIN, min(LYRICS_PER_LINE_MAX, n))
 
 
@@ -1527,6 +1670,8 @@ def frequency_lyrics_per_line(value) -> int:
 def image_frequency_hints(freq) -> list:
     """Ordered sequence framing strings for multi-variant lyric stills (length == lyrics-per-line)."""
     n = frequency_lyrics_per_line(freq)
+    if n <= 0:
+        return []
     hints = IMAGE_FREQUENCY_SEQUENCE.get(n)
     if not hints:
         # Generic progressive labels beyond the canned set
@@ -2108,6 +2253,7 @@ GENERATION_KEYS = [
     "reference_image_path",
     "hair_style",
     "outfit_worn",
+    "footwear",
     "ref_gender",
     "ref_bodyshape",
     "ref_age",
@@ -2139,6 +2285,7 @@ def _default_generation() -> Dict[str, Any]:
         "reference_image_path": "",
         "hair_style": HAIR_STYLE_DEFAULT,
         "outfit_worn": OUTFIT_DEFAULT,
+        "footwear": FOOTWEAR_DEFAULT,
         "ref_gender": GENDER_DEFAULT,
         "ref_bodyshape": BODYSHAPE_DEFAULT,
         "ref_age": AGE_DEFAULT,
