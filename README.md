@@ -80,10 +80,12 @@ Lyrics-Materials/
 
 ### Development:
 - Installer not checked for a while, as I didnt change packages after early versions, but worked last time used, will be checked at some point. More interested in completing program.
-- The outfits need improving, current list is from Image Glamour plus 2 for artist, though after review. For more range, enumerate common outfit types, and create larger list, also 
+- The outfits need improving, current list is from Image Glamour plus 2 for artist, though after review. For more range, enumerate common popular outfit types.
+- Option to have NONE of the images with background/other characters; option for all scenes will as are appropriate ONLY feature reference character or just the scene. 
+
+### Testing:
 - add another control for footwear, ie, black-boots, manila-boots, black-shoes, manila-shoes, black-trainers, manila-trainers, none-specified (no text segment in prompt).
 - Its not meant to be moving the mmproj to ".\models\mmproj\*", its instead supposed to be creating a mmproj folder in the location where the actual model being used is in, and moving it there.
-- Option to have NONE of the images with background/other characters; option for all scenes will as are appropriate ONLY feature reference character or just the scene. 
 
 ### Disclaimer:
 - Warnings of quantum-weirdness in advance, but if you are familiar with Flux-2-Klein and qwen3-4b-thinking, this seems to be a good showcasing of what it can do, but you yourself are the one whom pulls the lever on your own configurations and Lyrics, then unexpected results will occur, because I probably havn't seen it before, one can always use the Negative prompt to filter out their phobias/fears in a box on the bottom of panel at location of  `Management > Name and Lyrics`.
