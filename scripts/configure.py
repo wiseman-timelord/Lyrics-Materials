@@ -1372,31 +1372,24 @@ def merge_negative_prompt(
 
 
 
-# Image frequency presets: Cover / Theme / Lyrics-per-line
-# Labels shown in the Generation dropdown.
-#   C = cover stills · T = theme (ambient) stills · L = stills per lyric line
-IMAGE_FREQUENCY_CHOICES = [
-    "C1/T2/L1", "C2/T4/L1", "C3/T6/L1",
-    "C1/T2/L2", "C2/T4/L2", "C3/T6/L2",
-    "C1/T2/L3", "C2/T4/L3", "C3/T6/L3",
-]
-DEFAULT_IMAGE_FREQUENCY = "C1/T2/L1"
+# Image frequency: independent Cover / Theme / Lyrics-per-line counts
+# Stored in generation.json as cover_count, theme_count, lyrics_per_line.
+# imagegen_frequency remains a synthesized "C#/T#/L#" label for compatibility.
+COVER_COUNT_MIN = 1
+COVER_COUNT_MAX = 6
+DEFAULT_COVER_COUNT = 1
 
-IMAGE_FREQUENCY_MAP = {
-    "C1/T2/L1": {"cover": 1, "theme": 2, "lyrics": 1},
-    "C2/T4/L1": {"cover": 2, "theme": 4, "lyrics": 1},
-    "C3/T6/L1": {"cover": 3, "theme": 6, "lyrics": 1},
-    "C1/T2/L2": {"cover": 1, "theme": 2, "lyrics": 2},
-    "C2/T4/L2": {"cover": 2, "theme": 4, "lyrics": 2},
-    "C3/T6/L2": {"cover": 3, "theme": 6, "lyrics": 2},
-    "C1/T2/L3": {"cover": 1, "theme": 2, "lyrics": 3},
-    "C2/T4/L3": {"cover": 2, "theme": 4, "lyrics": 3},
-    "C3/T6/L3": {"cover": 3, "theme": 6, "lyrics": 3},
-    # Legacy aliases from v1
-    "C1/T2/LX": {"cover": 1, "theme": 2, "lyrics": 1},
-    "C2/T4/LX": {"cover": 2, "theme": 4, "lyrics": 1},
-    "C3/T6/LX": {"cover": 3, "theme": 6, "lyrics": 1},
-}
+THEME_COUNT_MIN = 1
+THEME_COUNT_MAX = 12
+DEFAULT_THEME_COUNT = 2
+
+LYRICS_PER_LINE_MIN = 1
+LYRICS_PER_LINE_MAX = 5
+DEFAULT_LYRICS_PER_LINE = 1
+
+DEFAULT_IMAGE_FREQUENCY = (
+    f"C{DEFAULT_COVER_COUNT}/T{DEFAULT_THEME_COUNT}/L{DEFAULT_LYRICS_PER_LINE}"
+)
 
 # Framing hints when generating multiple stills for one lyric line
 IMAGE_FREQUENCY_SEQUENCE = {
@@ -1410,69 +1403,167 @@ IMAGE_FREQUENCY_SEQUENCE = {
         "middle / peak of this moment",
         "end of this moment",
     ],
+    4: [
+        "opening of this moment",
+        "build of this moment",
+        "peak of this moment",
+        "resolve of this moment",
+    ],
+    5: [
+        "opening of this moment",
+        "early development",
+        "middle / peak of this moment",
+        "late development",
+        "resolve of this moment",
+    ],
 }
 
 
-def normalize_image_frequency(value) -> str:
-    """Return a canonical frequency preset label (C1/T2/L1 …). Accepts legacy ints/LX."""
-    v = str(value or "").strip().upper().replace(" ", "")
-    # Normalise LX → L1 for lookup display
-    if v.endswith("/LX"):
-        v = v[:-2] + "L1"
-    if v in IMAGE_FREQUENCY_MAP and not v.endswith("/LX"):
-        # Prefer non-legacy key when both exist
-        if v in IMAGE_FREQUENCY_CHOICES:
-            return v
-    if v in IMAGE_FREQUENCY_MAP:
-        # Map legacy LX keys to L1 display labels
-        legacy = {
-            "C1/T2/LX": "C1/T2/L1",
-            "C2/T4/LX": "C2/T4/L1",
-            "C3/T6/LX": "C3/T6/L1",
-        }
-        return legacy.get(v, v if v in IMAGE_FREQUENCY_CHOICES else DEFAULT_IMAGE_FREQUENCY)
+def clamp_cover_count(value) -> int:
     try:
         n = int(value)
-        if n <= 1:
-            return "C1/T2/L1"
-        if n == 2:
-            return "C2/T4/L2"
-        return "C3/T6/L3"
+    except (TypeError, ValueError):
+        n = DEFAULT_COVER_COUNT
+    return max(COVER_COUNT_MIN, min(COVER_COUNT_MAX, n))
+
+
+def clamp_theme_count(value) -> int:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        n = DEFAULT_THEME_COUNT
+    return max(THEME_COUNT_MIN, min(THEME_COUNT_MAX, n))
+
+
+def clamp_lyrics_per_line(value) -> int:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        n = DEFAULT_LYRICS_PER_LINE
+    return max(LYRICS_PER_LINE_MIN, min(LYRICS_PER_LINE_MAX, n))
+
+
+def format_image_frequency(cover=None, theme=None, lyrics=None) -> str:
+    """Build canonical C#/T#/L# label from independent counts."""
+    c = clamp_cover_count(cover if cover is not None else DEFAULT_COVER_COUNT)
+    t = clamp_theme_count(theme if theme is not None else DEFAULT_THEME_COUNT)
+    l = clamp_lyrics_per_line(lyrics if lyrics is not None else DEFAULT_LYRICS_PER_LINE)
+    return f"C{c}/T{t}/L{l}"
+
+
+def parse_image_frequency(value) -> Dict[str, int]:
+    """
+    Parse a frequency value into {'cover', 'theme', 'lyrics'}.
+
+    Accepts:
+      - "C1/T2/L1" style labels (incl. legacy /LX → L1)
+      - generation dict with cover_count / theme_count / lyrics_per_line
+      - bare int (maps to default C/T with that L, or full defaults)
+    """
+    if isinstance(value, dict):
+        return {
+            "cover": clamp_cover_count(
+                value.get("cover_count", value.get("cover", DEFAULT_COVER_COUNT))
+            ),
+            "theme": clamp_theme_count(
+                value.get("theme_count", value.get("theme", DEFAULT_THEME_COUNT))
+            ),
+            "lyrics": clamp_lyrics_per_line(
+                value.get("lyrics_per_line", value.get("lyrics", DEFAULT_LYRICS_PER_LINE))
+            ),
+        }
+    v = str(value or "").strip().upper().replace(" ", "")
+    if v.endswith("/LX"):
+        v = v[:-2] + "L1"
+    m = re.match(r"^C(\d+)/T(\d+)/L(\d+)$", v)
+    if m:
+        return {
+            "cover": clamp_cover_count(m.group(1)),
+            "theme": clamp_theme_count(m.group(2)),
+            "lyrics": clamp_lyrics_per_line(m.group(3)),
+        }
+    try:
+        n = int(value)
+        # Legacy single-int: treat as lyrics-per-line with default C/T
+        return {
+            "cover": DEFAULT_COVER_COUNT,
+            "theme": DEFAULT_THEME_COUNT,
+            "lyrics": clamp_lyrics_per_line(n),
+        }
     except (TypeError, ValueError):
         pass
-    return DEFAULT_IMAGE_FREQUENCY
+    return {
+        "cover": DEFAULT_COVER_COUNT,
+        "theme": DEFAULT_THEME_COUNT,
+        "lyrics": DEFAULT_LYRICS_PER_LINE,
+    }
+
+
+def normalize_image_frequency(value) -> str:
+    """Return canonical C#/T#/L# label. Accepts legacy presets, ints, or dicts."""
+    counts = parse_image_frequency(value)
+    return format_image_frequency(
+        counts["cover"], counts["theme"], counts["lyrics"]
+    )
 
 
 def frequency_counts(value) -> Dict[str, int]:
-    """Return {'cover': N, 'theme': M, 'lyrics': K} for a preset or legacy value."""
-    key = normalize_image_frequency(value)
-    # Also try raw string for legacy map keys
-    raw = str(value or "").strip().upper().replace(" ", "")
-    src = IMAGE_FREQUENCY_MAP.get(key) or IMAGE_FREQUENCY_MAP.get(raw) or IMAGE_FREQUENCY_MAP[DEFAULT_IMAGE_FREQUENCY]
-    return dict(src)
+    """Return {'cover': N, 'theme': M, 'lyrics': K} for any frequency value."""
+    return parse_image_frequency(value)
 
 
 def frequency_cover_count(value) -> int:
-    return int(frequency_counts(value).get("cover", 1))
+    return int(frequency_counts(value).get("cover", DEFAULT_COVER_COUNT))
 
 
 def frequency_theme_count(value) -> int:
-    return int(frequency_counts(value).get("theme", 2))
+    return int(frequency_counts(value).get("theme", DEFAULT_THEME_COUNT))
 
 
 def frequency_lyrics_per_line(value) -> int:
-    return int(frequency_counts(value).get("lyrics", 1))
+    return int(frequency_counts(value).get("lyrics", DEFAULT_LYRICS_PER_LINE))
 
 
 def image_frequency_hints(freq) -> list:
     """Ordered sequence framing strings for multi-variant lyric stills (length == lyrics-per-line)."""
     n = frequency_lyrics_per_line(freq)
-    hints = IMAGE_FREQUENCY_SEQUENCE.get(n) or IMAGE_FREQUENCY_SEQUENCE[1]
+    hints = IMAGE_FREQUENCY_SEQUENCE.get(n)
+    if not hints:
+        # Generic progressive labels beyond the canned set
+        hints = [f"beat {i}/{n} of this moment" for i in range(1, n + 1)]
+        if n == 1:
+            hints = [""]
     if len(hints) < n:
         hints = list(hints) + [""] * (n - len(hints))
     return list(hints[:n])
 
 
+def load_frequency_counts() -> Dict[str, int]:
+    """Read independent counts from generation.json (with legacy label fallback)."""
+    g = load_generation()
+    if any(k in g for k in ("cover_count", "theme_count", "lyrics_per_line")):
+        return {
+            "cover": clamp_cover_count(g.get("cover_count", DEFAULT_COVER_COUNT)),
+            "theme": clamp_theme_count(g.get("theme_count", DEFAULT_THEME_COUNT)),
+            "lyrics": clamp_lyrics_per_line(g.get("lyrics_per_line", DEFAULT_LYRICS_PER_LINE)),
+        }
+    return parse_image_frequency(g.get("imagegen_frequency") or DEFAULT_IMAGE_FREQUENCY)
+
+
+def save_frequency_counts(cover=None, theme=None, lyrics=None) -> Dict[str, int]:
+    """Persist independent counts + synthesized imagegen_frequency label."""
+    current = load_frequency_counts()
+    c = clamp_cover_count(cover if cover is not None else current["cover"])
+    t = clamp_theme_count(theme if theme is not None else current["theme"])
+    l = clamp_lyrics_per_line(lyrics if lyrics is not None else current["lyrics"])
+    label = format_image_frequency(c, t, l)
+    update_generation({
+        "cover_count": c,
+        "theme_count": t,
+        "lyrics_per_line": l,
+        "imagegen_frequency": label,
+    })
+    return {"cover": c, "theme": t, "lyrics": l}
 
 
 # Window geometry defaults
@@ -2000,6 +2091,9 @@ GENERATION_KEYS = [
     "imagegen_height",
     "imagegen_size",
     "imagegen_frequency",
+    "cover_count",
+    "theme_count",
+    "lyrics_per_line",
     "image_style",
     "imagegen_steps",
     "imagegen_cfg_scale",
@@ -2028,6 +2122,9 @@ def _default_generation() -> Dict[str, Any]:
         "imagegen_height": DEFAULT_HEIGHT,
         "imagegen_size": DEFAULT_IMAGE_SIZE,
         "imagegen_frequency": DEFAULT_IMAGE_FREQUENCY,
+        "cover_count": DEFAULT_COVER_COUNT,
+        "theme_count": DEFAULT_THEME_COUNT,
+        "lyrics_per_line": DEFAULT_LYRICS_PER_LINE,
         "image_style": IMAGE_STYLE_DEFAULT,
         "imagegen_steps": DEFAULT_STEPS,
         "imagegen_cfg_scale": DEFAULT_CFG,

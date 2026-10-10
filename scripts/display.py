@@ -231,10 +231,8 @@ def _can_theme(lyrics: str = "", song_name: str = "") -> bool:
 
 def _current_freq_label() -> str:
     try:
-        g = configure.load_generation()
-        return configure.normalize_image_frequency(
-            g.get("imagegen_frequency") or configure.DEFAULT_IMAGE_FREQUENCY
-        )
+        c = configure.load_frequency_counts()
+        return configure.format_image_frequency(c["cover"], c["theme"], c["lyrics"])
     except Exception:
         return configure.DEFAULT_IMAGE_FREQUENCY
 
@@ -2124,8 +2122,12 @@ def _build_create_tab() -> None:
             )
             if _g0.get("imagegen_size"):
                 _init_size = configure.normalize_image_size(str(_g0.get("imagegen_size")))
-            _init_freq = configure.normalize_image_frequency(
-                _g0.get("imagegen_frequency") or configure.DEFAULT_IMAGE_FREQUENCY
+            _freq0 = configure.load_frequency_counts()
+            _init_cover = _freq0["cover"]
+            _init_theme = _freq0["theme"]
+            _init_lyrics_n = _freq0["lyrics"]
+            _init_freq = configure.format_image_frequency(
+                _init_cover, _init_theme, _init_lyrics_n
             )
 
             _gen["details_mode"] = gr.Radio(
@@ -2144,8 +2146,8 @@ def _build_create_tab() -> None:
             with gr.Column(visible=False, elem_id="details-project-settings") as _details_settings:
                 gr.Markdown(
                     "### Project Settings\n"
-                    "Visual style, image style, still size, image frequency "
-                    "(**C**over / **T**heme / **L**yrics-per-line), and sampling. "
+                    "Visual style, image style, still size, and independent "
+                    "**C**over / **T**heme / **L**yrics-per-line counts, plus sampling. "
                     "Default steps **8** (better eyes / detail on Flux.2)."
                 )
                 with gr.Row():
@@ -2166,13 +2168,48 @@ def _build_create_tab() -> None:
                         label="Image size",
                         choices=configure.IMAGE_SIZE_CHOICES,
                         value=_init_size,
-                        info="Output still dimensions (width × height).",
+                        scale=1,
+                        min_width=120,
+                        info="Still dimensions.",
                     )
-                    _gen["image_frequency"] = gr.Dropdown(
-                        label="Image Frequency",
-                        choices=configure.IMAGE_FREQUENCY_CHOICES,
+                    _gen["cover_count"] = gr.Number(
+                        label="Cover (C)",
+                        value=_init_cover,
+                        minimum=configure.COVER_COUNT_MIN,
+                        maximum=configure.COVER_COUNT_MAX,
+                        step=1,
+                        precision=0,
+                        scale=1,
+                        min_width=80,
+                        info=f"{configure.COVER_COUNT_MIN}–{configure.COVER_COUNT_MAX}",
+                    )
+                    _gen["theme_count"] = gr.Number(
+                        label="Theme (T)",
+                        value=_init_theme,
+                        minimum=configure.THEME_COUNT_MIN,
+                        maximum=configure.THEME_COUNT_MAX,
+                        step=1,
+                        precision=0,
+                        scale=1,
+                        min_width=80,
+                        info=f"{configure.THEME_COUNT_MIN}–{configure.THEME_COUNT_MAX}",
+                    )
+                    _gen["lyrics_per_line"] = gr.Number(
+                        label="Lyrics/line (L)",
+                        value=_init_lyrics_n,
+                        minimum=configure.LYRICS_PER_LINE_MIN,
+                        maximum=configure.LYRICS_PER_LINE_MAX,
+                        step=1,
+                        precision=0,
+                        scale=1,
+                        min_width=80,
+                        info=f"{configure.LYRICS_PER_LINE_MIN}–{configure.LYRICS_PER_LINE_MAX} variants",
+                    )
+                    # Hidden synthesised label kept for any residual readers
+                    _gen["image_frequency"] = gr.Textbox(
                         value=_init_freq,
-                        info="C = Cover count · T = Theme (ambient) count · L = stills per lyric line (L2/L3 progressive).",
+                        visible=False,
+                        elem_id="image-frequency-hidden",
                     )
                 with gr.Row():
                     _gen["steps"] = gr.Slider(
@@ -3065,6 +3102,9 @@ def _wire_create_events(status_box) -> None:
         # Optional controls — only when present so counts stay matched
         for key in (
             "image_style",
+            "cover_count",
+            "theme_count",
+            "lyrics_per_line",
             "image_frequency",
             "hair_style",
             "outfit_worn",
@@ -3089,6 +3129,9 @@ def _wire_create_events(status_box) -> None:
         status="",
         sid="",
         image_style=None,
+        cover_count=None,
+        theme_count=None,
+        lyrics_per_line=None,
         image_frequency=None,
         hair_style=None,
         outfit_worn=None,
@@ -3128,13 +3171,26 @@ def _wire_create_events(status_box) -> None:
             *btn_updates,
         ]
         g = configure.load_generation()
+        _fc = configure.load_frequency_counts()
+        if cover_count is not None:
+            _fc["cover"] = configure.clamp_cover_count(cover_count)
+        if theme_count is not None:
+            _fc["theme"] = configure.clamp_theme_count(theme_count)
+        if lyrics_per_line is not None:
+            _fc["lyrics"] = configure.clamp_lyrics_per_line(lyrics_per_line)
+        if image_frequency is not None and str(image_frequency).strip():
+            _fc = configure.parse_image_frequency(image_frequency)
+        _freq_label = configure.format_image_frequency(
+            _fc["cover"], _fc["theme"], _fc["lyrics"]
+        )
         extras = {
             "image_style": configure.normalize_image_style(
                 image_style if image_style is not None else (g.get("image_style") or configure.IMAGE_STYLE_DEFAULT)
             ),
-            "image_frequency": configure.normalize_image_frequency(
-                image_frequency if image_frequency is not None else (g.get("imagegen_frequency") or configure.DEFAULT_IMAGE_FREQUENCY)
-            ),
+            "cover_count": _fc["cover"],
+            "theme_count": _fc["theme"],
+            "lyrics_per_line": _fc["lyrics"],
+            "image_frequency": _freq_label,
             "hair_style": configure.normalize_hair_style(
                 hair_style if hair_style is not None else (g.get("hair_style") or configure.HAIR_STYLE_DEFAULT)
             ),
@@ -3153,6 +3209,9 @@ def _wire_create_events(status_box) -> None:
         }
         for key in (
             "image_style",
+            "cover_count",
+            "theme_count",
+            "lyrics_per_line",
             "image_frequency",
             "hair_style",
             "outfit_worn",
@@ -3459,6 +3518,13 @@ def _wire_create_events(status_box) -> None:
         size_label = configure.normalize_image_size(str(image_size or configure.DEFAULT_IMAGE_SIZE))
         w, h = configure.image_size_pixels(size_label)
         freq = configure.normalize_image_frequency(image_frequency)
+        _fc = configure.parse_image_frequency(freq)
+        configure.update_generation({
+            "cover_count": _fc["cover"],
+            "theme_count": _fc["theme"],
+            "lyrics_per_line": _fc["lyrics"],
+            "imagegen_frequency": freq,
+        })
         cfg["imagegen_width"] = w
         cfg["imagegen_height"] = h
         cfg["imagegen_size"] = size_label
@@ -3794,35 +3860,37 @@ def _wire_create_events(status_box) -> None:
             outputs=[],
         )
 
-    def _on_image_frequency_change(image_frequency, lyrics, song_name, active_session_id):
-        """Persist frequency and refresh Cover/Theme/Lyrics grids + action labels.
+    def _on_frequency_counts_change(cover_count, theme_count, lyrics_per_line, lyrics, song_name, active_session_id):
+        """Persist independent C/T/L counts and refresh Cover/Theme/Lyrics grids.
 
-        Raising frequency expands empty no_image slots and switches buttons to
-        "Complete … Images" when existing stills fall short. Lowering frequency
+        Raising a count expands empty no_image slots and switches buttons to
+        "Complete … Images" when existing stills fall short. Lowering a count
         slims the grids to the new expected count (extra files remain on disk).
         """
-        freq = configure.normalize_image_frequency(image_frequency)
-        configure.update_generation({"imagegen_frequency": freq})
-        # Drop batch-pinned expectations so the dropdown is the display authority
+        counts = configure.save_frequency_counts(cover_count, theme_count, lyrics_per_line)
+        freq = configure.format_image_frequency(
+            counts["cover"], counts["theme"], counts["lyrics"]
+        )
+        # Drop batch-pinned expectations so the UI counts are the display authority
         configure.APP_STATE["cover_slot_expected"] = 0
         configure.APP_STATE["theme_slot_expected"] = 0
         try:
             # Refresh lyrics expected from current lyrics × L
             n_lines = 0
-            text = (lyrics or "").strip()
-            if not text:
+            text_ly = (lyrics or "").strip()
+            if not text_ly:
                 proj = (configure.APP_STATE.get("current_project_folder") or "").strip()
                 if proj and (Path(proj) / "lyrics.txt").is_file():
-                    text = (Path(proj) / "lyrics.txt").read_text(
+                    text_ly = (Path(proj) / "lyrics.txt").read_text(
                         encoding="utf-8", errors="replace"
                     )
-            if text.strip():
+            if text_ly.strip():
                 from scripts.inference import parse_lyrics, lyric_lines_only
-                n_lines = len(lyric_lines_only(parse_lyrics(text)))
+                n_lines = len(lyric_lines_only(parse_lyrics(text_ly)))
             if n_lines > 0:
-                # Grid slots = lyric lines only; L2/L3 variants use the page switcher
+                # Grid slots = lyric lines only; L2+ variants use the page switcher
                 configure.APP_STATE["thumb_expected_count"] = n_lines
-            per = configure.frequency_lyrics_per_line(freq)
+            per = counts["lyrics"]
             # Keep current page when possible; clamp to new L range
             try:
                 cur = int(configure.APP_STATE.get("lyrics_page") or 1)
@@ -3832,32 +3900,45 @@ def _wire_create_events(status_box) -> None:
         except Exception:
             pass
         pad_status = (
-            f"Image frequency set to {freq} — "
-            f"Cover {configure.frequency_cover_count(freq)}, "
-            f"Theme {configure.frequency_theme_count(freq)}, "
-            f"Lyrics×{configure.frequency_lyrics_per_line(freq)}."
+            f"Image counts set to {freq} — "
+            f"Cover {counts['cover']}, "
+            f"Theme {counts['theme']}, "
+            f"Lyrics×{counts['lyrics']}."
         )
         return (
             pad_status,
+            freq,  # hidden image_frequency
+            counts["cover"],
+            counts["theme"],
+            counts["lyrics"],
             *_action_btn_updates(lyrics or "", song_name or "", running=False),
             active_session_id or "",
         ) + _gallery_sessions_tab(active_session_id or "")
 
-    if _gen.get("image_frequency") is not None:
-        _gen["image_frequency"].change(
-            _on_image_frequency_change,
-            inputs=[
-                _gen["image_frequency"],
-                _gen["lyrics"],
-                _gen["song_name"],
-                _gen["active_session_id"],
-            ],
-            outputs=[
-                status_box,
-                *_action_btn_components(),
-                _gen["active_session_id"],
-            ] + _thumb_panel_outputs() + _session_refresh_outputs + [_gen["main_tabs"]],
-        )
+    _freq_count_inputs = [
+        _gen["cover_count"],
+        _gen["theme_count"],
+        _gen["lyrics_per_line"],
+        _gen["lyrics"],
+        _gen["song_name"],
+        _gen["active_session_id"],
+    ]
+    _freq_count_outputs = [
+        status_box,
+        _gen["image_frequency"],
+        _gen["cover_count"],
+        _gen["theme_count"],
+        _gen["lyrics_per_line"],
+        *_action_btn_components(),
+        _gen["active_session_id"],
+    ] + _thumb_panel_outputs() + _session_refresh_outputs + [_gen["main_tabs"]]
+    for _fk in ("cover_count", "theme_count", "lyrics_per_line"):
+        if _gen.get(_fk) is not None:
+            _gen[_fk].change(
+                _on_frequency_counts_change,
+                inputs=_freq_count_inputs,
+                outputs=_freq_count_outputs,
+            )
 
     def _on_lyrics_page_change(page_label, active_session_id):
         """Switch Lyrics Thumbnails to the selected variant page (L2/L3)."""
@@ -4056,6 +4137,13 @@ def _wire_create_events(status_box) -> None:
         size_label = configure.normalize_image_size(str(image_size or configure.DEFAULT_IMAGE_SIZE))
         w, h = configure.image_size_pixels(size_label)
         freq = configure.normalize_image_frequency(image_frequency)
+        _fc = configure.parse_image_frequency(freq)
+        configure.update_generation({
+            "cover_count": _fc["cover"],
+            "theme_count": _fc["theme"],
+            "lyrics_per_line": _fc["lyrics"],
+            "imagegen_frequency": freq,
+        })
         cfg["imagegen_width"] = w
         cfg["imagegen_height"] = h
         cfg["imagegen_size"] = size_label
@@ -4178,6 +4266,13 @@ def _wire_create_events(status_box) -> None:
         size_label = configure.normalize_image_size(str(image_size or configure.DEFAULT_IMAGE_SIZE))
         w, h = configure.image_size_pixels(size_label)
         freq = configure.normalize_image_frequency(image_frequency)
+        _fc = configure.parse_image_frequency(freq)
+        configure.update_generation({
+            "cover_count": _fc["cover"],
+            "theme_count": _fc["theme"],
+            "lyrics_per_line": _fc["lyrics"],
+            "imagegen_frequency": freq,
+        })
         cfg["imagegen_width"] = w
         cfg["imagegen_height"] = h
         cfg["imagegen_size"] = size_label
@@ -4473,6 +4568,13 @@ def _wire_create_events(status_box) -> None:
 
         # Persist generation settings
         freq = configure.normalize_image_frequency(image_frequency)
+        _fc = configure.parse_image_frequency(freq)
+        configure.update_generation({
+            "cover_count": _fc["cover"],
+            "theme_count": _fc["theme"],
+            "lyrics_per_line": _fc["lyrics"],
+            "imagegen_frequency": freq,
+        })
         w, h = configure.image_size_pixels(image_size)
         cfg = configure.generation_config()
         style = _resolve_ui_style(style)
@@ -4810,6 +4912,13 @@ def _wire_create_events(status_box) -> None:
         size_label = configure.normalize_image_size(str(image_size or configure.DEFAULT_IMAGE_SIZE))
         w, h = configure.image_size_pixels(size_label)
         freq = configure.normalize_image_frequency(image_frequency)
+        _fc = configure.parse_image_frequency(freq)
+        configure.update_generation({
+            "cover_count": _fc["cover"],
+            "theme_count": _fc["theme"],
+            "lyrics_per_line": _fc["lyrics"],
+            "imagegen_frequency": freq,
+        })
         cfg_now = configure.load_configuration()
         gnow = configure.load_generation()
         cfg_now["imagegen_steps"] = steps
