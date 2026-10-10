@@ -79,6 +79,7 @@ Lyrics-Materials/
 ```
 
 ### Development:
+- Installer not checked for a while, as I didnt change packages after early versions, but worked last time used, will be checked at some point. More interested in completing program.
 - The outfits need improving, current list is from Image Glamour plus 2 for artist, though after review. For more range, enumerate common outfit types, and create larger list, also 
 - add another control for footwear, ie, black-boots, manila-boots, black-shoes, manila-shoes, black-trainers, manila-trainers, none-specified (no text segment in prompt).
 - Its not meant to be moving the mmproj to ".\models\mmproj\*", its instead supposed to be creating a mmproj folder in the location where the actual model being used is in, and moving it there.
