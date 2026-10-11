@@ -2034,7 +2034,9 @@ def _build_create_tab() -> None:
         g0_init.get("ref_age", configure.AGE_DEFAULT)
     )
     can = _can_create(initial_lyrics, initial_song)
-    expanded = bool(configure.APP_STATE.get("sessions_sidebar_expanded", True))
+    # Program start: Session Slots always expanded
+    configure.APP_STATE["sessions_sidebar_expanded"] = True
+    expanded = True
     configure.APP_STATE["active_session_id"] = ""
     configure.APP_STATE["session_status"] = "idle"
     configure.APP_STATE["current_project_folder"] = ""
@@ -3030,18 +3032,65 @@ def _wire_create_events(status_box) -> None:
         print(f"[ui] lyrics focus/blur not bound: {e}", flush=True)
 
     def _pipeline_is_running() -> bool:
+        """True while any batch / assessment / image job is live."""
         st = str(configure.APP_STATE.get("session_status") or "").lower()
-        return st in ("running", "images", "prompts", "analysis", "theme", "cover", "regen")
+        if st in ("running", "images", "prompts", "analysis", "theme", "cover", "regen"):
+            return True
+        if bool(configure.APP_STATE.get("generating")):
+            return True
+        if configure.APP_STATE.get("cover_slot_generating") is not None:
+            return True
+        if configure.APP_STATE.get("theme_slot_generating") is not None:
+            return True
+        if configure.APP_STATE.get("thumb_generating_line") is not None:
+            return True
+        return False
 
     def _stop(lyrics="", song_name=""):
         msg = inference.emergency_stop()
         configure.APP_STATE["session_status"] = "idle"
         configure.APP_STATE["generating"] = False
         configure.APP_STATE["image_gen_t0"] = None
+        configure.APP_STATE["cover_slot_generating"] = None
+        configure.APP_STATE["theme_slot_generating"] = None
+        configure.APP_STATE["thumb_generating_line"] = None
+        configure.APP_STATE["prefer_stop"] = False
         _begin_ui_job("stop")  # invalidate any residual UI timer loops
         inference.clear_cancel_state()
         idle = _action_btn_updates(lyrics or "", song_name or "", running=False)
         return (msg, *idle)
+
+    def _stop_from_thumb(lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale, ref_image, hair_style, outfit_worn, negative_prompt, active_session_id):
+        """Emergency Stop path shared by Cover / Theme / Lyrics dual-purpose buttons."""
+        msg, *idle = _stop(lyrics, song_name)
+        yield (
+            msg, *idle, active_session_id or "",
+        ) + _gallery_sessions_tab(active_session_id or "")
+
+    def _should_stop_only() -> bool:
+        """True when this click should only stop (not start a new job).
+
+        Gradio cancels the previous generator with GeneratorExit when the same
+        button is re-clicked; that path sets prefer_stop so the new invocation
+        does not immediately restart generation.
+        """
+        if configure.APP_STATE.pop("prefer_stop", False):
+            return True
+        return _pipeline_is_running()
+
+    def _mark_generator_cancelled() -> None:
+        """Called from GeneratorExit — kill backend workers and flag stop-only."""
+        configure.APP_STATE["prefer_stop"] = True
+        try:
+            inference.emergency_stop()
+        except Exception:
+            pass
+        configure.APP_STATE["session_status"] = "idle"
+        configure.APP_STATE["generating"] = False
+        configure.APP_STATE["image_gen_t0"] = None
+        configure.APP_STATE["cover_slot_generating"] = None
+        configure.APP_STATE["theme_slot_generating"] = None
+        configure.APP_STATE["thumb_generating_line"] = None
 
     # Management Emergency Stop (+ restores button labels)
     _gen["stop_btn"].click(
@@ -3088,6 +3137,21 @@ def _wire_create_events(status_box) -> None:
         # Re-label session buttons for compact/expanded
         refresh = _refresh_session_slots(active_id or "", expanded=expanded)
         return (expanded, gr.update(value=btn_label), col) + tuple(refresh)
+
+    def _collapse_sidebar_updates(active_id: str = ""):
+        """Force Session slots column collapsed (idiot-proof after Run Assessment)."""
+        configure.APP_STATE["sessions_sidebar_expanded"] = False
+        col = gr.update(
+            scale=0,
+            min_width=48,
+            elem_classes=["sessions-sidebar-compact"],
+        )
+        refresh = _refresh_session_slots(active_id or "", expanded=False)
+        return (False, gr.update(value="<-->"), col) + tuple(refresh)
+
+    def _on_assess_click_ui(active_id: str = ""):
+        """Instant UI feedback on Assess: status line + collapse Session slots."""
+        return (_status_plain(_ASSESS_START_MSG),) + _collapse_sidebar_updates(active_id or "")
 
     _gen["sidebar_toggle"].click(
         _toggle_sidebar,
@@ -3504,17 +3568,11 @@ def _wire_create_events(status_box) -> None:
         run_btns = _action_btn_updates(lyrics, song_name, running=True)
 
         # Thumbnails "Emergency Stop" reuses this handler when pipeline is live
-        if _pipeline_is_running():
-            msg = inference.emergency_stop()
-            configure.APP_STATE["session_status"] = "idle"
-            configure.APP_STATE["generating"] = False
-            configure.APP_STATE["image_gen_t0"] = None
-            _begin_ui_job("stop")
-            inference.clear_cancel_state()
-            idle_btns = _action_btn_updates(lyrics, song_name, running=False)
-            yield (
-                msg, *idle_btns, active_session_id or "",
-            ) + _gallery_sessions_tab(active_session_id or "")
+        if _should_stop_only():
+            yield from _stop_from_thumb(
+                lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale,
+                ref_image, hair_style, outfit_worn, negative_prompt, active_session_id,
+            )
             return
 
         if not _can_create(lyrics, song_name):
@@ -3998,17 +4056,11 @@ def _wire_create_events(status_box) -> None:
         idle_btns = _action_btn_updates(lyrics, song_name, running=False)
         run_btns = _action_btn_updates(lyrics, song_name, running=True)
 
-        if _pipeline_is_running():
-            msg = inference.emergency_stop()
-            configure.APP_STATE["session_status"] = "idle"
-            configure.APP_STATE["generating"] = False
-            configure.APP_STATE["image_gen_t0"] = None
-            _begin_ui_job("stop")
-            inference.clear_cancel_state()
-            idle_btns = _action_btn_updates(lyrics, song_name, running=False)
-            yield (
-                msg, *idle_btns, active_session_id or "",
-            ) + _gallery_sessions_tab(active_session_id or "")
+        if _should_stop_only():
+            yield from _stop_from_thumb(
+                lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale,
+                ref_image, hair_style, outfit_worn, negative_prompt, active_session_id,
+            )
             return
 
         if not (lyrics or "").strip() or not (song_name or "").strip():
@@ -4136,17 +4188,11 @@ def _wire_create_events(status_box) -> None:
     ):
         idle_btns = _action_btn_updates(lyrics, song_name, running=False)
         run_btns = _action_btn_updates(lyrics, song_name, running=True)
-        if _pipeline_is_running():
-            msg = inference.emergency_stop()
-            configure.APP_STATE["session_status"] = "idle"
-            configure.APP_STATE["generating"] = False
-            configure.APP_STATE["image_gen_t0"] = None
-            _begin_ui_job("stop")
-            inference.clear_cancel_state()
-            idle_btns = _action_btn_updates(lyrics, song_name, running=False)
-            yield (
-                msg, *idle_btns, active_session_id or "",
-            ) + _gallery_sessions_tab(active_session_id or "")
+        if _should_stop_only():
+            yield from _stop_from_thumb(
+                lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale,
+                ref_image, hair_style, outfit_worn, negative_prompt, active_session_id,
+            )
             return
         if not _can_cover(song_name):
             yield (
@@ -4268,17 +4314,11 @@ def _wire_create_events(status_box) -> None:
     ):
         idle_btns = _action_btn_updates(lyrics, song_name, running=False)
         run_btns = _action_btn_updates(lyrics, song_name, running=True)
-        if _pipeline_is_running():
-            msg = inference.emergency_stop()
-            configure.APP_STATE["session_status"] = "idle"
-            configure.APP_STATE["generating"] = False
-            configure.APP_STATE["image_gen_t0"] = None
-            _begin_ui_job("stop")
-            inference.clear_cancel_state()
-            idle_btns = _action_btn_updates(lyrics, song_name, running=False)
-            yield (
-                msg, *idle_btns, active_session_id or "",
-            ) + _gallery_sessions_tab(active_session_id or "")
+        if _should_stop_only():
+            yield from _stop_from_thumb(
+                lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale,
+                ref_image, hair_style, outfit_worn, negative_prompt, active_session_id,
+            )
             return
         if not _can_theme(lyrics, song_name):
             yield (
@@ -4552,12 +4592,16 @@ def _wire_create_events(status_box) -> None:
         _gen["assessment_view"],
     ]
 
-    # Instant, queue-free listener: the status bar prints the start line on the
-    # click itself, even before the (queued) assessment handler is scheduled.
+    # Instant, queue-free: status line + collapse Session slots before the job queues.
     _gen["assess_btn"].click(
-        lambda: _status_plain(_ASSESS_START_MSG),
-        inputs=None,
-        outputs=[status_box],
+        _on_assess_click_ui,
+        inputs=[_gen["active_session_id"]],
+        outputs=[
+            status_box,
+            _gen["sidebar_expanded"],
+            _gen["sidebar_toggle"],
+            _gen["sidebar_col"],
+        ] + _session_refresh_outputs,
         queue=False,
         show_progress="hidden",
     )
@@ -4767,22 +4811,41 @@ def _wire_create_events(status_box) -> None:
         inputs=_shared_gen_inputs(),
         outputs=_run_outputs,
     )
+    def _guard_job(gen_fn):
+        """Wrap a job generator so Gradio cancel (re-click) kills backend workers.
+
+        When the user re-clicks a dual-purpose Emergency Stop button, Gradio
+        raises GeneratorExit on the running job *before* the new click runs.
+        Without this, Theme/Lyrics/Cover stop labels do nothing to sd-cli.
+        """
+        def _wrapped(*args, **kwargs):
+            try:
+                yield from gen_fn(*args, **kwargs)
+            except GeneratorExit:
+                _mark_generator_cancelled()
+                raise
+        return _wrapped
+
     # Thumbnails-tab per-section buttons (Cover / Theme / Lyrics only live here)
+    # Dual-purpose: Generate while idle, Emergency Stop while running.
+    _cover_ev = None
+    _theme_ev = None
+    _lyrics_ev = None
     if _gen.get("thumb_cover_btn") is not None:
-        _gen["thumb_cover_btn"].click(
-            _run_cover,
+        _cover_ev = _gen["thumb_cover_btn"].click(
+            _guard_job(_run_cover),
             inputs=_shared_gen_inputs(),
             outputs=_run_outputs,
         )
     if _gen.get("thumb_theme_btn") is not None:
-        _gen["thumb_theme_btn"].click(
-            _run_theme,
+        _theme_ev = _gen["thumb_theme_btn"].click(
+            _guard_job(_run_theme),
             inputs=_shared_gen_inputs(),
             outputs=_run_outputs,
         )
     if _gen.get("thumb_run_btn") is not None:
-        _gen["thumb_run_btn"].click(
-            _run,
+        _lyrics_ev = _gen["thumb_run_btn"].click(
+            _guard_job(_run),
             inputs=_shared_gen_inputs(),
             outputs=_run_outputs,
         )
