@@ -1161,15 +1161,16 @@ def character_identity_clause(
     """
     Natural-language character lock for Flux --llm (no instructional CHARACTER: prefix).
 
-    presence = none | silhouette | partial | full (default full)
+    presence = none | distant | partial | full (default full)
 
     Footwear is only included for *full* main-character stills. Partial and
-    silhouette omit footwear so Flux does not force a complete standing body
-    (partial) or a second grounded figure (silhouette doubles).
+    distant/partial omit footwear so Flux does not force a complete close-up body.
     presence=none returns empty — no identity text, no wardrobe.
     """
     pres = (presence or "full").strip().lower()
-    if pres not in ("none", "silhouette", "partial", "full"):
+    if pres in ("silhouette", "outline", "shadow"):
+        pres = "distant"
+    if pres not in ("none", "distant", "partial", "full"):
         pres = "full"
     if pres == "none":
         return ""
@@ -1177,7 +1178,7 @@ def character_identity_clause(
     gp = gender_phrase(gender) if gender else ""
     bp = bodyshape_phrase(bodyshape)
     hp = hair_style_phrase(hair)
-    # Clothing only for silhouette/partial; clothing + footwear for full.
+    # Clothing only for distant/partial; clothing + footwear for full.
     if pres == "full":
         wear = clothing_and_footwear_phrase(outfit, footwear)
     else:
@@ -1185,9 +1186,12 @@ def character_identity_clause(
 
     subject = f"a {gp}" if gp else "the subject"
 
-    if pres == "silhouette":
+    if pres == "distant":
+        # No "silhouette" word — Flux treats that as a separate dark cutout.
+        # "A distant male matching the reference image" keeps one character, far away.
+        who = gp if gp else "figure"
         bits: List[str] = [
-            f"silhouette or shadow outline of {subject} matching the reference image"
+            f"A distant {who} matching the reference image"
         ]
         if hp:
             bits.append(f"hair {hp}")

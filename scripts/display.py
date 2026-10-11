@@ -3155,7 +3155,9 @@ def _wire_create_events(status_box) -> None:
         configure.APP_STATE["thumb_generating_line"] = None
         configure.APP_STATE["prefer_stop"] = False
         _begin_ui_job("stop")  # invalidate any residual UI timer loops
-        inference.clear_cancel_state()
+        # Do NOT clear_cancel_state() here — the lyrics/theme/cover worker loops
+        # still need is_cancel_requested() True so they exit. Cancel is cleared
+        # when the next job starts (clear_cancel_state at pipeline entry).
         idle = _action_btn_updates(lyrics or "", song_name or "", running=False)
         return (msg, *idle)
 
@@ -3201,10 +3203,12 @@ def _wire_create_events(status_box) -> None:
         configure.APP_STATE["thumb_generating_line"] = None
 
     # Management Emergency Stop (+ restores button labels)
+    # queue=False so stop runs immediately while a long lyrics generator is queued
     _gen["stop_btn"].click(
         _stop,
         inputs=[_gen["lyrics"], _gen["song_name"]],
         outputs=[status_box, *_action_btn_components()],
+        queue=False,
     )
 
     # Header click → current project folder, or output/ root if none
@@ -5000,6 +5004,7 @@ def _wire_create_events(status_box) -> None:
             _stop_for_run_outputs,
             inputs=[_gen["lyrics"], _gen["song_name"], _gen["active_session_id"]],
             outputs=_run_outputs,
+            queue=False,
         )
 
     if _gen.get("thumb_theme_btn") is not None:
@@ -5019,6 +5024,7 @@ def _wire_create_events(status_box) -> None:
             _stop_for_run_outputs,
             inputs=[_gen["lyrics"], _gen["song_name"], _gen["active_session_id"]],
             outputs=_run_outputs,
+            queue=False,
         )
 
     if _gen.get("thumb_run_btn") is not None:
@@ -5038,6 +5044,7 @@ def _wire_create_events(status_box) -> None:
             _stop_for_run_outputs,
             inputs=[_gen["lyrics"], _gen["song_name"], _gen["active_session_id"]],
             outputs=_run_outputs,
+            queue=False,
         )
 
 

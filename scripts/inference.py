@@ -1405,7 +1405,9 @@ def _load_analysis_from_disk(project_dir: Path) -> Optional[Dict[str, Any]]:
                 if ":" in raw and not raw.strip().lower().startswith("section"):
                     k, v = raw.split(":", 1)
                     k, v = k.strip(), v.strip().lower()
-                    if k and v in ("none", "silhouette", "partial", "full"):
+                    if k and v in ("none", "silhouette", "distant", "partial", "full"):
+                        if v == "silhouette":
+                            v = "distant"
                         character_presence[k] = v
         except OSError:
             pass
@@ -1422,11 +1424,17 @@ def _load_analysis_from_disk(project_dir: Path) -> Optional[Dict[str, Any]]:
 
 
 def _normalize_presence_token(raw: str) -> str:
-    """Map a presence label to none|silhouette|partial|full only."""
+    """Map a presence label to none|distant|partial|full.
+
+    'silhouette' is accepted as a legacy alias for 'distant'.
+    Identity wording uses "A distant {gender} matching the reference image…".
+    """
     t = (raw or "").strip().lower()
     # Take first token only (guards against leaked instruction text)
     token = re.split(r"[\s,;:]+", t, maxsplit=1)[0] if t else "none"
-    if token in ("none", "silhouette", "partial", "full"):
+    if token in ("silhouette", "outline", "shadow"):
+        return "distant"
+    if token in ("none", "distant", "partial", "full"):
         return token
     # Heuristic: long instruction residue → none (do not attach ref)
     if len(t) > 24 or "absent" in t or "without the reference" in t:
@@ -1658,7 +1666,7 @@ def analyze_song_and_sections(
       sections: {label: notes}
       character_guidance: str
       other_figures: str
-      character_presence: {section_label: "none"|"silhouette"|"partial"|"full"}
+      character_presence: {section_label: "none"|"distant"|"partial"|"full"}
         — used programmatically to include/exclude the reference image per line
     """
     if progress_callback:
@@ -1699,8 +1707,8 @@ def analyze_song_and_sections(
             "what they should wear if clothing is relevant to the lyric or scene. "
             "Secondary people are NOT the reference character and must never share that face.\n"
             "If the lyrics never imply other people, write OTHER_FIGURES: none.\n"
-            "CHARACTER_MAP: one line per section as  SectionName: none|silhouette|partial|full\n"
-            "  none=no main character, silhouette=outline only, partial=partly visible, full=clearly present.\n"
+            "CHARACTER_MAP: one line per section as  SectionName: none|distant|partial|full\n"
+            "  none=no main character, distant=character far away only, partial=partly visible, full=clearly present.\n"
             "  Vary main-character presence across the song when the lyrics support it.\n"
         )
     else:
@@ -1710,7 +1718,7 @@ def analyze_song_and_sections(
             "Do NOT mention clothing, outfit, wardrobe, gear, or hair style for the central figure.\n"
             "OTHER_FIGURES: 1-3 sentences on any secondary people the lyrics imply, including "
             "appropriate distinct outfits when clothing matters; or 'none'.\n"
-            "CHARACTER_MAP: one line per section as  SectionName: none|silhouette|partial|full\n"
+            "CHARACTER_MAP: one line per section as  SectionName: none|distant|partial|full\n"
         )
 
     # Rigid, example-led prompt — no trailing "Notes:" (models often free-associate after it)
@@ -1740,7 +1748,7 @@ def analyze_song_and_sections(
         "OTHER_FIGURES:\n"
         "Occasional anonymous street crowd in ordinary coats; no named secondary lead.\n\n"
         "CHARACTER_MAP:\n"
-        f"{ex0}: silhouette\n"
+        f"{ex0}: distant\n"
         f"{ex1}: full\n\n"
         "SECTIONS:\n"
         f"{ex0}: Wide establishing shots of an anonymous crowd. The camera glides; the figure is barely present.\n"
@@ -1869,7 +1877,7 @@ def analyze_song_and_sections(
                     line.strip(),
                     re.I,
                 ):
-                    for kw in ("none", "silhouette", "partial", "full"):
+                    for kw in ("none", "distant", "silhouette", "partial", "full"):
                         if re.search(rf"\b{kw}\b", line, re.I):
                             found = kw
                             break
@@ -1888,9 +1896,13 @@ def analyze_song_and_sections(
         if lab not in presence:
             low = lab.lower()
             if any(k in low for k in ("intro", "outro", "fade")):
-                presence[lab] = "silhouette" if has_character_ref else "none"
+                presence[lab] = "distant" if has_character_ref else "none"
             else:
                 presence[lab] = "full" if has_character_ref else "partial"
+
+    # Canonicalise legacy silhouette → distant
+    for lab in list(presence.keys()):
+        presence[lab] = _normalize_presence_token(presence.get(lab) or "none")
 
     print("[analysis] character presence map:", flush=True)
     for lab, val in presence.items():
@@ -1922,7 +1934,7 @@ def generate_visual_prompts(
     """
     One visual-description prompt per lyric line.
     Returns (prompts, presence_per_line) where presence_per_line[i] is
-    none|silhouette|partial|full for programmatic ref-image include/exclude.
+    none|distant|partial|full for programmatic ref-image include/exclude.
     """
     model_path, role = _resolve_prompt_model(cfg)
     if not model_path:
@@ -1956,7 +1968,7 @@ def generate_visual_prompts(
         line_no = i + 1
         sec = line_section.get(i, "Body")
         pres = (presence_map.get(sec) or ("full" if has_character_ref else "none")).lower()
-        if pres not in ("none", "silhouette", "partial", "full"):
+        if pres not in ("none", "distant", "silhouette", "partial", "full"):
             pres = "full" if has_character_ref else "none"
         presence_per_line.append(pres)
 
@@ -1975,11 +1987,6 @@ def generate_visual_prompts(
         style_part = template.replace("{line}", line) if "{line}" in template else f"{template}\n{line}"
 
         if has_character_ref and pres != "none":
-            how = {
-                "silhouette": "show the main character only as a silhouette or shadow outline",
-                "partial": "show the main character partially (cropped, turned, or distant)",
-                "full": "show the main character clearly",
-            }.get(pres, "show the main character")
             # Secondary people: only when assessment named them — positive scene detail
             if other_figures:
                 sec_people = (
@@ -1988,16 +1995,35 @@ def generate_visual_prompts(
                 )
             else:
                 sec_people = (
-                    "Focus on the main character and the scene implied by this lyric; "
+                    "Focus on the scene implied by this lyric; "
                     "add other people only if the lyric itself clearly requires them, "
                     "each with their own distinct outfit. "
                 )
-            char_clause = (
-                f"Show the main figure {how}. "
-                "Pose and action only — no face or clothing detail. "
-                f"{(char_guide or '')[:120]} "
-                f"{sec_people}"
-            )
+            if pres in ("silhouette", "distant"):
+                # Do NOT say "show the main figure as a silhouette" — models echo that
+                # into the scene and Flux then paints two people (scene figure + identity).
+                char_clause = (
+                    "Describe environment, light, and atmosphere only. "
+                    "At most one tiny distant dark outline against the light — "
+                    "never a close figure, never face or clothing detail, never a second person. "
+                    f"{(char_guide or '')[:80]} "
+                    f"{sec_people}"
+                )
+            elif pres == "partial":
+                char_clause = (
+                    "Describe the scene with the main figure only partially visible "
+                    "(cropped, turned, or mid-distance). Pose and action only — "
+                    "no face or clothing detail. "
+                    f"{(char_guide or '')[:120]} "
+                    f"{sec_people}"
+                )
+            else:
+                char_clause = (
+                    "Describe the scene with the main figure clearly present. "
+                    "Pose and action only — no face or clothing detail. "
+                    f"{(char_guide or '')[:120]} "
+                    f"{sec_people}"
+                )
         elif has_character_ref and pres == "none":
             if other_figures:
                 sec_people = (
@@ -2027,16 +2053,24 @@ def generate_visual_prompts(
 
         # Style header is applied later by compose_lyric_still_prompt — keep the
         # model instruction free of template/style text so it cannot echo into scene.
-        # Keep presence guidance outside the model text to reduce echo.
+        # Never put copy-able "The main figure appears as…" lines in the instruction;
+        # models echo those and Flux then draws a second character beside the identity lock.
         presence_hint = ""
-        if has_character_ref and pres == "silhouette":
-            presence_hint = "The main figure appears only as a silhouette or shadow.\n"
+        if has_character_ref and pres in ("silhouette", "distant"):
+            presence_hint = (
+                "Constraint (do not copy this sentence into the output): "
+                "any person is only a tiny distant dark outline.\n"
+            )
         elif has_character_ref and pres == "partial":
-            presence_hint = "The main figure is partial (cropped, turned, or distant).\n"
-        elif has_character_ref and pres == "full":
-            presence_hint = "The main figure is present in frame.\n"
+            presence_hint = (
+                "Constraint (do not copy this sentence into the output): "
+                "figure is only partially visible.\n"
+            )
         elif has_character_ref and pres == "none":
-            presence_hint = "The main figure is absent from this still.\n"
+            presence_hint = (
+                "Constraint (do not copy this sentence into the output): "
+                "main character is absent.\n"
+            )
         instruction = (
             f"Lyric: {line}\n"
             f"Context: {overall[:200]}\n"
@@ -2044,7 +2078,7 @@ def generate_visual_prompts(
             f"{presence_hint}"
             f"{char_clause}\n"
             "Describe the setting, action, and lighting in one short paragraph "
-            "(40–90 words). Output the scene only."
+            "(40–90 words). Output the scene only — no constraints or instructions."
         )
         try:
             text = _run_llama_completion(
@@ -2585,6 +2619,61 @@ def _strip_prompt_chatml(text: str) -> str:
     return p
 
 
+def _scrub_presence_echoes(scene: str, presence: str = "full") -> str:
+    """
+    Remove instruction / identity echoes from a scene paragraph.
+
+    For silhouette (and partial), leaked lines like "The main figure appears only
+    as a silhouette…" plus the identity lock make Flux draw two people.
+    """
+    p = (scene or "").strip()
+    if not p:
+        return ""
+    pres = (presence or "full").strip().lower()
+    # Patterns must not cross sentence boundaries. Em-dash fragments are matched
+    # only up to the next .?! so later scene sentences stay intact.
+    patterns = [
+        r"(?is)\bthe main figure appears\b[^.?!]{0,140}[.?!]",
+        r"(?is)\bonly as a silhouette or shadow\b[^.?!]{0,40}[.?!]?",
+        r"(?is)\bsilhouette or shadow outline of\b[^.?!]{0,200}[.?!]",
+        r"(?is)\ba distant silhouette of\b[^.?!]{0,200}[.?!]",
+        r"(?is)\bnot in the center of attention\b",
+        r"(?is)\bmatching the reference image\b[^.?!]{0,80}[.?!]?",
+        r"(?is)\bconstraint\s*\(do not copy[^)]{0,80}\)[:\s]*[^.?!]*[.?!]?",
+        r"(?is)\bshow the main (?:figure|character)\b[^.?!]{0,140}[.?!]",
+        r"(?is)\bpose and action only\b[^.?!]{0,60}[.?!]?",
+        r"(?is)\bno face or clothing detail\b[^.?!]{0,30}[.?!]?",
+        r"(?is)\bat most one tiny distant dark outline\b[^.?!]{0,100}[.?!]?",
+        r"(?is)\bnever a close (?:full-body )?figure\b[^.?!]{0,60}[.?!]?",
+        r"(?is)\bnever a second person\b[^.?!]{0,30}[.?!]?",
+        r"(?is)\bdo not copy this sentence\b[^.?!]{0,60}[.?!]?",
+        # "A lone figure appears — …" as a whole clause ending at .?!
+        r"(?is)\ba lone figure appears\s*[—–\-]+[^.?!]{0,100}[.?!]",
+        r"(?is)\ba lone figure appears\b[^.?!]{0,80}[.?!]",
+        r"(?is)\bthe (?:main )?figure (?:stands|walks|appears|is seen)\b[^.?!]{0,100}[.?!]",
+        # Orphan "appears —" with nothing after
+        r"(?is)\ba lone figure appears\s*[—–\-]+\s*",
+        r"(?is)\bthe main figure appears\s*[—–\-]+\s*",
+    ]
+    for pat in patterns:
+        p = re.sub(pat, " ", p)
+    p = re.sub(r"\s{2,}", " ", p).strip(" ,;:-")
+    parts = re.split(r"(?<=[.!?])\s+", p)
+    kept = []
+    for s in parts:
+        s = s.strip()
+        if not s:
+            continue
+        sl = s.lower()
+        if any(mk in sl for mk in _PROMPT_LEAK_MARKERS):
+            continue
+        if sl.startswith(("main figure", "the main figure", "constraint", "a lone figure appears")):
+            continue
+        kept.append(s)
+    return " ".join(kept).strip()
+
+
+
 def _lyric_scene_fallback(lyric: str) -> str:
     """Minimal visual scene when Phase-1 sanitize emptied the model output."""
     line = (lyric or "").strip().rstrip(" .,;:!?…")
@@ -2636,6 +2725,24 @@ def _sanitize_visual_prompt(prompt: str, lyric: str, style_hint: str = "") -> st
         " ",
         p,
     )
+    # Presence / identity instruction echoes (cause double-figure silhouettes)
+    for _pat in (
+        r"(?is)\bthe main figure appears\b[^.?!]{0,140}[.?!]?",
+        r"(?is)\bonly as a silhouette or shadow\b[^.?!]{0,60}[.?!]?",
+        r"(?is)\bsilhouette or shadow outline of\b[^.?!]{0,220}[.?!]?",
+        r"(?is)\ba distant silhouette of\b[^.?!]{0,220}[.?!]?",
+        r"(?is)\bnot in the center of attention\b[^.?!]{0,40}[.?!]?",
+        r"(?is)\bmatching the reference image\b[^.?!]{0,100}[.?!]?",
+        r"(?is)\bconstraint\s*\(do not copy[^)]{0,80}\)[:\s]*[^.?!]*[.?!]?",
+        r"(?is)\bpose and action only\b[^.?!]{0,80}[.?!]?",
+        r"(?is)\bno face or clothing detail\b[^.?!]{0,40}[.?!]?",
+        r"(?is)\bat most one tiny distant dark outline\b[^.?!]{0,120}[.?!]?",
+        r"(?is)\bnever a close figure\b[^.?!]{0,80}[.?!]?",
+        r"(?is)\bnever a second person\b[^.?!]{0,40}[.?!]?",
+        r"(?is)\ba lone figure appears\b[^.?!]{0,120}[.?!]?",
+        r"(?is)\ba lone figure appears\s*[—–\-]+\s*",
+    ):
+        p = re.sub(_pat, " ", p)
     p = re.sub(r"\s{2,}", " ", p).strip()
     low = p.lower()
     lyric_low = (lyric or "").strip().lower()
@@ -2731,7 +2838,7 @@ def _appearance_bit(cfg: Dict[str, Any], presence: str = "full") -> str:
 
     presence drives wording:
       none       → empty (caller must not attach the character reference either)
-      silhouette → outline + optional clothing, no footwear
+      distant / silhouette → far-away character + optional clothing, no footwear
       partial    → face-match + optional clothing, no footwear
       full       → face-match + clothing + footwear
     """
@@ -3002,6 +3109,9 @@ def generate_images_from_prompts(
             ref_override = ""
             attach_ref = False
             scene = (clean_prompt or "").strip()
+            # Strip residual presence/identity echoes that double the figure on silhouettes
+            if pres in ("silhouette", "distant", "partial"):
+                scene = _scrub_presence_echoes(scene, pres)
             identity = ""
             if progressive:
                 # Prior still as visual continuity only — NOT the character reference photo
@@ -3368,6 +3478,8 @@ def regenerate_single_still(
     if not scene:
         scene = _lyric_scene_fallback(line_text)
         print(f"[regen] empty scene after sanitize — using lyric fallback", flush=True)
+    if pres in ("silhouette", "distant", "partial"):
+        scene = _scrub_presence_echoes(scene, pres)
     identity = _appearance_bit(cfg, presence=pres) if use_ref else ""
     final_prompt = configure.compose_lyric_still_prompt(
         image_style=str(cfg.get("image_style") or ""),
@@ -4837,7 +4949,7 @@ def run_prompts_pipeline(
                         f"--- prompt ---\n{pr}\n\n"
                     )
             with open(project_dir / "character_map.txt", "w", encoding="utf-8") as f:
-                f.write("section → presence (none|silhouette|partial|full)\n")
+                f.write("section → presence (none|distant|partial|full)\n")
                 for lab, val in ((analysis or {}).get("character_presence") or {}).items():
                     f.write(f"{lab}: {val}\n")
                 f.write("\nper-line:\n")
@@ -5090,7 +5202,7 @@ def run_materials_pipeline(
                             f"--- prompt ---\n{pr}\n\n"
                         )
                 with open(project_dir / "character_map.txt", "w", encoding="utf-8") as f:
-                    f.write("section → presence (none|silhouette|partial|full)\n")
+                    f.write("section → presence (none|distant|partial|full)\n")
                     for lab, val in (analysis.get("character_presence") or {}).items():
                         f.write(f"{lab}: {val}\n")
                     f.write("\nper-line:\n")
