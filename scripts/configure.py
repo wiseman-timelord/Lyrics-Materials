@@ -1161,16 +1161,27 @@ def character_identity_clause(
     """
     Natural-language character lock for Flux --llm (no instructional CHARACTER: prefix).
 
-    presence = silhouette | partial | full (default full)
-    Footwear is appended after clothing when both are set.
+    presence = none | silhouette | partial | full (default full)
+
+    Footwear is only included for *full* main-character stills. Partial and
+    silhouette omit footwear so Flux does not force a complete standing body
+    (partial) or a second grounded figure (silhouette doubles).
+    presence=none returns empty — no identity text, no wardrobe.
     """
-    gp = gender_phrase(gender) if gender else ""
-    bp = bodyshape_phrase(bodyshape)
-    hp = hair_style_phrase(hair)
-    wear = clothing_and_footwear_phrase(outfit, footwear)
     pres = (presence or "full").strip().lower()
     if pres not in ("none", "silhouette", "partial", "full"):
         pres = "full"
+    if pres == "none":
+        return ""
+
+    gp = gender_phrase(gender) if gender else ""
+    bp = bodyshape_phrase(bodyshape)
+    hp = hair_style_phrase(hair)
+    # Clothing only for silhouette/partial; clothing + footwear for full.
+    if pres == "full":
+        wear = clothing_and_footwear_phrase(outfit, footwear)
+    else:
+        wear = outfit_phrase(outfit)
 
     subject = f"a {gp}" if gp else "the subject"
 

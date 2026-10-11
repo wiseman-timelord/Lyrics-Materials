@@ -407,21 +407,77 @@ def _prompts_btn_label(lyrics: str = "") -> str:
 
 
 def _thumb_cover_btn_label() -> str:
-    """Thumbnails-tab Cover section: Generate vs Re-Generate from existing stills."""
+    """Primary Cover action: Generate (empty) or ReGenerate (any existing)."""
     have, _ = _cover_counts()
-    return "Re-Generate" if have > 0 else "Generate"
+    return "ReGenerate" if have > 0 else "Generate"
 
 
 def _thumb_theme_btn_label() -> str:
-    """Thumbnails-tab Theme section: Generate vs Re-Generate from existing stills."""
+    """Primary Theme action: Generate (empty) or ReGenerate (any existing)."""
     have, _ = _theme_counts()
-    return "Re-Generate" if have > 0 else "Generate"
+    return "ReGenerate" if have > 0 else "Generate"
 
 
 def _thumb_lyrics_btn_label(lyrics: str = "") -> str:
-    """Thumbnails-tab Lyrics section: Generate vs Re-Generate from existing stills."""
+    """Primary Lyrics action: Generate (empty) or ReGenerate (any existing)."""
     have, _ = _lyrics_counts(lyrics)
-    return "Re-Generate" if have > 0 else "Generate"
+    return "ReGenerate" if have > 0 else "Generate"
+
+
+def _section_needs_complete(kind: str, lyrics: str = "") -> bool:
+    """True when some but not all expected stills exist (show Complete Gen)."""
+    if kind == "cover":
+        have, expected = _cover_counts()
+    elif kind == "theme":
+        have, expected = _theme_counts()
+    else:
+        have, expected = _lyrics_counts(lyrics)
+    return expected > 0 and 0 < have < expected
+
+
+def _section_btn_triple(kind: str, lyrics: str = "", *, running: bool = False, can_run: bool = True):
+    """
+    Updates for (gen_btn, complete_btn, stop_btn) for one Thumbnails section.
+
+    idle empty  → Generate only
+    idle partial → ReGenerate + Complete Gen
+    idle full   → ReGenerate only
+    running     → Emergency Stop only (all three sections)
+    """
+    if running:
+        hide = gr.update(visible=False)
+        stop = gr.update(
+            value="Emergency Stop",
+            visible=True,
+            interactive=True,
+            variant="stop",
+        )
+        return hide, hide, stop
+
+    if kind == "cover":
+        label = _thumb_cover_btn_label()
+        show_complete = _section_needs_complete("cover")
+    elif kind == "theme":
+        label = _thumb_theme_btn_label()
+        show_complete = _section_needs_complete("theme")
+    else:
+        label = _thumb_lyrics_btn_label(lyrics)
+        show_complete = _section_needs_complete("lyrics", lyrics)
+
+    gen = gr.update(
+        value=label,
+        visible=True,
+        interactive=bool(can_run),
+        variant="primary" if can_run else "secondary",
+    )
+    complete = gr.update(
+        value="Complete Gen",
+        visible=bool(show_complete),
+        interactive=bool(can_run and show_complete),
+        variant="secondary",
+    )
+    stop = gr.update(visible=False)
+    return gen, complete, stop
 
 
 def _project_has_any_images(project_dir: str = "") -> bool:
@@ -460,38 +516,54 @@ def _ui_job_is_current(job_id: int) -> bool:
 def _action_btn_updates(lyrics: str = "", song_name: str = "", *, running: bool = False):
     """
     Management: Assessment · All Assets · Lyrics Prompts · Emergency Stop
-    Thumbnails: Cover · Theme · Lyrics (section Generate / Re-Generate)
+    Thumbnails (per section): gen · Complete Gen · Emergency Stop
 
-    When running: hide management generate buttons, show Emergency Stop on
-    Management and on all 3 Thumbnails section buttons.
+    idle empty   → Generate only
+    idle partial → ReGenerate + Complete Gen
+    idle full    → ReGenerate only
+    running      → Emergency Stop only on each section (+ management stop)
 
-    Returns 7 updates:
-      (assess_u, all_assets_u, prompts_u, stop_u,
-       thumb_cover_u, thumb_theme_u, thumb_lyrics_u)
+    Returns 13 updates:
+      assess, all_assets, prompts, mgmt_stop,
+      cover_gen, cover_complete, cover_stop,
+      theme_gen, theme_complete, theme_stop,
+      lyrics_gen, lyrics_complete, lyrics_stop
     """
     hide = gr.update(visible=False)
     if running:
-        # Separate update objects per button (some Gradio builds coalesce identical refs)
+        mgmt_stop = gr.update(
+            value="Emergency Stop", visible=True, interactive=True, variant="stop",
+        )
+        c_g, c_c, c_s = _section_btn_triple("cover", lyrics, running=True)
+        t_g, t_c, t_s = _section_btn_triple("theme", lyrics, running=True)
+        l_g, l_c, l_s = _section_btn_triple("lyrics", lyrics, running=True)
         return (
-            hide, hide, hide,
-            gr.update(value="Emergency Stop", visible=True, interactive=True, variant="stop"),
-            gr.update(value="Emergency Stop", visible=True, interactive=True, variant="stop"),
-            gr.update(value="Emergency Stop", visible=True, interactive=True, variant="stop"),
-            gr.update(value="Emergency Stop", visible=True, interactive=True, variant="stop"),
+            hide, hide, hide, mgmt_stop,
+            c_g, c_c, c_s,
+            t_g, t_c, t_s,
+            l_g, l_c, l_s,
         )
 
     models_ok = _models_configured()
     if not models_ok:
+        disabled = gr.update(
+            value="Configure the Pages First",
+            interactive=False,
+            variant="secondary",
+            visible=True,
+        )
+        c_g, c_c, c_s = _section_btn_triple("cover", lyrics, running=False, can_run=False)
+        t_g, t_c, t_s = _section_btn_triple("theme", lyrics, running=False, can_run=False)
+        l_g, l_c, l_s = _section_btn_triple("lyrics", lyrics, running=False, can_run=False)
+        # Override gen labels when models missing
+        c_g = gr.update(value="Configure First", interactive=False, variant="secondary", visible=True)
+        t_g = gr.update(value="Configure First", interactive=False, variant="secondary", visible=True)
+        l_g = gr.update(value="Configure First", interactive=False, variant="secondary", visible=True)
         return (
-            gr.update(
-                value="Configure the Pages First",
-                interactive=False,
-                variant="secondary",
-                visible=True,
-            ),
-            hide, hide,
-            gr.update(visible=False),
-            hide, hide, hide,
+            disabled, hide, hide, hide,
+            c_g, c_c, c_s,
+            t_g, t_c, t_s,
+            l_g, l_c, l_s,
         )
 
     has_assess = _assessment_exists()
@@ -504,11 +576,14 @@ def _action_btn_updates(lyrics: str = "", song_name: str = "", *, running: bool 
     )
 
     if not has_assess:
+        c_g, c_c, c_s = _section_btn_triple("cover", lyrics, running=False, can_run=False)
+        t_g, t_c, t_s = _section_btn_triple("theme", lyrics, running=False, can_run=False)
+        l_g, l_c, l_s = _section_btn_triple("lyrics", lyrics, running=False, can_run=False)
         return (
-            assess_u,
-            hide, hide,
-            gr.update(visible=False),
-            hide, hide, hide,
+            assess_u, hide, hide, hide,
+            c_g, c_c, c_s,
+            t_g, t_c, t_s,
+            l_g, l_c, l_s,
         )
 
     cover_ok = _can_cover(song_name)
@@ -529,54 +604,41 @@ def _action_btn_updates(lyrics: str = "", song_name: str = "", *, running: bool 
         variant="primary" if prompts_ok else "secondary",
         visible=True,
     )
-    thumb_cover_u = gr.update(
-        value=_thumb_cover_btn_label(),
-        interactive=cover_ok,
-        variant="primary" if cover_ok else "secondary",
-        visible=True,
-    )
-    thumb_theme_u = gr.update(
-        value=_thumb_theme_btn_label(),
-        interactive=theme_ok,
-        variant="primary" if theme_ok else "secondary",
-        visible=True,
-    )
-    thumb_lyrics_u = gr.update(
-        value=_thumb_lyrics_btn_label(lyrics),
-        interactive=lyrics_ok,
-        variant="primary" if lyrics_ok else "secondary",
-        visible=True,
-    )
+    c_g, c_c, c_s = _section_btn_triple("cover", lyrics, running=False, can_run=cover_ok)
+    t_g, t_c, t_s = _section_btn_triple("theme", lyrics, running=False, can_run=theme_ok)
+    l_g, l_c, l_s = _section_btn_triple("lyrics", lyrics, running=False, can_run=lyrics_ok)
     return (
-        assess_u, all_assets_u, prompts_u, gr.update(visible=False),
-        thumb_cover_u, thumb_theme_u, thumb_lyrics_u,
+        assess_u, all_assets_u, prompts_u, hide,
+        c_g, c_c, c_s,
+        t_g, t_c, t_s,
+        l_g, l_c, l_s,
     )
+
 
 
 def _run_btn_updates(lyrics: str = "", song_name: str = ""):
-    """Back-compat: return only the lyrics-slideshow (thumb) button update."""
+    """Back-compat: return only the lyrics primary (Generate/ReGenerate) button update."""
     vals = _action_btn_updates(lyrics, song_name, running=False)
-    # thumb_lyrics_u is last of the 7-tuple
-    return vals[-1]
+    # lyrics_gen is index 10 of the 13-tuple
+    return vals[10] if len(vals) > 10 else vals[-1]
 
 
 def _action_btn_components() -> List[Any]:
-    """Management action buttons + Thumbnails per-section buttons (7 total).
-
-    Prefer the live gallery action buttons (cover_action_btn / theme_action_btn)
-    so Emergency Stop updates always hit the controls the user can see.
-    """
-    cover_b = _gen.get("thumb_cover_btn") or _gen.get("cover_action_btn")
-    theme_b = _gen.get("thumb_theme_btn") or _gen.get("theme_action_btn")
-    lyrics_b = _gen.get("thumb_run_btn")
+    """Management action buttons + per-section gen/complete/stop (13 total)."""
     return [
         _gen["assess_btn"],
         _gen["all_assets_btn"],
         _gen["prompts_btn"],
         _gen["stop_btn"],
-        cover_b,
-        theme_b,
-        lyrics_b,
+        _gen.get("thumb_cover_btn") or _gen.get("cover_action_btn"),
+        _gen.get("cover_complete_btn"),
+        _gen.get("cover_stop_btn"),
+        _gen.get("thumb_theme_btn") or _gen.get("theme_action_btn"),
+        _gen.get("theme_complete_btn"),
+        _gen.get("theme_stop_btn"),
+        _gen.get("thumb_run_btn"),
+        _gen.get("lyrics_complete_btn"),
+        _gen.get("lyrics_stop_btn"),
     ]
 
 
@@ -2480,19 +2542,35 @@ def _build_thumbnails_tab() -> None:
                             regen_btns.append(btn)
                             remove_btns.append(rmv)
                 rows.append(trow)
-            # Section action button (duplicate of Management generate control)
-            # Initial label refined by _action_btn_updates (Generate / Re-Generate)
+            # Section actions: Generate/ReGenerate · Complete Gen · Emergency Stop
             _init_label = "Generate"
             if prefix == "cover":
                 _init_label = _thumb_cover_btn_label()
             elif prefix == "theme":
                 _init_label = _thumb_theme_btn_label()
-            action_btn = gr.Button(
-                _init_label,
-                variant="primary",
-                visible=True,
-                elem_id=f"{prefix}-thumb-action-btn",
-            )
+            _show_complete = _section_needs_complete(prefix)
+            with gr.Row(elem_id=f"{prefix}-thumb-action-row"):
+                action_btn = gr.Button(
+                    _init_label,
+                    variant="primary",
+                    visible=True,
+                    elem_id=f"{prefix}-thumb-action-btn",
+                    scale=2,
+                )
+                complete_btn = gr.Button(
+                    "Complete Gen",
+                    variant="secondary",
+                    visible=_show_complete,
+                    elem_id=f"{prefix}-thumb-complete-btn",
+                    scale=2,
+                )
+                stop_btn = gr.Button(
+                    "Emergency Stop",
+                    variant="stop",
+                    visible=False,
+                    elem_id=f"{prefix}-thumb-stop-btn",
+                    scale=2,
+                )
         _gen[f"{prefix}_panel"] = panel
         _gen[f"{prefix}_header"] = header
         _gen[f"{prefix}_cols"] = cols
@@ -2501,19 +2579,24 @@ def _build_thumbnails_tab() -> None:
         _gen[f"{prefix}_regen_btns"] = regen_btns
         _gen[f"{prefix}_remove_btns"] = remove_btns
         _gen[f"{prefix}_action_btn"] = action_btn
-        return action_btn
+        _gen[f"{prefix}_complete_btn"] = complete_btn
+        _gen[f"{prefix}_stop_btn"] = stop_btn
+        return action_btn, complete_btn, stop_btn
 
-    cover_action = _build_simple_gallery(
+    cover_action, cover_complete, cover_stop = _build_simple_gallery(
         "cover", COVER_SLOTS, "Cover Images", "cover-gallery", freq_cover,
     )
-    theme_action = _build_simple_gallery(
+    theme_action, theme_complete, theme_stop = _build_simple_gallery(
         "theme", THEME_SLOTS, "Theme Images", "theme-gallery", freq_theme,
     )
-    # Map convenience keys used by action updates (same objects as cover_action_btn)
     _gen["thumb_cover_btn"] = cover_action
     _gen["thumb_theme_btn"] = theme_action
     _gen["cover_action_btn"] = cover_action
     _gen["theme_action_btn"] = theme_action
+    _gen["cover_complete_btn"] = cover_complete
+    _gen["theme_complete_btn"] = theme_complete
+    _gen["cover_stop_btn"] = cover_stop
+    _gen["theme_stop_btn"] = theme_stop
 
     # Lyrics gallery — always visible; one No Image slot until lines are known
     with gr.Column(
@@ -2585,12 +2668,28 @@ def _build_thumbnails_tab() -> None:
                         _gen["thumb_btns"].append(btn)
                         _gen["thumb_remove_btns"].append(rmv)
             _gen["thumb_rows"].append(trow)
-        _gen["thumb_run_btn"] = gr.Button(
-            _thumb_lyrics_btn_label(),
-            variant="primary",
-            visible=True,
-            elem_id="lyrics-thumb-action-btn",
-        )
+        with gr.Row(elem_id="lyrics-thumb-action-row"):
+            _gen["thumb_run_btn"] = gr.Button(
+                _thumb_lyrics_btn_label(),
+                variant="primary",
+                visible=True,
+                elem_id="lyrics-thumb-action-btn",
+                scale=2,
+            )
+            _gen["lyrics_complete_btn"] = gr.Button(
+                "Complete Gen",
+                variant="secondary",
+                visible=_section_needs_complete("lyrics"),
+                elem_id="lyrics-thumb-complete-btn",
+                scale=2,
+            )
+            _gen["lyrics_stop_btn"] = gr.Button(
+                "Emergency Stop",
+                variant="stop",
+                visible=False,
+                elem_id="lyrics-thumb-stop-btn",
+                scale=2,
+            )
 
 
 
@@ -3066,6 +3165,15 @@ def _wire_create_events(status_box) -> None:
         yield (
             msg, *idle, active_session_id or "",
         ) + _gallery_sessions_tab(active_session_id or "")
+
+    def _apply_gen_mode(cfg: dict, mode: str) -> dict:
+        """Stamp generate | regenerate | complete onto cfg for inference."""
+        m = (mode or "generate").strip().lower()
+        if m not in ("generate", "regenerate", "complete"):
+            m = "generate"
+        cfg = dict(cfg)
+        cfg["gen_mode"] = m
+        return cfg
 
     def _should_stop_only() -> bool:
         """True when this click should only stop (not start a new job).
@@ -3567,13 +3675,6 @@ def _wire_create_events(status_box) -> None:
         idle_btns = _action_btn_updates(lyrics, song_name, running=False)
         run_btns = _action_btn_updates(lyrics, song_name, running=True)
 
-        # Thumbnails "Emergency Stop" reuses this handler when pipeline is live
-        if _should_stop_only():
-            yield from _stop_from_thumb(
-                lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale,
-                ref_image, hair_style, outfit_worn, negative_prompt, active_session_id,
-            )
-            return
 
         if not _can_create(lyrics, song_name):
             yield (
@@ -4056,12 +4157,6 @@ def _wire_create_events(status_box) -> None:
         idle_btns = _action_btn_updates(lyrics, song_name, running=False)
         run_btns = _action_btn_updates(lyrics, song_name, running=True)
 
-        if _should_stop_only():
-            yield from _stop_from_thumb(
-                lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale,
-                ref_image, hair_style, outfit_worn, negative_prompt, active_session_id,
-            )
-            return
 
         if not (lyrics or "").strip() or not (song_name or "").strip():
             yield (
@@ -4188,12 +4283,6 @@ def _wire_create_events(status_box) -> None:
     ):
         idle_btns = _action_btn_updates(lyrics, song_name, running=False)
         run_btns = _action_btn_updates(lyrics, song_name, running=True)
-        if _should_stop_only():
-            yield from _stop_from_thumb(
-                lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale,
-                ref_image, hair_style, outfit_worn, negative_prompt, active_session_id,
-            )
-            return
         if not _can_cover(song_name):
             yield (
                 _status_plain("Song name and models are required for a cover image."),
@@ -4314,12 +4403,6 @@ def _wire_create_events(status_box) -> None:
     ):
         idle_btns = _action_btn_updates(lyrics, song_name, running=False)
         run_btns = _action_btn_updates(lyrics, song_name, running=True)
-        if _should_stop_only():
-            yield from _stop_from_thumb(
-                lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale,
-                ref_image, hair_style, outfit_worn, negative_prompt, active_session_id,
-            )
-            return
         if not _can_theme(lyrics, song_name):
             yield (
                 _status_plain("Song name, lyrics, and models are required for theme images."),
@@ -4812,12 +4895,7 @@ def _wire_create_events(status_box) -> None:
         outputs=_run_outputs,
     )
     def _guard_job(gen_fn):
-        """Wrap a job generator so Gradio cancel (re-click) kills backend workers.
-
-        When the user re-clicks a dual-purpose Emergency Stop button, Gradio
-        raises GeneratorExit on the running job *before* the new click runs.
-        Without this, Theme/Lyrics/Cover stop labels do nothing to sd-cli.
-        """
+        """Wrap a job generator so Gradio cancel kills backend workers cleanly."""
         def _wrapped(*args, **kwargs):
             try:
                 yield from gen_fn(*args, **kwargs)
@@ -4826,27 +4904,139 @@ def _wire_create_events(status_box) -> None:
                 raise
         return _wrapped
 
-    # Thumbnails-tab per-section buttons (Cover / Theme / Lyrics only live here)
-    # Dual-purpose: Generate while idle, Emergency Stop while running.
-    _cover_ev = None
-    _theme_ev = None
-    _lyrics_ev = None
+    def _with_gen_mode(gen_fn, mode: str):
+        """Bind generate | regenerate | complete onto a section handler."""
+        def _wrapped(
+            lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale,
+            ref_image, hair_style, outfit_worn, negative_prompt, active_session_id,
+            progress=gr.Progress(track_tqdm=False),
+        ):
+            configure.APP_STATE["gen_mode"] = mode
+            try:
+                yield from gen_fn(
+                    lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale,
+                    ref_image, hair_style, outfit_worn, negative_prompt, active_session_id,
+                    progress=progress,
+                )
+            finally:
+                configure.APP_STATE.pop("gen_mode", None)
+        return _wrapped
+
+    def _stop_for_run_outputs(lyrics="", song_name="", active_session_id=""):
+        """Dedicated Emergency Stop for Thumbnails section stop buttons."""
+        msg, *idle = _stop(lyrics, song_name)
+        sid = (
+            active_session_id
+            or configure.APP_STATE.get("active_session_id")
+            or ""
+        )
+        return (msg, *idle, sid) + _gallery_sessions_tab(sid)
+
+    def _cover_primary(
+        lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale,
+        ref_image, hair_style, outfit_worn, negative_prompt, active_session_id,
+        progress=gr.Progress(track_tqdm=False),
+    ):
+        have, _ = _cover_counts()
+        mode = "regenerate" if have > 0 else "generate"
+        configure.APP_STATE["gen_mode"] = mode
+        try:
+            yield from _run_cover(
+                lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale,
+                ref_image, hair_style, outfit_worn, negative_prompt, active_session_id,
+                progress=progress,
+            )
+        finally:
+            configure.APP_STATE.pop("gen_mode", None)
+
+    def _theme_primary(
+        lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale,
+        ref_image, hair_style, outfit_worn, negative_prompt, active_session_id,
+        progress=gr.Progress(track_tqdm=False),
+    ):
+        have, _ = _theme_counts()
+        mode = "regenerate" if have > 0 else "generate"
+        configure.APP_STATE["gen_mode"] = mode
+        try:
+            yield from _run_theme(
+                lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale,
+                ref_image, hair_style, outfit_worn, negative_prompt, active_session_id,
+                progress=progress,
+            )
+        finally:
+            configure.APP_STATE.pop("gen_mode", None)
+
+    def _lyrics_primary(
+        lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale,
+        ref_image, hair_style, outfit_worn, negative_prompt, active_session_id,
+        progress=gr.Progress(track_tqdm=False),
+    ):
+        have, _ = _lyrics_counts(lyrics)
+        mode = "regenerate" if have > 0 else "generate"
+        configure.APP_STATE["gen_mode"] = mode
+        try:
+            yield from _run(
+                lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale,
+                ref_image, hair_style, outfit_worn, negative_prompt, active_session_id,
+                progress=progress,
+            )
+        finally:
+            configure.APP_STATE.pop("gen_mode", None)
+
     if _gen.get("thumb_cover_btn") is not None:
-        _cover_ev = _gen["thumb_cover_btn"].click(
-            _guard_job(_run_cover),
+        _gen["thumb_cover_btn"].click(
+            _guard_job(_cover_primary),
             inputs=_shared_gen_inputs(),
             outputs=_run_outputs,
         )
+    if _gen.get("cover_complete_btn") is not None:
+        _gen["cover_complete_btn"].click(
+            _guard_job(_with_gen_mode(_run_cover, "complete")),
+            inputs=_shared_gen_inputs(),
+            outputs=_run_outputs,
+        )
+    if _gen.get("cover_stop_btn") is not None:
+        _gen["cover_stop_btn"].click(
+            _stop_for_run_outputs,
+            inputs=[_gen["lyrics"], _gen["song_name"], _gen["active_session_id"]],
+            outputs=_run_outputs,
+        )
+
     if _gen.get("thumb_theme_btn") is not None:
-        _theme_ev = _gen["thumb_theme_btn"].click(
-            _guard_job(_run_theme),
+        _gen["thumb_theme_btn"].click(
+            _guard_job(_theme_primary),
             inputs=_shared_gen_inputs(),
             outputs=_run_outputs,
         )
-    if _gen.get("thumb_run_btn") is not None:
-        _lyrics_ev = _gen["thumb_run_btn"].click(
-            _guard_job(_run),
+    if _gen.get("theme_complete_btn") is not None:
+        _gen["theme_complete_btn"].click(
+            _guard_job(_with_gen_mode(_run_theme, "complete")),
             inputs=_shared_gen_inputs(),
+            outputs=_run_outputs,
+        )
+    if _gen.get("theme_stop_btn") is not None:
+        _gen["theme_stop_btn"].click(
+            _stop_for_run_outputs,
+            inputs=[_gen["lyrics"], _gen["song_name"], _gen["active_session_id"]],
+            outputs=_run_outputs,
+        )
+
+    if _gen.get("thumb_run_btn") is not None:
+        _gen["thumb_run_btn"].click(
+            _guard_job(_lyrics_primary),
+            inputs=_shared_gen_inputs(),
+            outputs=_run_outputs,
+        )
+    if _gen.get("lyrics_complete_btn") is not None:
+        _gen["lyrics_complete_btn"].click(
+            _guard_job(_with_gen_mode(_run, "complete")),
+            inputs=_shared_gen_inputs(),
+            outputs=_run_outputs,
+        )
+    if _gen.get("lyrics_stop_btn") is not None:
+        _gen["lyrics_stop_btn"].click(
+            _stop_for_run_outputs,
+            inputs=[_gen["lyrics"], _gen["song_name"], _gen["active_session_id"]],
             outputs=_run_outputs,
         )
 

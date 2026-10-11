@@ -2727,10 +2727,13 @@ def _sanitize_visual_prompt(prompt: str, lyric: str, style_hint: str = "") -> st
 
 def _appearance_bit(cfg: Dict[str, Any], presence: str = "full") -> str:
     """
-    Identity + hair/outfit clause from cfg (character-bearing stills only).
+    Identity + wardrobe clause from cfg (character-bearing stills only).
 
-    presence drives wording: silhouette omits face/age/hands so the model
-    can actually render a shadow outline; full keeps the face-match lock.
+    presence drives wording:
+      none       → empty (caller must not attach the character reference either)
+      silhouette → outline + optional clothing, no footwear
+      partial    → face-match + optional clothing, no footwear
+      full       → face-match + clothing + footwear
     """
     return configure.character_identity_clause(
         hair=cfg.get("hair_style") or "",
@@ -2899,6 +2902,28 @@ def generate_images_from_prompts(
         c.extend(_sd_placement_args(cfg, use_gpu, vk_idx))
         return c
 
+    gen_mode = str(
+        cfg.get("gen_mode")
+        or configure.APP_STATE.get("gen_mode")
+        or "generate"
+    ).strip().lower()
+    if gen_mode not in ("generate", "regenerate", "complete"):
+        gen_mode = "generate"
+    if gen_mode == "regenerate":
+        # Wipe existing lyric stills so every slot is re-made
+        wiped = 0
+        for pth in list(out_dir.glob("*.png")):
+            name = pth.name.lower()
+            if name.startswith("cover-") or name.startswith("theme-"):
+                continue
+            # lyric stills: NNN - ... or line markers
+            try:
+                pth.unlink()
+                wiped += 1
+            except OSError:
+                pass
+        print(f"[images] regenerate — wiped {wiped} existing lyric still(s)", flush=True)
+
     work_total = max(1, total * freq)
     work_done = 0
     for i, prompt in enumerate(prompts):
@@ -2979,15 +3004,25 @@ def generate_images_from_prompts(
             scene = (clean_prompt or "").strip()
             identity = ""
             if progressive:
+                # Prior still as visual continuity only — NOT the character reference photo
+                # unless this line also has main-character presence.
                 ref_override = str(prev_still)
                 attach_ref = True
                 if use_char_ref:
                     identity = _appearance_bit(cfg, presence=pres)
-                beat = (
-                    f"Beat {var} of {freq} in a continuous moment: "
-                    "same scene, characters, hair, outfit, and lighting language, "
-                    "evolving to the next beat of the action."
-                )
+                    beat = (
+                        f"Beat {var} of {freq} in a continuous moment: "
+                        "same scene, characters, hair, outfit, and lighting language, "
+                        "evolving to the next beat of the action."
+                    )
+                else:
+                    identity = ""
+                    beat = (
+                        f"Beat {var} of {freq} in a continuous moment: "
+                        "same environment and lighting language, "
+                        "evolving to the next beat of the action. "
+                        "No main character in this still."
+                    )
                 final_prompt = configure.compose_lyric_still_prompt(
                     image_style=str(cfg.get("image_style") or ""),
                     visual_style=str(
@@ -4258,11 +4293,17 @@ def generate_cover_image(
             result["session_id"] = project_dir.name
             configure.APP_STATE["session_status"] = "idle"
             return result
-        # Count existing covers so "Complete" only fills the remainder;
-        # when already at target, wipe and fully re-generate.
+        # gen_mode: generate | regenerate | complete (from UI / APP_STATE)
+        gen_mode = str(
+            cfg.get("gen_mode")
+            or configure.APP_STATE.get("gen_mode")
+            or "generate"
+        ).strip().lower()
+        if gen_mode not in ("generate", "regenerate", "complete"):
+            gen_mode = "generate"
         existing_covers = sorted(project_dir.glob("cover-*.png"))
         have_n = len(existing_covers)
-        if have_n >= target_n:
+        if gen_mode == "regenerate" and existing_covers:
             for old in existing_covers:
                 try:
                     old.unlink()
@@ -4271,8 +4312,27 @@ def generate_cover_image(
             have_n = 0
             cover_n = target_n
             start_idx = 1
-            print(f"[cover] complete set removed — re-generating {cover_n}", flush=True)
-        elif have_n > 0:
+            print(f"[cover] regenerate — wiped existing, generating {cover_n}", flush=True)
+        elif gen_mode == "complete" and have_n > 0:
+            cover_n = max(0, target_n - have_n)
+            start_idx = 1
+            while (project_dir / f"cover-{start_idx:02d}-{slug}.png").exists():
+                start_idx += 1
+                if start_idx > 999:
+                    break
+            print(f"[cover] complete — filling {cover_n} missing slot(s)", flush=True)
+        elif have_n >= target_n and gen_mode != "complete":
+            # Legacy auto: full set → wipe & redo
+            for old in existing_covers:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+            have_n = 0
+            cover_n = target_n
+            start_idx = 1
+            print(f"[cover] full set — re-generating {cover_n}", flush=True)
+        elif have_n > 0 and gen_mode == "generate":
             cover_n = max(0, target_n - have_n)
             start_idx = 1
             while (project_dir / f"cover-{start_idx:02d}-{slug}.png").exists():
@@ -4465,8 +4525,14 @@ def generate_theme_images(
             return result
         existing_themes = sorted(project_dir.glob("theme-*.png"))
         existing_theme_n = len(existing_themes)
-        # Complete: fill remainder; already full: wipe and re-generate all
-        if existing_theme_n >= target_theme:
+        gen_mode = str(
+            cfg.get("gen_mode")
+            or configure.APP_STATE.get("gen_mode")
+            or "generate"
+        ).strip().lower()
+        if gen_mode not in ("generate", "regenerate", "complete"):
+            gen_mode = "generate"
+        if gen_mode == "regenerate" and existing_themes:
             for old in existing_themes:
                 try:
                     old.unlink()
@@ -4474,7 +4540,19 @@ def generate_theme_images(
                     pass
             existing_theme_n = 0
             theme_n = target_theme
-            print(f"[theme] complete set removed — re-generating {theme_n}", flush=True)
+            print(f"[theme] regenerate — wiped existing, generating {theme_n}", flush=True)
+        elif gen_mode == "complete" and existing_theme_n > 0:
+            theme_n = max(0, target_theme - existing_theme_n)
+            print(f"[theme] complete — filling {theme_n} missing slot(s)", flush=True)
+        elif existing_theme_n >= target_theme:
+            for old in existing_themes:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+            existing_theme_n = 0
+            theme_n = target_theme
+            print(f"[theme] full set — re-generating {theme_n}", flush=True)
         elif existing_theme_n > 0:
             theme_n = target_theme - existing_theme_n
         else:
