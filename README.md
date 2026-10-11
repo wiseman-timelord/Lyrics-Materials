@@ -86,6 +86,8 @@ Lyrics-Materials/
 ### Testing:
 - add another control for footwear, ie, black-boots, manila-boots, black-shoes, manila-shoes, black-trainers, manila-trainers, none-specified (no text segment in prompt).
 - Its not meant to be moving the mmproj to ".\models\mmproj\*", its instead supposed to be creating a mmproj folder in the location where the actual model being used is in, and moving it there.
+- Idiot-proofing;when the user clicks Run Assessment, then the Session Slots column is then collapsed. But when program starts it should be expanded.
+- emergency Stop worked from Management page, but not from Thumbnails page on Theme and Lyrics images, sections, maybe Cover Image section Emergency stop is also having issues.
 
 ### Disclaimer:
 - Warnings of quantum-weirdness in advance, but if you are familiar with Flux-2-Klein and qwen3-4b-thinking, this seems to be a good showcasing of what it can do, but you yourself are the one whom pulls the lever on your own configurations and Lyrics, then unexpected results will occur, because I probably havn't seen it before, one can always use the Negative prompt to filter out their phobias/fears in a box on the bottom of panel at location of  `Management > Name and Lyrics`.
