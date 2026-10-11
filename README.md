@@ -1,5 +1,5 @@
 # Lyrics-Materials
-Status: Beta - Mid-Late development, its almost there, testing potential final v1 versions since v0.30. Note the images shown below were updated recently. 
+Status: Beta - Mid-Late development, its almost there, testing potential final v1.00 versions since v0.30.
 
 ### Description:
 It convert lines of lyrics into AI generated images, one for each line. The idea is one could arrange these in a movie editor, and fade in/out between sections of images with theme images in the non-lyrics parts for fillers, to make simple music videos. One could also take the line of lyrics and the generated images, and feed that into AI video generator to make clips, that could then be assembled into a video.
@@ -80,15 +80,10 @@ Lyrics-Materials/
 ```
 
 ### Development:
+-  Main issue is on Management Page; project configuration panels are iffy when using Details Mode, and dont load correctly first time, user is left to click away to other modes on the switch and back.
 - Installer not checked for a while, as I didnt change packages after early versions, but worked last time used, will be checked at some point. More interested in completing program.
 - The outfits need improving, current list is from Image Glamour plus 2 for artist, though after review. For more range, enumerate common popular outfit types.
 - Option to have NONE of the images with background/other characters; option for all scenes will as are appropriate ONLY feature reference character or just the scene. 
-
-### Testing:
-- add another control for footwear, ie, black-boots, manila-boots, black-shoes, manila-shoes, black-trainers, manila-trainers, none-specified (no text segment in prompt).
-- Its not meant to be moving the mmproj to ".\models\mmproj\*", its instead supposed to be creating a mmproj folder in the location where the actual model being used is in, and moving it there.
-- Idiot-proofing;when the user clicks Run Assessment, then the Session Slots column is then collapsed. But when program starts it should be expanded.
-- emergency Stop worked from Management page, but not from Thumbnails page on Theme and Lyrics images, sections, maybe Cover Image section Emergency stop is also having issues.
 
 ### Disclaimer:
 - Warnings of quantum-weirdness in advance, but if you are familiar with Flux-2-Klein and qwen3-4b-thinking, this seems to be a good showcasing of what it can do, but you yourself are the one whom pulls the lever on your own configurations and Lyrics, then unexpected results will occur, because I probably havn't seen it before, one can always use the Negative prompt to filter out their phobias/fears in a box on the bottom of panel at location of  `Management > Name and Lyrics`.
