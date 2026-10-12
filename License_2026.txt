@@ -29,7 +29,7 @@ Additional Terms:
    Wiseman-Timelord's software is provided "as is" without warranties or support. The user assumes all responsibility for damages resulting from the software's use, including but not limited to hardware, software, or mental health impacts. 
    
 5. Disclaimer Experimental:
-   One also accepts the software here is "Experimental" and while it works fine on the hardware used by WiseMan-TimeLord, the program may not work as expected on hardware that differs. WiseMan-TimeLord is not responsible for issues created on the part of the libraries/binaries used.
+   One also accepts the software here is "Experimental" and while it works fine on the hardware used by WiseMan-TimeLord, and while time is taken to be updating installer scripts for compatibility with other hardware; WiseMan-TimeLord is not responsible for complications caused on the part of the libraries/binaries used, that are the result of other peoples differing hardware configurations.
 
 6. Versioning and Updates:
    This license may not be updated or revised by others tha WiseMan-TimeLord. Users are subject to the version of the license under which they obtained with the relating repository/version of the software, unless otherwise specified by Wiseman-Timelord.
