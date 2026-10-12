@@ -1239,58 +1239,75 @@ def compose_lyric_still_prompt(
     lyric: str = "",
     scene: str = "",
     identity: str = "",
+    pose: str = "",
     sequence_bit: str = "",
 ) -> str:
     """
     Full positive prompt for a lyric still:
 
-      {header} [{scene}] [{identity}] [{sequence}]
+      {header} {scene} [{identity}] [{pose}] [{sequence}]
 
-    Prefer the Phase-1 scene paragraph. Only fall back to a light lyric cue when
-    the scene is missing — never restatement of the lyric twice.
+    Scene = environment only. Identity = our locked character (from UI/ref).
+    Pose = activity only (from Phase-1). Never restates the lyric twice.
     """
     header = still_header(image_style, visual_style)
     lyric_s = (lyric or "").strip().rstrip(" .,;:!?…")
     parts: List[str] = [header]
 
-    scene_s = (scene or "").strip()
-    if scene_s:
-        low = scene_s.lower().strip()
-        lyric_low = lyric_s.lower()
+    def _clean_clause(s: str) -> str:
+        t = (s or "").strip().rstrip(" ,;:")
+        if not t:
+            return ""
+        low = t.lower()
         _bad = (
             "describe the visual scene",
+            "describe environment",
             "one positive paragraph",
             "do not describe the main character",
-            "output the scene description",
+            "output the scene",
             "<|im_start|>",
             "<think>",
             "song context:",
             "main character:",
             "character:",
             "framing note",
+            "lyric:",
+            "context:",
+            "section (",
             "cinematic music-video moment expressing the lyric mood",
         )
         if low.startswith("music-video still"):
-            scene_s = ""
-        elif any(b in low for b in _bad):
-            scene_s = ""
-        elif lyric_low and (low == lyric_low or low.rstrip(".!?") == lyric_low):
-            scene_s = ""
-        elif "music-video still of:" in low and len(scene_s) < 100:
-            scene_s = ""
+            return ""
+        if any(b in low for b in _bad):
+            return ""
+        if lyric_s and (low == lyric_s.lower() or low.rstrip(".!?") == lyric_s.lower()):
+            return ""
+        if t[-1] not in ".!?":
+            t += "."
+        return t
 
+    scene_s = _clean_clause(scene)
     if scene_s:
-        scene_s = scene_s.rstrip(" ,;:")
-        if scene_s and scene_s[-1] not in ".!?":
-            scene_s += "."
         parts.append(scene_s)
     elif lyric_s:
-        # No usable scene — light lyric cue only (not a full "Music-video still of")
         parts.append(f"Visual moment for the lyric: {lyric_s}.")
 
     id_s = (identity or "").strip()
     if id_s:
         parts.append(id_s)
+
+    pose_s = _clean_clause(pose)
+    if pose_s:
+        # Prefer natural "in an activity of X" only when pose is a bare verb phrase
+        pl = pose_s.lower().rstrip(".!?")
+        if pl.startswith(("in ", "at ", "on ", "walking", "standing", "sitting",
+                          "running", "dancing", "pointing", "looking", "turning",
+                          "reaching", "leaning", "kneeling", "lying", "crouching",
+                          "facing", "moving", "pausing", "gesturing")):
+            parts.append(pose_s)
+        else:
+            parts.append(f"in an activity of {pose_s[0].lower() + pose_s[1:] if pose_s else pose_s}")
+
     seq = (sequence_bit or "").strip()
     if seq:
         parts.append(seq)

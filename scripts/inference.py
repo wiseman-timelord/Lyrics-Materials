@@ -1923,6 +1923,99 @@ def analyze_song_and_sections(
 
 
 
+def _parse_scene_pose(raw: str, lyric: str = "") -> Tuple[str, str]:
+    """
+    Parse model output into (scene, pose).
+
+    Prefer labeled SCENE: / POSE: blocks. Discard CHARACTER: and instruction echoes.
+    Falls back to sanitizing the whole paragraph as scene when labels are missing.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return "", ""
+    text = _strip_think_tags(text)
+    for tok in (
+        "<|im_start|>system", "<|im_start|>user", "<|im_start|>assistant",
+        "<|im_start|>", "<|im_end|>", "<|endoftext|>",
+        "<think>", "</think>",
+    ):
+        text = text.replace(tok, " ")
+
+    scene = ""
+    pose = ""
+    # Labeled blocks (multiline until next LABEL: or end)
+    blocks = re.split(r"(?im)^(?=(?:SCENE|POSE|CHARACTER|SETTING|ACTION|ENVIRONMENT)\s*:)", text)
+    for block in blocks:
+        b = block.strip()
+        if not b:
+            continue
+        m = re.match(
+            r"(?is)^(SCENE|POSE|CHARACTER|SETTING|ACTION|ENVIRONMENT)\s*:\s*(.*)$",
+            b,
+        )
+        if not m:
+            continue
+        label = m.group(1).upper()
+        body = (m.group(2) or "").strip()
+        # Cut trailing other labels if any slipped through
+        body = re.split(
+            r"(?im)^(?:SCENE|POSE|CHARACTER|SETTING|ACTION|ENVIRONMENT)\s*:",
+            body,
+        )[0].strip()
+        if label in ("SCENE", "SETTING", "ENVIRONMENT"):
+            scene = body
+        elif label in ("POSE", "ACTION"):
+            pose = body
+        # CHARACTER deliberately discarded — identity comes from UI/ref
+
+    if not scene:
+        # Unstructured: sanitize whole reply as scene; no pose
+        scene = _sanitize_visual_prompt(text, lyric)
+
+    scene = _sanitize_visual_prompt(scene, lyric) if scene else ""
+    pose = _sanitize_pose(pose) if pose else ""
+    return scene, pose
+
+
+def _sanitize_pose(pose: str) -> str:
+    """Keep a short activity clause; drop instruction / identity residue."""
+    p = (pose or "").strip()
+    if not p:
+        return ""
+    pl = p.lower().strip()
+    if pl in ("none", "none.", "n/a", "na", "-", "absent", "n/a."):
+        return ""
+    if any(x in pl for x in (
+        "do not", "describe environment", "matching the reference",
+        "main character", "constraint", "output the", "lyric:",
+    )):
+        return ""
+    # One short clause
+    p = re.sub(r"\s{2,}", " ", p).strip(" ,;:-")
+    if len(p) > 160:
+        cut = p[:160]
+        for sep in (". ", "; ", ", "):
+            pos = cut.rfind(sep)
+            if pos > 40:
+                cut = cut[: pos + (1 if sep.startswith(".") else 0)]
+                break
+        p = cut.strip()
+    if p and p[-1] not in ".!?":
+        p += "."
+    return p
+
+
+def _split_stored_scene_pose(stored: str) -> Tuple[str, str]:
+    """Recover (scene, pose) from prompts.txt body (SCENE:/POSE: or plain prose)."""
+    s = (stored or "").strip()
+    if not s:
+        return "", ""
+    if re.search(r"(?im)^(?:SCENE|POSE)\s*:", s):
+        return _parse_scene_pose(s, "")
+    # Legacy plain paragraph
+    return _sanitize_visual_prompt(s, ""), ""
+
+
 def generate_visual_prompts(
     lines: List[str],
     parsed: List[Dict[str, Any]],
@@ -1984,124 +2077,98 @@ def generate_visual_prompts(
                 {"phase": "prompts", "line": line_no, "total": total},
             )
         sec_note = section_notes.get(sec, "")
-        style_part = template.replace("{line}", line) if "{line}" in template else f"{template}\n{line}"
 
-        if has_character_ref and pres != "none":
-            # Secondary people: only when assessment named them — positive scene detail
-            if other_figures:
-                sec_people = (
-                    f"Also include secondary figures as described: {other_figures[:280]} "
-                    "with their own distinct outfits appropriate to the lyric. "
-                )
-            else:
-                sec_people = (
-                    "Focus on the scene implied by this lyric; "
-                    "add other people only if the lyric itself clearly requires them, "
-                    "each with their own distinct outfit. "
-                )
-            if pres in ("silhouette", "distant"):
-                # Do NOT say "show the main figure as a silhouette" — models echo that
-                # into the scene and Flux then paints two people (scene figure + identity).
-                char_clause = (
-                    "Describe environment, light, and atmosphere only. "
-                    "At most one tiny distant dark outline against the light — "
-                    "never a close figure, never face or clothing detail, never a second person. "
-                    f"{(char_guide or '')[:80]} "
-                    f"{sec_people}"
-                )
-            elif pres == "partial":
-                char_clause = (
-                    "Describe the scene with the main figure only partially visible "
-                    "(cropped, turned, or mid-distance). Pose and action only — "
-                    "no face or clothing detail. "
-                    f"{(char_guide or '')[:120]} "
-                    f"{sec_people}"
-                )
-            else:
-                char_clause = (
-                    "Describe the scene with the main figure clearly present. "
-                    "Pose and action only — no face or clothing detail. "
-                    f"{(char_guide or '')[:120]} "
-                    f"{sec_people}"
-                )
-        elif has_character_ref and pres == "none":
-            if other_figures:
-                sec_people = (
-                    f"Figures in this still (not the main reference): {other_figures[:280]} "
-                    "with outfits appropriate to the scene. "
-                )
-            else:
-                sec_people = (
-                    "Environment, objects, or anonymous figures only as the lyric suggests. "
-                )
-            char_clause = (
-                "The main figure is not in this still. "
-                f"{sec_people}"
-            )
-        else:
-            if other_figures:
-                sec_people = (
-                    f"Figures: {other_figures[:280]} "
-                    "with distinct outfits when clothing matters. "
-                )
-            else:
-                sec_people = "Invent figures from the lyric when needed. "
-            char_clause = (
-                "No reference photo — build the scene from the lyrics and notes. "
-                f"{sec_people}"
-            )
-
-        # Style header is applied later by compose_lyric_still_prompt — keep the
-        # model instruction free of template/style text so it cannot echo into scene.
-        # Never put copy-able "The main figure appears as…" lines in the instruction;
-        # models echo those and Flux then draws a second character beside the identity lock.
-        presence_hint = ""
+        # Structured SCENE + POSE only. Character appearance is injected later
+        # from UI/ref identity — never ask the model to describe the main character.
         if has_character_ref and pres in ("silhouette", "distant"):
-            presence_hint = (
-                "Constraint (do not copy this sentence into the output): "
-                "any person is only a tiny distant dark outline.\n"
+            presence_rule = (
+                "Main character presence: DISTANT — far away, small in frame. "
+                "Do not describe face, hair, clothing, or identity."
+            )
+            pose_rule = (
+                "POSE: one short clause for what the distant figure is doing "
+                "(e.g. walking away, standing at the far end of a corridor), or none."
             )
         elif has_character_ref and pres == "partial":
-            presence_hint = (
-                "Constraint (do not copy this sentence into the output): "
-                "figure is only partially visible.\n"
+            presence_rule = (
+                "Main character presence: PARTIAL — cropped, turned, or mid-distance. "
+                "Do not describe face, hair, clothing, or identity."
+            )
+            pose_rule = (
+                "POSE: one short clause for pose/action "
+                "(e.g. turning away, reaching upward), or none."
+            )
+        elif has_character_ref and pres == "full":
+            presence_rule = (
+                "Main character presence: FULL — clearly in frame. "
+                "Do not describe face, hair, clothing, or identity."
+            )
+            pose_rule = (
+                "POSE: one short clause for pose/action "
+                "(e.g. walking forward, pointing, dancing), or none."
             )
         elif has_character_ref and pres == "none":
-            presence_hint = (
-                "Constraint (do not copy this sentence into the output): "
-                "main character is absent.\n"
+            presence_rule = (
+                "Main character is ABSENT from this still. "
+                "Do not mention the main character at all."
             )
+            pose_rule = "POSE: none"
+        else:
+            presence_rule = "Invent figures from the lyric only if needed."
+            pose_rule = (
+                "POSE: one short clause for figure activity if any figure is present, or none."
+            )
+
+        other_bit = ""
+        if other_figures and other_figures.lower().strip() not in ("none", "none.", "n/a", "na"):
+            other_bit = (
+                f"Secondary people (not the main reference): {other_figures[:220]}\n"
+            )
+
         instruction = (
-            f"Lyric: {line}\n"
-            f"Context: {overall[:200]}\n"
-            f"Section ({sec}): {sec_note[:140]}\n"
-            f"{presence_hint}"
-            f"{char_clause}\n"
-            "Describe the setting, action, and lighting in one short paragraph "
-            "(40–90 words). Output the scene only — no constraints or instructions."
+            f"Lyric (mood only — do not quote it in the reply): {line}\n"
+            f"Setting context: {(overall or '')[:180]}\n"
+            f"Section note ({sec}): {(sec_note or '')[:120]}\n"
+            f"{presence_rule}\n"
+            f"{other_bit}"
+            "Reply with EXACTLY these two labels and nothing else:\n"
+            "SCENE: <1-2 sentences of environment, light, and atmosphere only — "
+            "no main-character description, no face, no clothing, no instructions>\n"
+            f"{pose_rule}\n"
+            "Do not repeat the lyric. Do not write CHARACTER. Do not write constraints."
         )
         try:
-            text = _run_llama_completion(
+            raw_text = _run_llama_completion(
                 instruction, cfg, role=role, model_path=model_path,
                 n_predict=_PROMPT_PREDICT, ctx_size=_PROMPT_CTX,
                 temperature=0.75, timeout=_TIMEOUT_PROMPT,
             )
         except Exception as e:
             print(f"[prompts] Lyrics Line {line_no} FAILED — empty scene: {e}", flush=True)
-            text = ""
-        # Pure scene only — style/lyric header added at image time by compose_*
-        scene_body = _sanitize_visual_prompt(text or "", line, style)
-        if scene_body:
-            preview = scene_body.replace("\n", " ")[:140]
-            print(f"[prompts] Lyrics Line {line_no} OK — scene: {preview}", flush=True)
+            raw_text = ""
+
+        scene_body, pose_body = _parse_scene_pose(raw_text or "", line)
+        # Store structured so image-time compose can inject identity between them
+        if pose_body:
+            stored = f"SCENE: {scene_body}\nPOSE: {pose_body}"
         else:
-            raw_prev = (text or "").strip().replace("\n", " ")[:100]
+            stored = f"SCENE: {scene_body}" if scene_body else ""
+        if scene_body:
+            preview = scene_body.replace("\n", " ")[:120]
+            pose_prev = (pose_body or "")[:60]
             print(
-                f"[prompts] Lyrics Line {line_no}: empty after sanitize "
-                f"(raw {len((text or '').strip())} chars: {raw_prev!r})",
+                f"[prompts] Lyrics Line {line_no} OK — scene: {preview}"
+                + (f" | pose: {pose_prev}" if pose_body else ""),
                 flush=True,
             )
-        prompts.append(scene_body)
+        else:
+            raw_prev = (raw_text or "").strip().replace("\n", " ")[:100]
+            print(
+                f"[prompts] Lyrics Line {line_no}: empty after parse "
+                f"(raw {len((raw_text or '').strip())} chars: {raw_prev!r})",
+                flush=True,
+            )
+        prompts.append(stored)
 
     print(f"[prompts] === finished {len(prompts)}/{total} prompts ===", flush=True)
     # Pad presence if cancelled mid-loop
@@ -2633,6 +2700,7 @@ def _scrub_presence_echoes(scene: str, presence: str = "full") -> str:
     # Patterns must not cross sentence boundaries. Em-dash fragments are matched
     # only up to the next .?! so later scene sentences stay intact.
     patterns = [
+        r"(?is)\bthe main character is barely visible\b[^.?!]{0,120}[.?!]",
         r"(?is)\bthe main figure appears\b[^.?!]{0,140}[.?!]",
         r"(?is)\bonly as a silhouette or shadow\b[^.?!]{0,40}[.?!]?",
         r"(?is)\bsilhouette or shadow outline of\b[^.?!]{0,200}[.?!]",
@@ -2717,6 +2785,35 @@ def _sanitize_visual_prompt(prompt: str, lyric: str, style_hint: str = "") -> st
         r"(?is)\bYou are a precise music-video art director\.?\s*"
         r"Follow the user's structure exactly\.?\s*"
         r"Write real sentences, not keyword lists\.?\s*",
+        " ",
+        p,
+    )
+    # Strip echoed instruction headers the model copies wholesale
+    p = re.sub(
+        r"(?is)\bLyric\s*\([^)]*\)\s*:\s*",
+        " ",
+        p,
+    )
+    p = re.sub(r"(?is)\bLyric\s*:\s*", " ", p)
+    p = re.sub(r"(?is)\b(?:Setting\s+)?Context\s*:\s*", " ", p)
+    p = re.sub(r"(?is)\bSection\s*(?:\([^)]*\))?\s*:\s*", " ", p)
+    p = re.sub(
+        r"(?is)\bDescribe environment, light, and atmosphere only\.?\s*",
+        " ",
+        p,
+    )
+    p = re.sub(
+        r"(?is)\b(?:Main character presence|presence constraint)\b[^.?!]{0,120}[.?!]?",
+        " ",
+        p,
+    )
+    p = re.sub(
+        r"(?is)\bthe main character is barely visible\b[^.?!]{0,120}[.?!]?",
+        " ",
+        p,
+    )
+    p = re.sub(
+        r"(?is)\ba shadow among blinking\b[^.?!]{0,40}[.?!]?",
         " ",
         p,
     )
@@ -3048,14 +3145,16 @@ def generate_images_from_prompts(
         if presence_per_line and i < len(presence_per_line):
             pres = _normalize_presence_token(presence_per_line[i] or "none")
         use_char_ref = bool(has_ref and pres != "none")
-        clean_prompt = _sanitize_visual_prompt(prompt, line_text, style_hint)
-        if not (clean_prompt or "").strip():
-            clean_prompt = _lyric_scene_fallback(line_text)
+        scene0, pose0 = _split_stored_scene_pose(prompt or "")
+        if not scene0:
+            scene0 = _lyric_scene_fallback(line_text)
             print(
-                f"[images] line {line_no}: empty scene after sanitize — "
+                f"[images] line {line_no}: empty scene after parse — "
                 f"using lyric fallback",
                 flush=True,
             )
+        if pres in ("silhouette", "distant", "partial"):
+            scene0 = _scrub_presence_echoes(scene0, pres)
         prev_still: Optional[Path] = None  # progressive chain within this line
 
         for var in range(1, freq + 1):
@@ -3108,10 +3207,8 @@ def generate_images_from_prompts(
             progressive = bool(freq > 1 and var > 1 and prev_still and prev_still.is_file())
             ref_override = ""
             attach_ref = False
-            scene = (clean_prompt or "").strip()
-            # Strip residual presence/identity echoes that double the figure on silhouettes
-            if pres in ("silhouette", "distant", "partial"):
-                scene = _scrub_presence_echoes(scene, pres)
+            scene = scene0
+            pose = pose0
             identity = ""
             if progressive:
                 # Prior still as visual continuity only — NOT the character reference photo
@@ -3122,7 +3219,7 @@ def generate_images_from_prompts(
                     identity = _appearance_bit(cfg, presence=pres)
                     beat = (
                         f"Beat {var} of {freq} in a continuous moment: "
-                        "same scene, characters, hair, outfit, and lighting language, "
+                        "same environment and lighting language, "
                         "evolving to the next beat of the action."
                     )
                 else:
@@ -3143,6 +3240,7 @@ def generate_images_from_prompts(
                     lyric=line_text,
                     scene=scene,
                     identity=identity,
+                    pose=pose,
                     sequence_bit=f"{seq_bit} {beat}".strip() if seq_bit else beat,
                 )
                 print(
@@ -3162,6 +3260,7 @@ def generate_images_from_prompts(
                     lyric=line_text,
                     scene=scene,
                     identity=identity,
+                    pose=pose,
                     sequence_bit=seq_bit.strip(" []") if seq_bit else "",
                 )
                 print(f"[images] character ref ATTACHED ({pres})"
@@ -3179,6 +3278,7 @@ def generate_images_from_prompts(
                     lyric=line_text,
                     scene=scene,
                     identity="",
+                    pose=pose,
                     sequence_bit=seq_bit.strip(" []") if seq_bit else "",
                 )
 
@@ -3473,11 +3573,10 @@ def regenerate_single_still(
     threads = _worker_thread_count(cfg)
 
     style_hint = str(cfg.get("prompt_template") or cfg.get("style") or "")
-    clean_prompt = _sanitize_visual_prompt(prompt, line_text, style_hint)
-    scene = (clean_prompt or "").strip()
+    scene, pose = _split_stored_scene_pose(prompt or "")
     if not scene:
         scene = _lyric_scene_fallback(line_text)
-        print(f"[regen] empty scene after sanitize — using lyric fallback", flush=True)
+        print(f"[regen] empty scene after parse — using lyric fallback", flush=True)
     if pres in ("silhouette", "distant", "partial"):
         scene = _scrub_presence_echoes(scene, pres)
     identity = _appearance_bit(cfg, presence=pres) if use_ref else ""
@@ -3491,6 +3590,7 @@ def regenerate_single_still(
         lyric=line_text,
         scene=scene,
         identity=identity,
+        pose=pose,
         sequence_bit="",
     )
     final_prompt = _strip_prompt_chatml(final_prompt)
