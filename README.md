@@ -80,7 +80,8 @@ Lyrics-Materials/
 ```
 
 ### Development:
--  Main issue is on Management Page; project configuration panels are iffy when using Details Mode, and dont load correctly first time, user is left to click away to other modes on the switch and back.
+- I do want option to, have or not have, background actors. This requires an additional iteration and prompting to assess, if there are background actors in the scene, and what type of being, and outfit style (if any), and pose/activity, then merge that with other details for generation of image.
+- Main issue is on Management Page; project configuration panels are iffy when using Details Mode, and dont load correctly first time, user is left to click away to other modes on the switch and back.
 - Installer not checked for a while, as I didnt change packages after early versions, but worked last time used, will be checked at some point. More interested in completing program.
 - The outfits need improving, current list is from Image Glamour plus 2 for artist, though after review. For more range, enumerate common popular outfit types.
 - Option to have NONE of the images with background/other characters; option for all scenes will as are appropriate ONLY feature reference character or just the scene. 
