@@ -1553,14 +1553,16 @@ THEME_COUNT_MAX = 12
 DEFAULT_THEME_COUNT = 2
 
 LYRICS_PER_LINE_MIN = 0
-LYRICS_PER_LINE_MAX = 5
+LYRICS_PER_LINE_MAX = 20
 DEFAULT_LYRICS_PER_LINE = 1
 
 DEFAULT_IMAGE_FREQUENCY = (
     f"C{DEFAULT_COVER_COUNT}/T{DEFAULT_THEME_COUNT}/L{DEFAULT_LYRICS_PER_LINE}"
 )
 
-# Framing hints when generating multiple stills for one lyric line
+# Framing hints when generating multiple stills for one lyric line.
+# Values above the largest canned set fall back to generic "beat i/n" labels
+# in image_frequency_hints() (supports L up to LYRICS_PER_LINE_MAX).
 IMAGE_FREQUENCY_SEQUENCE = {
     1: [""],
     2: [
@@ -1583,6 +1585,36 @@ IMAGE_FREQUENCY_SEQUENCE = {
         "early development",
         "middle / peak of this moment",
         "late development",
+        "resolve of this moment",
+    ],
+    6: [
+        "opening of this moment",
+        "early development",
+        "rising action",
+        "peak of this moment",
+        "falling action",
+        "resolve of this moment",
+    ],
+    8: [
+        "opening of this moment",
+        "early development",
+        "build",
+        "rising action",
+        "peak of this moment",
+        "aftermath of the peak",
+        "falling action",
+        "resolve of this moment",
+    ],
+    10: [
+        "opening of this moment",
+        "establish the scene",
+        "early development",
+        "build",
+        "rising action",
+        "peak of this moment",
+        "hold the peak",
+        "aftermath of the peak",
+        "falling action",
         "resolve of this moment",
     ],
 }
