@@ -1,5 +1,5 @@
 # Lyrics-Materials
-Status: Beta - Mid-Late development, its almost there, testing potential final v1.00 versions since v0.30 (final prompt tuning going on now).
+Status: Beta - Mid-Late development, its almost there since v0.30. phase now is testing and refining. Some things are buggy, but otherwise it does what it shows in the screenshots.
 
 ### Description:
 It convert lines of lyrics into AI generated images, one for each line. The idea is one could arrange these in a movie editor, and fade in/out between sections of images with theme images in the non-lyrics parts for fillers, to make simple music videos. One could also take the line of lyrics and the generated images, and feed that into AI video generator to make clips, that could then be assembled into a video.
@@ -11,7 +11,7 @@ It convert lines of lyrics into AI generated images, one for each line. The idea
 - Here screen where user reviews work and re-generates individual images/sections (v0.31)...
 ![Generation_Page](https://github.com/wiseman-timelord/Lyrics-Materials/blob/main/media/Thumbnails_Page_v031.jpg)
 
-- Here is the old version scenes either do or dont have people there, but issues with ghostly characters (v0.25)...
+- Here is a old version, appropriately scenes either do or dont have people (somewhat better if you want other people), but the GUI/Controls are not so good (v0.25)...
 ![Generation_Page](https://github.com/wiseman-timelord/Lyrics-Materials/blob/main/media/Thumbnails_Page_v025.jpg)
 
 - The Configuration page is refined, with two individual models columns (v0.25)...
