@@ -83,6 +83,7 @@ Lyrics-Materials/
 ```
 
 ### Development:
+- Experiments with Qwen-Image 2.1 - if its better, and facial accuracy is more frequent, or some neat features, then possibly switch, if "its the one".
 - I do want option to, have or not have, background actors. This requires an additional iteration and prompting to assess, if there are background actors in the scene, and what type of being, and outfit style (if any), and pose/activity, then merge that with other details for generation of image.
 - Main issue is on Management Page; project configuration panels are iffy when using Details Mode, and dont load correctly first time, user is left to click away to other modes on the switch and back.
 - Installer not checked for a while, as I didnt change packages after early versions, but worked last time used, will be checked at some point. More interested in completing program.
