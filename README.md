@@ -88,7 +88,8 @@ Lyrics-Materials/
 - Main issue is on Management Page; project configuration panels are iffy when using Details Mode, and dont load correctly first time, user is left to click away to other modes on the switch and back.
 - Installer not checked for a while, as I didnt change packages after early versions, but worked last time used, will be checked at some point. More interested in completing program.
 - The outfits need improving, current list is from Image Glamour plus 2 for artist, though after review. For more range, enumerate common popular outfit types.
-- Option to have NONE of the images with background/other characters; option for all scenes will as are appropriate ONLY feature reference character or just the scene. This is supposed to be the case when no reference image, but need to check that when there is no reference image, that all of the relating prompting will be ok, ie no character control traces.
+- Option to have NONE of the images with background/other characters; option for all scenes will as are appropriate ONLY feature reference character or just the scene. 
+- If there is no reference image, then all of the relating prompting needs to not mention things such as character control traces in positive and negative prompt.
 
 ### Disclaimer:
 - Warnings of quantum-weirdness in advance, but you yourself are the one whom pulls the lever on your own configurations and Lyrics, there is no way I know what your video will turn out like, because it can generate anything; one can always use the Negative prompt to filter out their phobias/fears in a box on the bottom of panel at location of  `Management > Name and Lyrics`.
