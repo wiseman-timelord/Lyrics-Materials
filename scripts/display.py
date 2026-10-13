@@ -2237,46 +2237,32 @@ def _build_create_tab() -> None:
                         info="Lead word of every still prompt (Photorealistic, Cartoon, …).",
                     )
                 with gr.Row():
-                    _gen["image_size"] = gr.Dropdown(
-                        label="Image size",
-                        choices=configure.IMAGE_SIZE_CHOICES,
-                        value=_init_size,
-                        scale=1,
-                        min_width=120,
-                        info="Still dimensions.",
-                    )
-                    _gen["cover_count"] = gr.Number(
+                    _gen["cover_count"] = gr.Slider(
                         label="Cover (C)",
                         value=_init_cover,
                         minimum=configure.COVER_COUNT_MIN,
                         maximum=configure.COVER_COUNT_MAX,
                         step=1,
-                        precision=0,
                         scale=1,
-                        min_width=80,
-                        info=f"{configure.COVER_COUNT_MIN}–{configure.COVER_COUNT_MAX}",
+                        info=f"{configure.COVER_COUNT_MIN}–{configure.COVER_COUNT_MAX} (updates on release)",
                     )
-                    _gen["theme_count"] = gr.Number(
+                    _gen["theme_count"] = gr.Slider(
                         label="Theme (T)",
                         value=_init_theme,
                         minimum=configure.THEME_COUNT_MIN,
                         maximum=configure.THEME_COUNT_MAX,
                         step=1,
-                        precision=0,
                         scale=1,
-                        min_width=80,
-                        info=f"{configure.THEME_COUNT_MIN}–{configure.THEME_COUNT_MAX}",
+                        info=f"{configure.THEME_COUNT_MIN}–{configure.THEME_COUNT_MAX} (updates on release)",
                     )
-                    _gen["lyrics_per_line"] = gr.Number(
+                    _gen["lyrics_per_line"] = gr.Slider(
                         label="Lyrics/line (L)",
                         value=_init_lyrics_n,
                         minimum=configure.LYRICS_PER_LINE_MIN,
                         maximum=configure.LYRICS_PER_LINE_MAX,
                         step=1,
-                        precision=0,
                         scale=1,
-                        min_width=80,
-                        info=f"{configure.LYRICS_PER_LINE_MIN}–{configure.LYRICS_PER_LINE_MAX} variants",
+                        info=f"{configure.LYRICS_PER_LINE_MIN}–{configure.LYRICS_PER_LINE_MAX} variants (updates on release)",
                     )
                     # Hidden synthesised label kept for any residual readers
                     _gen["image_frequency"] = gr.Textbox(
@@ -2285,12 +2271,21 @@ def _build_create_tab() -> None:
                         elem_id="image-frequency-hidden",
                     )
                 with gr.Row():
+                    _gen["image_size"] = gr.Dropdown(
+                        label="Image size",
+                        choices=configure.IMAGE_SIZE_CHOICES,
+                        value=_init_size,
+                        scale=1,
+                        min_width=120,
+                        info="Still dimensions.",
+                    )
                     _gen["steps"] = gr.Slider(
                         label="Steps",
                         minimum=1,
                         maximum=20,
                         step=1,
                         value=int(_g0.get("imagegen_steps") or configure.DEFAULT_STEPS),
+                        scale=1,
                     )
                     _gen["cfg"] = gr.Slider(
                         label="CFG",
@@ -2298,6 +2293,7 @@ def _build_create_tab() -> None:
                         maximum=4.0,
                         step=0.1,
                         value=float(_g0.get("imagegen_cfg_scale") or configure.DEFAULT_CFG),
+                        scale=1,
                     )
             _gen["details_project_settings"] = _details_settings
 
@@ -4123,9 +4119,11 @@ def _wire_create_events(status_box) -> None:
         *_action_btn_components(),
         _gen["active_session_id"],
     ] + _thumb_panel_outputs() + _session_refresh_outputs + [_gen["main_tabs"]]
+    # Slider.release fires only after the mouse button is released — avoids
+    # thrashing the gallery / status while the user is still dragging.
     for _fk in ("cover_count", "theme_count", "lyrics_per_line"):
         if _gen.get(_fk) is not None:
-            _gen[_fk].change(
+            _gen[_fk].release(
                 _on_frequency_counts_change,
                 inputs=_freq_count_inputs,
                 outputs=_freq_count_outputs,
