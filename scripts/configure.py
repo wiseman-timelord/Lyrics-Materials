@@ -1380,7 +1380,7 @@ DEFAULT_NEGATIVE_BODY = (
     "deformed, bad anatomy, extra limbs, missing limbs, mutated limbs, "
     "mutated hands, fused fingers, fewer than five fingers on each hand, "
     "exaggerated proportions, contorted pose, head on backwards. "
-    "More than 1 character with same identity as shown in the reference image. "
+    "2 or more characters based on reference image. ghosts. "
     "electronic devices, mobile phones, headphones."
 )
 # Back-compat alias: full default assumes Photo Realistic style lead.
@@ -1392,17 +1392,15 @@ DEFAULT_NEGATIVE_PROMPT = (
 # Style lead is prepended by merge_negative_prompt; keep ambient body style-free.
 # Cover / Theme: no subjects of any kind (people, faces, figures, bodies).
 AMBIENT_NEGATIVE_PROMPT = (
-    "text, writing, caption, watermark, signature, graphical overlay, "
-    "signage, poster text, banner. "
+    "text, writing, caption, watermark, signature, graphical overlay, subtitles."
+    "signage, poster text, banner, neon sign. "
     "blurry, out of focus, low quality, noisy. "
     "people, humans, person, human, face, portrait, character, characters, figure, crowd, body, "
-    "man, woman, child, silhouette of a person, humanoid subject."
+    "man, woman, child, silhouette of a person, humanoid subject, ghost. "
 )
 # Extra anti-text always merged into cover stills (Flux 4B loves to write titles).
 COVER_NEGATIVE_EXTRA = (
-    "people, humans, characters, "
-    "alphabet, calligraphy, album title text, readable text, misspelled text, "
-    "graphical overlay, text overlay."
+    "people, humans, characters, ghosts. "
 )
 DEFAULT_SAMPLER = "euler_a"
 DEFAULT_SEED = -1

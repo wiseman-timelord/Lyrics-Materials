@@ -476,7 +476,13 @@ def _section_btn_triple(kind: str, lyrics: str = "", *, running: bool = False, c
         interactive=bool(can_run and show_complete),
         variant="secondary",
     )
-    stop = gr.update(visible=False)
+    # Explicit hide — Gradio can leave a previously-shown stop visible if the
+    # update only sets visible=False without restating value/interactive.
+    stop = gr.update(
+        value="Emergency Stop",
+        visible=False,
+        interactive=False,
+    )
     return gen, complete, stop
 
 
@@ -530,6 +536,10 @@ def _action_btn_updates(lyrics: str = "", song_name: str = "", *, running: bool 
       lyrics_gen, lyrics_complete, lyrics_stop
     """
     hide = gr.update(visible=False)
+    # Force-hide for Emergency Stop buttons (mgmt + sections) when idle
+    stop_hide = gr.update(
+        value="Emergency Stop", visible=False, interactive=False,
+    )
     if running:
         mgmt_stop = gr.update(
             value="Emergency Stop", visible=True, interactive=True, variant="stop",
@@ -560,7 +570,7 @@ def _action_btn_updates(lyrics: str = "", song_name: str = "", *, running: bool 
         t_g = gr.update(value="Configure First", interactive=False, variant="secondary", visible=True)
         l_g = gr.update(value="Configure First", interactive=False, variant="secondary", visible=True)
         return (
-            disabled, hide, hide, hide,
+            disabled, hide, hide, stop_hide,
             c_g, c_c, c_s,
             t_g, t_c, t_s,
             l_g, l_c, l_s,
@@ -580,7 +590,7 @@ def _action_btn_updates(lyrics: str = "", song_name: str = "", *, running: bool 
         t_g, t_c, t_s = _section_btn_triple("theme", lyrics, running=False, can_run=False)
         l_g, l_c, l_s = _section_btn_triple("lyrics", lyrics, running=False, can_run=False)
         return (
-            assess_u, hide, hide, hide,
+            assess_u, hide, hide, stop_hide,
             c_g, c_c, c_s,
             t_g, t_c, t_s,
             l_g, l_c, l_s,
@@ -608,7 +618,7 @@ def _action_btn_updates(lyrics: str = "", song_name: str = "", *, running: bool 
     t_g, t_c, t_s = _section_btn_triple("theme", lyrics, running=False, can_run=theme_ok)
     l_g, l_c, l_s = _section_btn_triple("lyrics", lyrics, running=False, can_run=lyrics_ok)
     return (
-        assess_u, all_assets_u, prompts_u, hide,
+        assess_u, all_assets_u, prompts_u, stop_hide,
         c_g, c_c, c_s,
         t_g, t_c, t_s,
         l_g, l_c, l_s,
@@ -4394,6 +4404,9 @@ def _wire_create_events(status_box) -> None:
         if r.get("success") and r.get("project_folder"):
             configure.APP_STATE["current_project_folder"] = r["project_folder"]
             configure.update_generation({"last_project_folder": r["project_folder"]})
+        configure.APP_STATE["generating"] = False
+        configure.APP_STATE["session_status"] = "idle"
+        # Force idle button set so Emergency Stop is hidden on every section
         idle_btns = _action_btn_updates(lyrics, song_name, running=False)
         yield (
             _status_plain(msg), *idle_btns, sid,
@@ -4516,6 +4529,9 @@ def _wire_create_events(status_box) -> None:
         if r.get("success") and r.get("project_folder"):
             configure.APP_STATE["current_project_folder"] = r["project_folder"]
             configure.update_generation({"last_project_folder": r["project_folder"]})
+        configure.APP_STATE["generating"] = False
+        configure.APP_STATE["session_status"] = "idle"
+        # Force idle button set so Emergency Stop is hidden on every section
         idle_btns = _action_btn_updates(lyrics, song_name, running=False)
         yield (
             _status_plain(msg), *idle_btns, sid,
