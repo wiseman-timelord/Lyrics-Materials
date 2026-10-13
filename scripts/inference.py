@@ -3893,7 +3893,13 @@ def generate_theme_prompts_from_assessment(
     from the OVERALL assessment only. Theme stills are fillers for non-lyric
     stretches — no central character, no reference photo.
     """
-    n = max(1, min(8, int(n_prompts or 1)))
+    # Honour the requested count up to THEME_COUNT_MAX (was hard-capped at 8,
+    # which left Complete Gen short when Theme (T) > 8).
+    try:
+        requested = int(n_prompts or 1)
+    except (TypeError, ValueError):
+        requested = 1
+    n = max(1, min(int(configure.THEME_COUNT_MAX), requested))
     overall = (analysis.get("overall") or "").strip()
     if not overall:
         return []
@@ -4513,73 +4519,97 @@ def generate_cover_image(
         ).strip().lower()
         if gen_mode not in ("generate", "regenerate", "complete"):
             gen_mode = "generate"
-        existing_covers = sorted(project_dir.glob("cover-*.png"))
-        have_n = len(existing_covers)
-        if gen_mode == "regenerate" and existing_covers:
-            for old in existing_covers:
+        # Map 1-based slot → path (ignore __partial__ in-progress files)
+        existing_cover_map: Dict[int, Path] = {}
+        for p in project_dir.glob("cover-*.png"):
+            if ".__partial__" in p.name.lower():
+                continue
+            m = re.match(r"cover-(\d+)", p.name, re.I)
+            if m:
+                idx = int(m.group(1))
+                if idx > 0:
+                    existing_cover_map[idx] = p
+        have_n = len(existing_cover_map)
+        if gen_mode == "regenerate" and existing_cover_map:
+            for old in list(existing_cover_map.values()):
                 try:
                     old.unlink()
                 except OSError:
                     pass
+            existing_cover_map.clear()
             have_n = 0
-            cover_n = target_n
-            start_idx = 1
-            print(f"[cover] regenerate — wiped existing, generating {cover_n}", flush=True)
-        elif gen_mode == "complete" and have_n > 0:
-            cover_n = max(0, target_n - have_n)
-            start_idx = 1
-            while (project_dir / f"cover-{start_idx:02d}-{slug}.png").exists():
-                start_idx += 1
-                if start_idx > 999:
-                    break
-            print(f"[cover] complete — filling {cover_n} missing slot(s)", flush=True)
+            missing_cover_slots = list(range(1, target_n + 1))
+            print(
+                f"[cover] regenerate — wiped existing, generating {len(missing_cover_slots)}",
+                flush=True,
+            )
+        elif gen_mode == "complete":
+            missing_cover_slots = [
+                i for i in range(1, target_n + 1) if i not in existing_cover_map
+            ]
+            print(
+                f"[cover] complete — filling {len(missing_cover_slots)} missing slot(s) "
+                f"of target {target_n}",
+                flush=True,
+            )
         elif have_n >= target_n and gen_mode != "complete":
             # Legacy auto: full set → wipe & redo
-            for old in existing_covers:
+            for old in list(existing_cover_map.values()):
                 try:
                     old.unlink()
                 except OSError:
                     pass
+            existing_cover_map.clear()
             have_n = 0
-            cover_n = target_n
-            start_idx = 1
-            print(f"[cover] full set — re-generating {cover_n}", flush=True)
-        elif have_n > 0 and gen_mode == "generate":
-            cover_n = max(0, target_n - have_n)
-            start_idx = 1
-            while (project_dir / f"cover-{start_idx:02d}-{slug}.png").exists():
-                start_idx += 1
-                if start_idx > 999:
-                    break
+            missing_cover_slots = list(range(1, target_n + 1))
+            print(
+                f"[cover] full set — re-generating {len(missing_cover_slots)}",
+                flush=True,
+            )
         else:
-            cover_n = target_n
-            start_idx = 1
+            # generate with some present → fill gaps (same as complete)
+            missing_cover_slots = [
+                i for i in range(1, target_n + 1) if i not in existing_cover_map
+            ]
+        cover_n = len(missing_cover_slots)
         images: List[Path] = []
-        print(f"[cover] target={target_n} have={have_n} generating={cover_n}", flush=True)
-        configure.APP_STATE["cover_slot_expected"] = cover_n
-        configure.APP_STATE["cover_slot_queued"] = list(range(cover_n))
+        print(
+            f"[cover] target={target_n} have={have_n} generating={cover_n} "
+            f"slots={missing_cover_slots}",
+            flush=True,
+        )
+        if cover_n <= 0:
+            result["success"] = True
+            result["message"] = f"Cover images already complete ({have_n}/{target_n})."
+            result["project_folder"] = str(project_dir)
+            result["session_id"] = project_dir.name
+            result["image_count"] = have_n
+            configure.APP_STATE["session_status"] = "idle"
+            return result
+        configure.APP_STATE["cover_slot_expected"] = target_n
+        configure.APP_STATE["cover_slot_queued"] = [s - 1 for s in missing_cover_slots]
         configure.APP_STATE["cover_slot_generating"] = None
-        for i in range(cover_n):
+        for i, idx in enumerate(missing_cover_slots):
             if is_cancel_requested():
                 break
             cq = list(configure.APP_STATE.get("cover_slot_queued") or [])
-            if i in cq:
-                cq = [x for x in cq if x != i]
+            slot0 = idx - 1
+            if slot0 in cq:
+                cq = [x for x in cq if x != slot0]
             configure.APP_STATE["cover_slot_queued"] = cq
-            configure.APP_STATE["cover_slot_generating"] = i
-            idx = start_idx + i
+            configure.APP_STATE["cover_slot_generating"] = slot0
             dest = project_dir / f"cover-{idx:02d}-{slug}.png"
             clear_still_markers()
             if progress_callback:
                 progress_callback(
                     f"Generating cover still {i + 1}/{cover_n}…",
                     0.35 + 0.55 * (i / max(cover_n, 1)),
-                    {"phase": "cover", "line": i + 1, "total": cover_n},
+                    {"phase": "cover", "line": idx, "total": target_n},
                 )
-            print(f"[cover] {i + 1}/{cover_n} — {dest.name}", flush=True)
+            print(f"[cover] {i + 1}/{cover_n} — {dest.name} (slot {idx}/{target_n})", flush=True)
             var_bit = (
-                f" Variation {i + 1} of {cover_n}: alternate angle or crop emphasis."
-                if cover_n > 1 else ""
+                f" Variation {idx} of {target_n}: alternate angle or crop emphasis."
+                if target_n > 1 else ""
             )
             cfg_cover = dict(cfg)
             cfg_cover["cover_mode"] = True
@@ -4735,8 +4765,17 @@ def generate_theme_images(
             result["session_id"] = project_dir.name
             configure.APP_STATE["session_status"] = "idle"
             return result
-        existing_themes = sorted(project_dir.glob("theme-*.png"))
-        existing_theme_n = len(existing_themes)
+        # Map 1-based slot index → path (ignore in-progress __partial__ files)
+        existing_map: Dict[int, Path] = {}
+        for p in project_dir.glob("theme-*.png"):
+            if ".__partial__" in p.name.lower():
+                continue
+            m = re.match(r"theme-(\d+)", p.name, re.I)
+            if m:
+                idx = int(m.group(1))
+                if idx > 0:
+                    existing_map[idx] = p
+        existing_theme_n = len(existing_map)
         gen_mode = str(
             cfg.get("gen_mode")
             or configure.APP_STATE.get("gen_mode")
@@ -4744,39 +4783,61 @@ def generate_theme_images(
         ).strip().lower()
         if gen_mode not in ("generate", "regenerate", "complete"):
             gen_mode = "generate"
-        if gen_mode == "regenerate" and existing_themes:
-            for old in existing_themes:
+
+        # Decide which 1-based slot numbers to (re)generate
+        if gen_mode == "regenerate" and existing_map:
+            for old in list(existing_map.values()):
                 try:
                     old.unlink()
                 except OSError:
                     pass
+            existing_map.clear()
             existing_theme_n = 0
-            theme_n = target_theme
-            print(f"[theme] regenerate — wiped existing, generating {theme_n}", flush=True)
-        elif gen_mode == "complete" and existing_theme_n > 0:
-            theme_n = max(0, target_theme - existing_theme_n)
-            print(f"[theme] complete — filling {theme_n} missing slot(s)", flush=True)
+            missing_slots = list(range(1, target_theme + 1))
+            print(f"[theme] regenerate — wiped existing, generating {len(missing_slots)}", flush=True)
+        elif gen_mode == "complete":
+            # Fill every empty index in 1..target (gaps + tail). Never wipe.
+            missing_slots = [i for i in range(1, target_theme + 1) if i not in existing_map]
+            print(
+                f"[theme] complete — filling {len(missing_slots)} missing slot(s) "
+                f"of target {target_theme}",
+                flush=True,
+            )
         elif existing_theme_n >= target_theme:
-            for old in existing_themes:
+            for old in list(existing_map.values()):
                 try:
                     old.unlink()
                 except OSError:
                     pass
+            existing_map.clear()
             existing_theme_n = 0
-            theme_n = target_theme
-            print(f"[theme] full set — re-generating {theme_n}", flush=True)
-        elif existing_theme_n > 0:
-            theme_n = target_theme - existing_theme_n
+            missing_slots = list(range(1, target_theme + 1))
+            print(f"[theme] full set — re-generating {len(missing_slots)}", flush=True)
         else:
-            theme_n = target_theme
+            # generate with some already present → same as complete (fill gaps)
+            missing_slots = [i for i in range(1, target_theme + 1) if i not in existing_map]
+
+        theme_n = len(missing_slots)
         style = str(cfg.get("style") or configure.STYLE_DEFAULT)
         print(
             f"[theme] frequency = {freq_label} → target={target_theme} "
-            f"have={existing_theme_n} generating={theme_n}",
+            f"have={existing_theme_n} generating={theme_n} slots={missing_slots[:12]}"
+            f"{'…' if len(missing_slots) > 12 else ''}",
             flush=True,
         )
 
-        # Phase 1b: thinking model writes frequency theme prompts from OVERALL
+        if theme_n <= 0:
+            result["success"] = True
+            result["message"] = (
+                f"Theme images already complete ({existing_theme_n}/{target_theme})."
+            )
+            result["project_folder"] = str(project_dir)
+            result["session_id"] = project_dir.name
+            result["image_count"] = existing_theme_n
+            configure.APP_STATE["session_status"] = "idle"
+            return result
+
+        # Phase 1b: thinking model writes one ambient prompt per missing slot
         theme_prompts = generate_theme_prompts_from_assessment(
             analysis, cfg, theme_n,
             song_name=song_name or label,
@@ -4786,12 +4847,16 @@ def generate_theme_images(
             result["message"] = "Could not derive theme prompts from the assessment."
             configure.APP_STATE["session_status"] = "stopped"
             return result
+        # Ensure we have one prompt per missing slot (pad/trim)
+        while len(theme_prompts) < theme_n and theme_prompts:
+            theme_prompts.append(theme_prompts[-1])
+        theme_prompts = theme_prompts[:theme_n]
 
         try:
             with open(project_dir / "theme_prompts.txt", "w", encoding="utf-8") as f:
                 f.write("OVERALL\n" + (analysis.get("overall") or "") + "\n\n")
-                for i, pr in enumerate(theme_prompts, 1):
-                    f.write(f"=== theme {i} ===\n{pr}\n\n")
+                for slot_no, pr in zip(missing_slots, theme_prompts):
+                    f.write(f"=== theme {slot_no} ===\n{pr}\n\n")
         except OSError:
             pass
 
@@ -4810,24 +4875,20 @@ def generate_theme_images(
 
         images: List[Path] = []
         total = len(theme_prompts)
-        # Start numbering after any existing theme-NN files so re-runs accumulate
-        base_idx = 0
-        for p in project_dir.glob("theme-*.png"):
-            m = re.match(r"theme-(\d+)", p.name, re.I)
-            if m:
-                base_idx = max(base_idx, int(m.group(1)))
-        # Thumbnail queue: all slots qued, then each becomes generating
-        configure.APP_STATE["theme_slot_expected"] = total
-        configure.APP_STATE["theme_slot_queued"] = list(range(total))
+        # UI expects full target so the grid shows all slots, not just missing
+        configure.APP_STATE["theme_slot_expected"] = target_theme
+        # Queue uses 0-based indices matching the missing 1-based slots
+        configure.APP_STATE["theme_slot_queued"] = [s - 1 for s in missing_slots]
         configure.APP_STATE["theme_slot_generating"] = None
-        for i, tprompt in enumerate(theme_prompts):
+        for i, (slot_no, tprompt) in enumerate(zip(missing_slots, theme_prompts)):
             if is_cancel_requested():
                 break
             q = list(configure.APP_STATE.get("theme_slot_queued") or [])
-            if i in q:
-                q = [x for x in q if x != i]
+            slot0 = slot_no - 1
+            if slot0 in q:
+                q = [x for x in q if x != slot0]
             configure.APP_STATE["theme_slot_queued"] = q
-            configure.APP_STATE["theme_slot_generating"] = i
+            configure.APP_STATE["theme_slot_generating"] = slot0
             # Theme = ambient worldspace only (no people, no reference image).
             # Do NOT use STYLE_PROMPT_TEMPLATES — they say "Subject of the image"
             # and push Flux toward portraits.
@@ -4856,9 +4917,8 @@ def generate_theme_images(
                 "Empty environment only — no people, no faces, no figures, "
                 "no humanoid subjects, no character portraits."
             ).strip()
-            theme_no = base_idx + i + 1
             fname = (
-                f"theme-{theme_no:02d}-"
+                f"theme-{slot_no:02d}-"
                 f"{_ascii_line_slug(song_name or label, max_len=32) or 'theme'}.png"
             )
             dest = project_dir / fname
@@ -4867,9 +4927,13 @@ def generate_theme_images(
                 progress_callback(
                     f"encoding & generating still",
                     0.35 + 0.55 * (i / max(total, 1)),
-                    {"phase": "theme", "line": i + 1, "total": total},
+                    {"phase": "theme", "line": slot_no, "total": target_theme},
                 )
-            print(f"[theme] {i + 1}/{total} — {fname} (no character / no ref)", flush=True)
+            print(
+                f"[theme] {i + 1}/{total} — {fname} "
+                f"(slot {slot_no}/{target_theme}, no character / no ref)",
+                flush=True,
+            )
             try:
                 cfg_theme = dict(cfg)
                 cfg_theme["ambient_mode"] = True
@@ -4880,7 +4944,7 @@ def generate_theme_images(
                 )
                 images.append(out)
             except Exception as e:
-                print(f"[theme] failed theme {i + 1}: {e}", flush=True)
+                print(f"[theme] failed theme slot {slot_no}: {e}", flush=True)
                 raise
 
         elapsed = time.time() - t0

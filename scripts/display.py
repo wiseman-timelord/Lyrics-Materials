@@ -2244,7 +2244,7 @@ def _build_create_tab() -> None:
                         maximum=configure.COVER_COUNT_MAX,
                         step=1,
                         scale=1,
-                        info=f"{configure.COVER_COUNT_MIN}–{configure.COVER_COUNT_MAX} (updates on release)",
+                        info=f"{configure.COVER_COUNT_MIN}–{configure.COVER_COUNT_MAX}",
                     )
                     _gen["theme_count"] = gr.Slider(
                         label="Theme (T)",
@@ -2253,7 +2253,7 @@ def _build_create_tab() -> None:
                         maximum=configure.THEME_COUNT_MAX,
                         step=1,
                         scale=1,
-                        info=f"{configure.THEME_COUNT_MIN}–{configure.THEME_COUNT_MAX} (updates on release)",
+                        info=f"{configure.THEME_COUNT_MIN}–{configure.THEME_COUNT_MAX}",
                     )
                     _gen["lyrics_per_line"] = gr.Slider(
                         label="Lyrics/line (L)",
@@ -2262,7 +2262,7 @@ def _build_create_tab() -> None:
                         maximum=configure.LYRICS_PER_LINE_MAX,
                         step=1,
                         scale=1,
-                        info=f"{configure.LYRICS_PER_LINE_MIN}–{configure.LYRICS_PER_LINE_MAX} variants (updates on release)",
+                        info=f"{configure.LYRICS_PER_LINE_MIN}–{configure.LYRICS_PER_LINE_MAX} variants",
                     )
                     # Hidden synthesised label kept for any residual readers
                     _gen["image_frequency"] = gr.Textbox(
