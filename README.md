@@ -1,5 +1,5 @@
 # Lyrics-Materials
-Status: Beta - Mid-Late development, its almost there since v0.30. phase now is testing and refining. Some things are buggy, but this is being worked on, and otherwise it does what it shows in the screenshots. Update v0.35; finally saw negative prompt refinement and no more ghosts and no more duplicate reference image characters. Return to installer testing soon, as program working good now. 
+Status: Beta - Mid-Late development, its mostly there since v0.30. phase now is longer testing and refining (it takes long). Some things are buggy, but this will be worked on too. 
 
 ### Description:
 It convert lines of lyrics into AI generated images, one for each line. The idea is one could arrange these in a movie editor, and fade in/out between sections of images with theme images in the non-lyrics parts for fillers, to make simple music videos. One could also take the line of lyrics and the generated images, and feed that into AI video generator to make clips, that could then be assembled into a video.
