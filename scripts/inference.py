@@ -84,6 +84,18 @@ def last_image_gen_seconds() -> float:
 #   still_finished_at    wall-clock moment that still was saved
 #   still_done_seq       counter bumped on every saved still; UI loops watch it
 #                        to break out of the timer/percent loop immediately
+#
+# CRITICAL — MUST close the timer the instant the image is on disk:
+#   When sd-cli has written the PNG, call mark_still_saved() AT ONCE (via
+#   _on_saved / ensure_still_marked). That:
+#     1. records the true wall time as last_image_gen_seconds (next estimate),
+#     2. clears image_gen_t0 so the UI percent/elapsed stops climbing,
+#     3. bumps still_done_seq so every _job_stream loop exits its timer tick
+#        on the very next pass and moves on to the next still.
+#   If you wait for process exit / teardown, the measured time ratchets up to
+#   the longest run seen so far and every subsequent still inherits that
+#   inflated estimate. Detection + mark_still_saved MUST fire on file-ready
+#   or log-save, never on process returncode.
 # ---------------------------------------------------------------------------
 
 def mark_still_started(t0: Optional[float] = None) -> None:
@@ -147,10 +159,15 @@ def _out_path_from_cmd(cmd: List[str]) -> Optional[Path]:
 
 def _still_file_ready(path: Optional[Path], since: float, prev_size: int) -> Tuple[bool, int]:
     """
-    True once sd-cli's output file is fully written (PNG: IEND trailer present;
-    other formats: size unchanged across two polls). Files older than `since`
-    are ignored so a previous still at the same path is never mistaken for the
-    new one. Returns (ready, current_size).
+    True once sd-cli's output file is fully written.
+
+    PNG preferred signal: IEND trailer present (file closed / flushed).
+    Fallback for both PNG and other formats: size unchanged across two polls
+    and already large enough — covers sd-cli builds that keep the FILE*
+    open until process exit (IEND only appears on fclose at teardown).
+
+    Files older than `since` are ignored so a previous still at the same path
+    is never mistaken for the new one. Returns (ready, current_size).
     """
     if path is None:
         return False, 0
@@ -160,14 +177,19 @@ def _still_file_ready(path: Optional[Path], since: float, prev_size: int) -> Tup
         return False, 0
     if st.st_mtime < since - 1.0 or st.st_size < 64:
         return False, st.st_size
+    size_stable = prev_size > 0 and st.st_size == prev_size and st.st_size >= 4096
     if path.suffix.lower() == ".png":
         try:
             with open(path, "rb") as f:
                 f.seek(-12, os.SEEK_END)
-                return f.read(12) == _PNG_IEND, st.st_size
+                if f.read(12) == _PNG_IEND:
+                    return True, st.st_size
         except OSError:
-            return False, st.st_size
-    return (prev_size > 0 and st.st_size == prev_size), st.st_size
+            pass
+        # Fallback: size stable means the write has finished even if the
+        # process has not yet closed the handle (IEND not visible yet).
+        return size_stable, st.st_size
+    return size_stable, st.st_size
 
 
 def maybe_bleep_section() -> None:
@@ -2196,7 +2218,12 @@ def _run_sd_cli_once(cmd: List[str], exe: Path, timeout: float = 600.0) -> Tuple
 # Seconds sd-cli is allowed to keep running after its image is on disk
 # (model teardown / VRAM release). Past this it is stopped so the next image
 # or phase can start immediately.
-_SD_POST_SAVE_GRACE = 3.0
+#
+# MUST be short. The measured still time is taken at the moment the image
+# is detected on disk (mark_still_saved). Leaving the process alive does not
+# change that measurement, but a long grace delays the *next* still and can
+# make the UI appear stuck on the previous estimate. Keep this under 2s.
+_SD_POST_SAVE_GRACE = 1.5
 
 
 def _run_sd_cli_once_unlocked(cmd: List[str], exe: Path, timeout: float = 600.0) -> Tuple[str, int]:
@@ -2245,7 +2272,12 @@ def _run_sd_cli_once_unlocked(cmd: List[str], exe: Path, timeout: float = 600.0)
     last_file_poll = 0.0
 
     def _on_saved(via: str) -> None:
-        """Image is on disk — stop the timer, store the time, signal the UI NOW."""
+        """Image is on disk — MUST stop the timer, store the time, signal the UI NOW.
+
+        This is the single point that prevents the estimate from ratcheting to
+        the longest time seen so far. Call as soon as the PNG is complete
+        (file watch or log line). Do NOT wait for process exit.
+        """
         nonlocal saved_ok, saved_at
         if saved_ok:
             return
@@ -2255,7 +2287,8 @@ def _run_sd_cli_once_unlocked(cmd: List[str], exe: Path, timeout: float = 600.0)
             wall = mark_still_saved(saved_at - t0)
             print(
                 f"[sd-cli] image saved ({via}) — timer stopped at {wall:.1f}s; "
-                f"estimate for the next still is now {wall:.0f}s",
+                f"estimate for the next still is now {wall:.0f}s "
+                f"(MUST close early so next still does not inherit a longer time)",
                 flush=True,
             )
         except Exception:
@@ -2289,7 +2322,19 @@ def _run_sd_cli_once_unlocked(cmd: List[str], exe: Path, timeout: float = 600.0)
                     tail = tail[-200:]
                 print(f"[sd-cli] {text_line}", flush=True)
                 low = text_line.lower()
-                if "images saved" in low or ("save result" in low and "success" in low):
+                # Broad save-signal match: different sd.cpp builds phrase the
+                # final write differently. Any of these MUST trigger early close.
+                if (
+                    "images saved" in low
+                    or "image saved" in low
+                    or "saved to" in low
+                    or "wrote image" in low
+                    or "output written" in low
+                    or "successfully saved" in low
+                    or "saved successfully" in low
+                    or ("save result" in low and "success" in low)
+                    or ("save" in low and "success" in low and "fail" not in low)
+                ):
                     _on_saved("log")
                 if not model_loaded and ("load" in low) and any(
                     k in low for k in ("loaded", "load model", "diffusion", "vae", "tensor")
@@ -2297,8 +2342,11 @@ def _run_sd_cli_once_unlocked(cmd: List[str], exe: Path, timeout: float = 600.0)
                     model_loaded = True
                     print(f"[sd-cli] *** MODEL ACTIVITY ({time.time() - t0:.1f}s) ***", flush=True)
             # Do not rely on log text alone: also watch the output file.
+            # Poll every ~0.5s — frequent enough to close the timer promptly
+            # after the write completes (MUST close early — see bookkeeping
+            # comment) without busy-spinning the file system.
             now = time.time()
-            if not saved_ok and out_path is not None and now - last_file_poll >= 0.2:
+            if not saved_ok and out_path is not None and now - last_file_poll >= 0.5:
                 last_file_poll = now
                 ready, prev_size = _still_file_ready(out_path, t0, prev_size)
                 if ready:
@@ -2306,10 +2354,12 @@ def _run_sd_cli_once_unlocked(cmd: List[str], exe: Path, timeout: float = 600.0)
             # Image is saved: give sd-cli a short grace to exit by itself, then
             # release it so the timer loop, the next image and the next phase
             # are never held up by process teardown.
+            # MUST kill promptly — otherwise the UI stays on this still and the
+            # measured time can only grow (ratchet to longest-so-far).
             if saved_ok and proc.poll() is None and (time.time() - saved_at) > _SD_POST_SAVE_GRACE:
                 print(
                     f"[sd-cli] still running {time.time() - saved_at:.1f}s after save — "
-                    "releasing it so the next step can start",
+                    "releasing it so the next step can start (early close required)",
                     flush=True,
                 )
                 released_after_save = True

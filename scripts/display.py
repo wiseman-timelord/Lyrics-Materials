@@ -719,15 +719,23 @@ def _format_progress_line(msg: str, frac: float, info: dict) -> str:
     """
     One status-bar line that is aware of the per-still timer.
 
-      generating : [ 61%] cover Image 1/1 Generating cover still…65s (est 106s)
-      just saved : [100%] cover Image 1/1 Generating cover still — saved in 65s (next est 65s)
+      generating : images Image 8/44 Taking the long way…296s [92%] (est 322s)
+      just saved : images Image 8/44 Taking the long way — saved in 110s (next est 110s)
+
+    Percent sits at the END of the line, between elapsed time and the previous
+    estimate:  …{elapsed}s [{pct}%] (est {last}s)
 
     While a still generates, the percent is THAT still's own progress
     (elapsed / estimate). The instant sd-cli has written the image the backend
-    stores the measured time as the new estimate (last_image_gen_seconds),
-    clears the live timer and bumps still_done_seq; this line then shows the
-    finished state at once, and the next still starts again from 0% with the
-    updated estimate. Nothing here ever waits for the estimate to be "used up".
+    MUST call mark_still_saved: that stores the measured time as the new
+    estimate (last_image_gen_seconds), clears the live timer and bumps
+    still_done_seq. This line then shows the finished state at once, and the
+    next still starts again from 0% with the updated estimate.
+
+    Nothing here ever waits for the estimate to be "used up". If the timer
+    were allowed to run to the previous estimate after the image was already
+    on disk, every subsequent still would inherit the longest time seen so
+    far — that is exactly the ratchet bug this path prevents.
     """
     info = info or {}
     phase = str(info.get("phase", "") or "")
@@ -754,7 +762,9 @@ def _format_progress_line(msg: str, frac: float, info: dict) -> str:
         f = 1.0  # this still is saved
     pct = int(round(max(0.0, min(1.0, f)) * 100))
 
-    bits = [f"[{pct:3d}%]"]
+    # Build body WITHOUT leading percent — percent goes at the end, between
+    # elapsed and estimate.
+    bits: list = []
     if phase and phase not in ("done",):
         bits.append(phase)
     msg_s = (msg or "").replace("\n", " ").strip()
@@ -780,7 +790,8 @@ def _format_progress_line(msg: str, frac: float, info: dict) -> str:
         return body[:240]
     if generating:
         body = body.rstrip(".…")
-        body = f"{body}…{int(elapsed)}s"
+        # …elapsed [pct%] (est last)  — percent between time-so-far and previous
+        body = f"{body}…{int(elapsed)}s [{pct:3d}%]"
         if last > 0:
             body = f"{body} (est {int(last)}s)"
     elif is_image and per_image and finished_secs > 0:
@@ -872,9 +883,10 @@ def _job_stream(
 
     * Every pass the status line is rebuilt from live state, so the timer,
       percent and estimate always describe what is happening NOW.
-    * The moment a still is saved (still_done_seq changes) the loop wakes,
-      refreshes the gallery once and shows the finished state; the next still
-      then starts from 0% with the new estimate.
+    * The moment a still is saved (still_done_seq changes) the loop MUST wake,
+      refresh the gallery once and show the finished state; the next still
+      then starts from 0% with the new estimate. Early wake is required so
+      we never keep counting up to a stale longer estimate.
     * Plain ticks are lightweight (status + buttons only). The heavy gallery
       refresh is sent only on real events, a saved still, or every
       `heavy_every` seconds as a safety net.
