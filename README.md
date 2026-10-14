@@ -2,7 +2,7 @@
 Status: Beta - Mid-Late development, its mostly there since v0.30. phase now is longer testing and refining (it takes long). Some things are buggy, but this will be worked on too. 
 
 ### Description:
-It convert lines of lyrics into AI generated images, one for each line. The idea is one could arrange these in a movie editor, and fade in/out between sections of images with theme images in the non-lyrics parts for fillers, to make simple music videos. One could also take the line of lyrics and the generated images, and feed that into AI video generator to make clips, that could then be assembled into a video.
+It convert lines of lyrics into AI generated images, up to 30 per line (20 is quite fast enough for me). The idea is one could arrange these in a movie editor, and tactically use theme images for fillers in the video or promotional material, so its a program to make simple AI music videos. One could also take the line of lyrics and the generated images, and feed that into AI video generator to make clips, that could then be assembled into a video clips.
 
 ### Media:
 - Here is the Initial Project Page where there is now better image frequency control (v0.26)...
