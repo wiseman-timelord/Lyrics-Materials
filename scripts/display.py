@@ -705,40 +705,80 @@ def _last_still_seconds() -> float:
         return 0.0
 
 
+# ---------------------------------------------------------------------------
+# PER-STILL TIMER — EARLY CLOSE (read before touching any of this)
+#
+#   MUST stop counting the instant the image is on disk. The backend
+#   (inference._run_sd_cli_once_unlocked -> mark_still_saved) clears
+#   image_gen_t0, stores the measured time as last_image_gen_seconds and bumps
+#   still_done_seq the moment the PNG is complete. The UI side must:
+#     * never keep counting up to the previous estimate ("Est") — the estimate
+#       is only a label, never a deadline or something to "run out";
+#     * never delay moving to the next still while waiting for a timer;
+#     * treat "finished marker newer than timer start" as NOT generating, so
+#       a late / stale tick can never resurrect a closed timer;
+#     * always read the estimate from last_image_gen_seconds, which holds the
+#       MOST RECENT still's time — never a running maximum.
+#   If the timer is allowed to run out instead of closing early, every still
+#   ends up taking the longest time seen so far in the active operation.
+# ---------------------------------------------------------------------------
+
 def _current_still_elapsed() -> float:
+    """Seconds the CURRENT still has been generating; 0.0 once it is saved."""
     t0 = configure.APP_STATE.get("image_gen_t0")
     if not t0:
         return 0.0
     try:
-        return max(0.0, time.time() - float(t0))
+        t0f = float(t0)
+        # Belt and braces for early close: a finish marker at/after this
+        # timer's start means the image already exists — the timer is CLOSED.
+        fin = configure.APP_STATE.get("still_finished_at")
+        if fin and float(fin) >= t0f:
+            return 0.0
+        return max(0.0, time.time() - t0f)
     except (TypeError, ValueError):
         return 0.0
 
 
 def _format_progress_line(msg: str, frac: float, info: dict) -> str:
     """
-    One status-bar line that is aware of the per-still timer.
+    One status-bar line that is aware of the per-still timer. No percent —
+    only wall-clock seconds and the previous still estimate.
 
-      generating : images Image 8/44 Taking the long way…296s [92%] (est 322s)
-      just saved : images Image 8/44 Taking the long way — saved in 110s (next est 110s)
+      generating : Lyrics Image 33/44, 26s (Est 205s): Eating tins of tinfoil…
+      just saved : Lyrics Image 33/44 — saved in 110s (next est 110s)
+      prompts    : Prompts 33/44: Eating tins of tinfoil…
 
-    Percent sits at the END of the line, between elapsed time and the previous
-    estimate:  …{elapsed}s [{pct}%] (est {last}s)
+    Phase labels:
+      images / regen → Lyrics
+      cover          → Cover
+      theme          → Theme
+      prompts        → Prompts
 
-    While a still generates, the percent is THAT still's own progress
-    (elapsed / estimate). The instant sd-cli has written the image the backend
-    MUST call mark_still_saved: that stores the measured time as the new
-    estimate (last_image_gen_seconds), clears the live timer and bumps
-    still_done_seq. This line then shows the finished state at once, and the
-    next still starts again from 0% with the updated estimate.
-
-    Nothing here ever waits for the estimate to be "used up". If the timer
-    were allowed to run to the previous estimate after the image was already
-    on disk, every subsequent still would inherit the longest time seen so
-    far — that is exactly the ratchet bug this path prevents.
+    While a still generates, elapsed comes from image_gen_t0. The instant
+    sd-cli has written the image the backend MUST call mark_still_saved:
+    that stores the measured time as the new estimate, clears the live
+    timer and bumps still_done_seq so this line switches to the finished
+    state at once. Nothing here ever waits for the estimate to be "used up".
     """
     info = info or {}
-    phase = str(info.get("phase", "") or "")
+    phase_raw = str(info.get("phase", "") or "").lower()
+    phase_label = {
+        "images": "Lyrics",
+        "regen": "Lyrics",
+        "cover": "Cover",
+        "theme": "Theme",
+        "prompts": "Prompts",
+        "analysis": "Assessment",
+        "barrier": "Barrier",
+        "project": "Project",
+        "parse": "Parse",
+        "plan": "Plan",
+        "done": "Done",
+        "error": "Error",
+        "stopped": "Stopped",
+    }.get(phase_raw, phase_raw.capitalize() if phase_raw else "")
+
     last = _last_still_seconds()
     elapsed = _current_still_elapsed()
     generating = elapsed > 0
@@ -750,54 +790,76 @@ def _format_progress_line(msg: str, frac: float, info: dict) -> str:
     total = info.get("total")
     per_image = line_n is not None and total is not None
     image_phases = ("images", "regen", "theme", "cover")
-    is_image = generating or phase in image_phases
-    terminal = phase in ("done", "error", "stopped")
+    is_image = generating or phase_raw in image_phases
+    terminal = phase_raw in ("done", "error", "stopped")
 
-    f = float(frac or 0.0)
-    if generating:
-        # Per-still percent from the estimate; first-ever still has no estimate
-        # yet, so it falls back to the pipeline fraction (never reaches 100%).
-        f = min(0.99, elapsed / last) if last > 1.0 else min(0.99, f)
-    elif is_image and per_image and finished_secs > 0 and not terminal:
-        f = 1.0  # this still is saved
-    pct = int(round(max(0.0, min(1.0, f)) * 100))
-
-    # Build body WITHOUT leading percent — percent goes at the end, between
-    # elapsed and estimate.
-    bits: list = []
-    if phase and phase not in ("done",):
-        bits.append(phase)
+    # Clean message: drop redundant "Image n/m" / "Prompt n/m" / phase prefixes
     msg_s = (msg or "").replace("\n", " ").strip()
     if per_image:
-        # Always show Image n/m once; drop the same counter from the message text.
-        bits.append(f"Image {int(line_n)}/{int(total)}")
         msg_s = re.sub(
-            rf"(?i)^(theme|image|cover|line)\s*{int(line_n)}\s*/\s*{int(total)}\s*[:.\-–—]?\s*",
+            rf"(?i)^(theme|image|cover|line|prompt|lyrics)\s*{int(line_n)}\s*/\s*{int(total)}\s*"
+            rf"(?:\[\s*\d+\s*/\s*\d+\s*\])?\s*[:.\-–—]?\s*",
             "",
             msg_s,
         ).strip()
         msg_s = re.sub(r"(?i)\bstill\s+\d+\s*/\s*\d+", "still", msg_s)
         if finished_secs > 0 and not generating:
             msg_s = re.sub(r"(?i)\s*\bdone\s*\(\d+s\)", "", msg_s).strip()
-    if msg_s:
-        bits.append(msg_s)
-    body = " ".join(bits).strip()
+    if phase_label:
+        msg_s = re.sub(
+            rf"(?i)^\s*{re.escape(phase_label)}\s*[:.\-–—]?\s*",
+            "",
+            msg_s,
+        ).strip()
+
+    # Head: "Lyrics Image 33/44" or "Prompts 33/44" or just phase label
+    head_parts: list = []
+    if phase_label and phase_raw not in ("done",):
+        if per_image and phase_raw in image_phases:
+            head_parts.append(f"{phase_label} Image {int(line_n)}/{int(total)}")
+        elif per_image:
+            head_parts.append(f"{phase_label} {int(line_n)}/{int(total)}")
+        else:
+            head_parts.append(phase_label)
+    elif per_image:
+        head_parts.append(f"Image {int(line_n)}/{int(total)}")
+    head = " ".join(head_parts).strip()
 
     if terminal:
+        body = head
+        if msg_s:
+            body = f"{body}: {msg_s}" if body else msg_s
         shown = finished_secs if finished_secs > 0 else last
-        if shown > 0 and "last" not in body.lower():
-            body = f"{body} (last {int(shown)}s)"
-        return body[:240]
+        if shown > 0 and "last" not in (body or "").lower():
+            body = f"{body} (last {int(shown)}s)" if body else f"(last {int(shown)}s)"
+        return (body or "Done.")[:240]
+
     if generating:
-        body = body.rstrip(".…")
-        # …elapsed [pct%] (est last)  — percent between time-so-far and previous
-        body = f"{body}…{int(elapsed)}s [{pct:3d}%]"
+        # Lyrics Image 33/44, 26s (Est 205s): <msg>
+        timer = f"{int(elapsed)}s"
         if last > 0:
-            body = f"{body} (est {int(last)}s)"
-    elif is_image and per_image and finished_secs > 0:
-        body = body.rstrip(".…")
+            timer = f"{timer} (Est {int(last)}s)"
+        if head:
+            body = f"{head}, {timer}"
+        else:
+            body = timer
+        if msg_s:
+            body = f"{body}: {msg_s}"
+        return body[:240]
+
+    if is_image and per_image and finished_secs > 0:
+        # Lyrics Image 33/44 — saved in 110s (next est 110s)
+        body = head or phase_label or "Image"
         body = f"{body} — saved in {finished_secs:.0f}s (next est {finished_secs:.0f}s)"
-    return body[:240]
+        if msg_s:
+            body = f"{body}: {msg_s}"
+        return body[:240]
+
+    # Non-image / idle phases (prompts, assessment, …) — no timer
+    body = head
+    if msg_s:
+        body = f"{body}: {msg_s}" if body else msg_s
+    return (body or "Ready.")[:240]
 
 
 def _status_from_progress(msg: str, frac: float, info: dict) -> str:
@@ -807,7 +869,6 @@ def _status_from_progress(msg: str, frac: float, info: dict) -> str:
 
 def _status_plain(msg: str, frac: float = 0.0) -> str:
     return (msg or "Ready.").replace("\n", " ").strip()[:240]
-
 
 
 _ASSESS_START_MSG = "Starting the Assessment of Lyrics..."
@@ -830,7 +891,6 @@ def _live_status_line(default_msg: str = "", default_info: Optional[dict] = None
         frac = 0.0
     info = configure.APP_STATE.get("status_last_info") or default_info or {}
     return _status_from_progress(msg, frac, info)
-
 
 def _still_done_seq() -> int:
     try:
@@ -885,8 +945,9 @@ def _job_stream(
       percent and estimate always describe what is happening NOW.
     * The moment a still is saved (still_done_seq changes) the loop MUST wake,
       refresh the gallery once and show the finished state; the next still
-      then starts from 0% with the new estimate. Early wake is required so
-      we never keep counting up to a stale longer estimate.
+      then starts from 0 with the new estimate. EARLY CLOSE IS REQUIRED: the
+      timer must never keep counting up to the old (longer) estimate, or every
+      still ends up taking the longest time seen so far.
     * Plain ticks are lightweight (status + buttons only). The heavy gallery
       refresh is sent only on real events, a saved still, or every
       `heavy_every` seconds as a safety net.
@@ -3791,7 +3852,7 @@ def _wire_create_events(status_box) -> None:
             configure.APP_STATE["thumb_queued_lines"] = []
 
         yield (
-            _status_plain("[  0%] start  Starting lyrics slideshow pipeline…"),
+            _status_plain("Starting lyrics slideshow pipeline…"),
             *run_btns, active_session_id or "",
         ) + _gallery_sessions_tab(active_session_id or "")
 

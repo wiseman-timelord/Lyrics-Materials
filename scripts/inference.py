@@ -48,14 +48,35 @@ def _play_bleep(count: int = 1) -> None:
 
 
 
-def record_last_image_gen_seconds(elapsed: float) -> None:
-    """Persist the time taken for the most recent successful still generation."""
+_PERSIST_LAST_LOCK = threading.Lock()
+
+
+def record_last_image_gen_seconds(elapsed: float, *, persist_async: bool = True) -> None:
+    """
+    Store the time taken for the most recent successful still generation.
+
+    The in-memory value (what the UI reads for "Est") is updated IMMEDIATELY.
+    Writing generation.json can stall on Windows (antivirus / sharing
+    violations / retry back-off), so it happens on a background thread and
+    can never delay closing the timer.
+    """
     try:
         sec = round(float(elapsed), 1)
         if sec <= 0:
             return
-        configure.update_generation({"last_image_gen_seconds": sec})
         configure.APP_STATE["last_image_gen_seconds"] = sec
+
+        def _persist() -> None:
+            try:
+                with _PERSIST_LAST_LOCK:
+                    configure.update_generation({"last_image_gen_seconds": sec})
+            except Exception:
+                pass
+
+        if persist_async:
+            threading.Thread(target=_persist, daemon=True).start()
+        else:
+            _persist()
     except Exception:
         pass
 
@@ -85,7 +106,9 @@ def last_image_gen_seconds() -> float:
 #   still_done_seq       counter bumped on every saved still; UI loops watch it
 #                        to break out of the timer/percent loop immediately
 #
-# CRITICAL — MUST close the timer the instant the image is on disk:
+# CRITICAL — MUST close the timer the instant the image is on disk
+# (EARLY CLOSE — never run the timer out to the old estimate, never wait for
+#  process exit; otherwise the estimate ratchets to the LONGEST time so far):
 #   When sd-cli has written the PNG, call mark_still_saved() AT ONCE (via
 #   _on_saved / ensure_still_marked). That:
 #     1. records the true wall time as last_image_gen_seconds (next estimate),
@@ -113,20 +136,27 @@ def clear_still_markers() -> None:
 
 def mark_still_saved(wall: float) -> float:
     """
-    The still is on disk. Store its measured duration as the new estimate,
-    stop the live timer and bump still_done_seq so every UI loop leaves its
-    timer/percent loop on its very next pass.
+    The still is on disk. MUST be called the instant the image is complete.
+
+    Order matters — everything the UI looks at is updated in memory FIRST, with
+    no disk I/O in between:
+      1. live timer stopped (image_gen_t0 = None)
+      2. measured time stored as the estimate for the NEXT still
+      3. still_done_seq bumped so every UI loop leaves its timer tick now
+    Only then is the estimate persisted (background thread).
     """
-    sec = max(0.1, float(wall))
-    record_last_image_gen_seconds(sec)
-    configure.APP_STATE["image_gen_t0"] = None
-    configure.APP_STATE["still_finished_secs"] = round(sec, 1)
-    configure.APP_STATE["still_finished_at"] = time.time()
+    sec = round(max(0.1, float(wall)), 1)
+    now = time.time()
+    configure.APP_STATE["image_gen_t0"] = None                 # 1. stop the timer
+    configure.APP_STATE["last_image_gen_seconds"] = sec        # 2. next estimate
+    configure.APP_STATE["still_finished_secs"] = sec
+    configure.APP_STATE["still_finished_at"] = now
     try:
         seq = int(configure.APP_STATE.get("still_done_seq") or 0) + 1
     except (TypeError, ValueError):
         seq = 1
-    configure.APP_STATE["still_done_seq"] = seq
+    configure.APP_STATE["still_done_seq"] = seq                # 3. wake the UI
+    record_last_image_gen_seconds(sec)                         # disk: async, last
     return sec
 
 
@@ -358,14 +388,26 @@ def _apply_worker_affinity(proc) -> None:
 
 
 def _worker_thread_count(cfg: Optional[Dict[str, Any]] = None) -> int:
+    """
+    Threads for llama / sd-cli (-t).
+
+    MUST NOT exceed the number of cores the process is pinned to
+    (_apply_worker_affinity uses configure.get_worker_threads(), which is
+    clamped to logical-cores minus the 2 reserved ones). ggml's thread pool
+    spin-waits, so more threads than cores makes every CPU stage (VAE decode,
+    reference encode, CPU text-encode) several times slower — every still then
+    takes far longer than it should, every time.
+    """
+    pinned = configure.get_worker_threads()          # same value the mask uses
+    want = 0
     if cfg:
         try:
-            n = int(cfg.get("worker_threads") or cfg.get("encoder_threads") or 0)
-            if n >= configure.WORKER_THREADS_MIN:
-                return n
+            want = int(cfg.get("worker_threads") or cfg.get("encoder_threads") or 0)
         except (TypeError, ValueError):
-            pass
-    return configure.get_worker_threads()
+            want = 0
+    if want >= configure.WORKER_THREADS_MIN:
+        return max(configure.WORKER_THREADS_MIN, min(want, pinned))
+    return pinned
 
 
 def find_llama_completion() -> Optional[Path]:
@@ -2094,7 +2136,7 @@ def generate_visual_prompts(
               flush=True)
         if progress_callback:
             progress_callback(
-                f"Prompt {line_no}/{total}: {line[:60]}",
+                f"{line[:80]}",
                 0.10 + 0.25 * (i / max(total, 1)),
                 {"phase": "prompts", "line": line_no, "total": total},
             )
@@ -2215,15 +2257,87 @@ def _run_sd_cli_once(cmd: List[str], exe: Path, timeout: float = 600.0) -> Tuple
         return _run_sd_cli_once_unlocked(cmd, exe, timeout=timeout)
 
 
+# ---------------------------------------------------------------------------
+# sd-cli runner — EARLY CLOSE ON IMAGE OUTPUT
+#
+# !!! MUST CLOSE THE TIMER THE INSTANT THE IMAGE EXISTS !!!
+#
+#   The per-still time is measured from sd-cli start to the moment the PNG is
+#   complete on disk — NOT to process exit, and NOT to "the estimate ran out".
+#   That measurement becomes last_image_gen_seconds, i.e. the "Est" shown for
+#   the NEXT still. If detection is late, or the timer is left running until
+#   the old estimate is used up, the measured time can only grow and every
+#   later still inherits the LONGEST time seen so far (the bug this block
+#   exists to prevent).
+#
+#   Rules this runner follows — keep them:
+#     1. Detection NEVER depends on the console. Two independent detectors run
+#        on their own threads: the stdout reader (log "save result … success")
+#        and a file watcher (PNG complete). Whichever fires first calls
+#        _on_saved(); the main loop only prints, enforces cancel/timeout and
+#        releases the process.
+#     2. _on_saved() stops the live timer and bumps still_done_seq in memory
+#        FIRST (no disk I/O on that path); persisting the estimate happens
+#        afterwards on a background thread.
+#     3. After the save, sd-cli gets only _SD_POST_SAVE_GRACE seconds to exit
+#        on its own, then it is killed so the next still starts immediately.
+#     4. Console output is written in batches and is throttled after the save,
+#        so a slow Windows console can never delay steps 1-3.
+# ---------------------------------------------------------------------------
+
 # Seconds sd-cli is allowed to keep running after its image is on disk
 # (model teardown / VRAM release). Past this it is stopped so the next image
 # or phase can start immediately.
 #
-# MUST be short. The measured still time is taken at the moment the image
-# is detected on disk (mark_still_saved). Leaving the process alive does not
-# change that measurement, but a long grace delays the *next* still and can
-# make the UI appear stuck on the previous estimate. Keep this under 2s.
-_SD_POST_SAVE_GRACE = 1.5
+# MUST be short (<= ~1.5s). The still time is already frozen at detection, but
+# a long grace delays the NEXT still and makes the UI look stuck.
+_SD_POST_SAVE_GRACE = 1.0
+
+# File watcher poll interval (seconds). Small on purpose: this is what closes
+# the timer when the log line is missed or phrased differently by a build.
+_SD_FILE_WATCH_INTERVAL = 0.25
+
+# Max sd-cli log lines written to the console in ONE print() call, and the cap
+# applied once the image is already saved (nothing after the save is urgent).
+_SD_CONSOLE_BATCH = 200
+_SD_CONSOLE_BATCH_AFTER_SAVE = 25
+
+
+# sd.cpp progress bar line, e.g. "  |=====>      | 3/12 - 18.42s/it"  (or "it/s")
+_SD_STEP_RE = re.compile(r"(\d+)\s*/\s*(\d+)\s*-\s*([\d.]+)\s*(s/it|it/s)")
+
+
+def _png_has_iend(path: Optional[Path]) -> bool:
+    """True when a PNG's closing IEND chunk is present (file fully written)."""
+    if path is None:
+        return False
+    try:
+        with open(path, "rb") as f:
+            f.seek(-12, os.SEEK_END)
+            return f.read(12) == _PNG_IEND
+    except OSError:
+        return False
+
+
+def _sd_line_means_saved(low: str) -> bool:
+    """
+    True when an (already lower-cased) sd-cli log line says the image was
+    written. Builds phrase the final write differently, so the match is broad;
+    explicit failure wording is the only veto.
+    """
+    if "(failure)" in low or "failed to save" in low or "failed to write" in low:
+        return False
+    return (
+        "images saved" in low
+        or "image saved" in low
+        or "saved to" in low
+        or "wrote image" in low
+        or "output written" in low
+        or "successfully saved" in low
+        or "saved successfully" in low
+        or ("save result" in low and "success" in low)
+        or ("save" in low and "success" in low)
+    )
 
 
 def _run_sd_cli_once_unlocked(cmd: List[str], exe: Path, timeout: float = 600.0) -> Tuple[str, int]:
@@ -2243,56 +2357,123 @@ def _run_sd_cli_once_unlocked(cmd: List[str], exe: Path, timeout: float = 600.0)
     # The live timer for THIS still starts exactly when sd-cli starts, so the
     # time measured at save is directly comparable with the estimate shown.
     mark_still_started(t0)
+    try:
+        _t_arg = int(cmd[cmd.index("-t") + 1]) if "-t" in cmd else 0
+        _cores = configure.affinity_core_list()
+        _logical = configure.get_cpu_info().get("cores_logical")
+        _warn = "  *** MORE THREADS THAN CORES — will be slow ***" if _t_arg > len(_cores) else ""
+        print(
+            f"[sd-cli] threads -t {_t_arg}; pinned to {len(_cores)} core(s) {_cores} "
+            f"(logical CPUs: {_logical}){_warn}",
+            flush=True,
+        )
+    except Exception:
+        pass
 
-    # Reader thread: readline() can block for many seconds with no output, so
-    # the main loop polls a queue and can also watch the output file itself.
     line_q: "queue.Queue[Optional[str]]" = queue.Queue()
+    marks: Dict[str, Any] = {"first_step": None, "last_step": None, "steps": 0,
+                             "total": 0, "sit_first": None, "sit_last": None}
+    saved_evt = threading.Event()      # set the instant the image is on disk
+    stop_watch = threading.Event()     # tells the file watcher to quit
+    saved_lock = threading.Lock()
+    state: Dict[str, float] = {"saved_at": 0.0}
+
+    def _on_saved(via: str) -> None:
+        """Image is on disk — MUST stop the timer, store the time, signal the UI NOW.
+
+        The single point that prevents the estimate ratcheting up to the
+        longest time seen so far. Called from the reader / watcher threads the
+        moment the image is complete. Never wait for process exit, never wait
+        for the old estimate to run out, never do disk I/O before this.
+        """
+        with saved_lock:
+            if saved_evt.is_set():
+                return
+            now = time.time()
+            state["saved_at"] = now
+            try:
+                # Stops image_gen_t0, stores the measured time as the next
+                # estimate, bumps still_done_seq (UI loops wake immediately).
+                wall = mark_still_saved(now - t0)
+            except Exception:
+                wall = now - t0
+            saved_evt.set()
+        print(
+            f"[sd-cli] image saved ({via}) — timer stopped at {wall:.1f}s; "
+            f"estimate for the next still is now {wall:.0f}s "
+            f"(MUST close early so next still does not inherit a longer time)",
+            flush=True,
+        )
+
+    def _note_step(ln: str) -> None:
+        """Record sampling-step progress lines ('| 3/12 - 18.4s/it') for the timing summary."""
+        m = _SD_STEP_RE.search(ln)
+        if not m:
+            return
+        try:
+            now = time.time()
+            n, tot = int(m.group(1)), int(m.group(2))
+            val = float(m.group(3))
+            sit = val if m.group(4) == "s/it" else (1.0 / val if val > 0 else 0.0)
+            if marks["first_step"] is None:
+                marks["first_step"], marks["sit_first"] = now, sit
+            marks["last_step"], marks["sit_last"] = now, sit
+            marks["steps"], marks["total"] = n, tot
+        except Exception:
+            pass
 
     def _reader(stream) -> None:
+        # Detector #1: every line is checked HERE, before it is queued for the
+        # console, so console speed can never delay the timer close.
         try:
             for ln in iter(stream.readline, ""):
+                if not saved_evt.is_set() and _sd_line_means_saved(ln.lower()):
+                    _on_saved("log")
+                _note_step(ln)
                 line_q.put(ln)
         except Exception:
             pass
         finally:
             line_q.put(None)
 
+    def _watcher() -> None:
+        # Detector #2: the output file itself. Independent of log wording.
+        prev_size = 0
+        stable_hits = 0
+        is_png = out_path is not None and out_path.suffix.lower() == ".png"
+        while not stop_watch.is_set() and not saved_evt.is_set():
+            try:
+                ready, prev_size = _still_file_ready(out_path, t0, prev_size)
+            except Exception:
+                ready = False
+            if ready:
+                # IEND (or a non-PNG) is definitive. A PNG without IEND is
+                # accepted only after the size held still for several polls,
+                # so the process is never killed mid-write.
+                if (not is_png) or _png_has_iend(out_path):
+                    _on_saved("output file complete")
+                    return
+                stable_hits += 1
+                if stable_hits >= 2:
+                    _on_saved("output file stable")
+                    return
+            else:
+                stable_hits = 0
+            stop_watch.wait(_SD_FILE_WATCH_INTERVAL)
+
     assert proc.stdout is not None
     reader = threading.Thread(target=_reader, args=(proc.stdout,), daemon=True)
     reader.start()
+    watcher: Optional[threading.Thread] = None
+    if out_path is not None:
+        watcher = threading.Thread(target=_watcher, daemon=True)
+        watcher.start()
 
     tail: List[str] = []
-    saved_ok = False
-    saved_at = 0.0
     released_after_save = False
     model_loaded = False
     rc = -1
     flags: List[str] = []
-    prev_size = 0
-    last_file_poll = 0.0
-
-    def _on_saved(via: str) -> None:
-        """Image is on disk — MUST stop the timer, store the time, signal the UI NOW.
-
-        This is the single point that prevents the estimate from ratcheting to
-        the longest time seen so far. Call as soon as the PNG is complete
-        (file watch or log line). Do NOT wait for process exit.
-        """
-        nonlocal saved_ok, saved_at
-        if saved_ok:
-            return
-        saved_ok = True
-        saved_at = time.time()
-        try:
-            wall = mark_still_saved(saved_at - t0)
-            print(
-                f"[sd-cli] image saved ({via}) — timer stopped at {wall:.1f}s; "
-                f"estimate for the next still is now {wall:.0f}s "
-                f"(MUST close early so next still does not inherit a longer time)",
-                flush=True,
-            )
-        except Exception:
-            pass
 
     try:
         deadline = t0 + timeout
@@ -2301,7 +2482,7 @@ def _run_sd_cli_once_unlocked(cmd: List[str], exe: Path, timeout: float = 600.0)
                 proc.kill()
                 flags.append("[[CANCELLED]] sd-cli was stopped by a cancel request.")
                 break
-            if not saved_ok and time.time() > deadline:
+            if not saved_evt.is_set() and time.time() > deadline:
                 proc.kill()
                 print(f"[sd-cli] TIMEOUT after {time.time() - t0:.1f}s", flush=True)
                 flags.append(
@@ -2309,56 +2490,16 @@ def _run_sd_cli_once_unlocked(cmd: List[str], exe: Path, timeout: float = 600.0)
                     f"(limit {timeout:.0f}s) before saving an image."
                 )
                 break
-            try:
-                line = line_q.get(timeout=0.1)
-            except queue.Empty:
-                line = ""
-            if line is None:
-                break  # sd-cli closed its output (exited)
-            if line:
-                text_line = line.rstrip("\n\r")
-                tail.append(text_line)
-                if len(tail) > 250:
-                    tail = tail[-200:]
-                print(f"[sd-cli] {text_line}", flush=True)
-                low = text_line.lower()
-                # Broad save-signal match: different sd.cpp builds phrase the
-                # final write differently. Any of these MUST trigger early close.
-                if (
-                    "images saved" in low
-                    or "image saved" in low
-                    or "saved to" in low
-                    or "wrote image" in low
-                    or "output written" in low
-                    or "successfully saved" in low
-                    or "saved successfully" in low
-                    or ("save result" in low and "success" in low)
-                    or ("save" in low and "success" in low and "fail" not in low)
-                ):
-                    _on_saved("log")
-                if not model_loaded and ("load" in low) and any(
-                    k in low for k in ("loaded", "load model", "diffusion", "vae", "tensor")
-                ):
-                    model_loaded = True
-                    print(f"[sd-cli] *** MODEL ACTIVITY ({time.time() - t0:.1f}s) ***", flush=True)
-            # Do not rely on log text alone: also watch the output file.
-            # Poll every ~0.5s — frequent enough to close the timer promptly
-            # after the write completes (MUST close early — see bookkeeping
-            # comment) without busy-spinning the file system.
-            now = time.time()
-            if not saved_ok and out_path is not None and now - last_file_poll >= 0.5:
-                last_file_poll = now
-                ready, prev_size = _still_file_ready(out_path, t0, prev_size)
-                if ready:
-                    _on_saved("output file complete")
-            # Image is saved: give sd-cli a short grace to exit by itself, then
-            # release it so the timer loop, the next image and the next phase
-            # are never held up by process teardown.
-            # MUST kill promptly — otherwise the UI stays on this still and the
-            # measured time can only grow (ratchet to longest-so-far).
-            if saved_ok and proc.poll() is None and (time.time() - saved_at) > _SD_POST_SAVE_GRACE:
+            # Release check runs FIRST on every pass, regardless of console
+            # traffic. MUST kill promptly after the save — otherwise the next
+            # still is held up and the UI stays parked on this one.
+            if (
+                saved_evt.is_set()
+                and proc.poll() is None
+                and (time.time() - state["saved_at"]) > _SD_POST_SAVE_GRACE
+            ):
                 print(
-                    f"[sd-cli] still running {time.time() - saved_at:.1f}s after save — "
+                    f"[sd-cli] still running {time.time() - state['saved_at']:.1f}s after save — "
                     "releasing it so the next step can start (early close required)",
                     flush=True,
                 )
@@ -2367,6 +2508,48 @@ def _run_sd_cli_once_unlocked(cmd: List[str], exe: Path, timeout: float = 600.0)
                     proc.kill()
                 except Exception:
                     pass
+                break
+
+            try:
+                first = line_q.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if first is None:
+                break  # sd-cli closed its output (exited)
+
+            # Drain a batch so one console write covers many log lines.
+            batch = [first]
+            ended = False
+            while len(batch) < _SD_CONSOLE_BATCH:
+                try:
+                    nxt = line_q.get_nowait()
+                except queue.Empty:
+                    break
+                if nxt is None:
+                    ended = True
+                    break
+                batch.append(nxt)
+
+            texts = [b.rstrip("\n\r") for b in batch]
+            tail.extend(texts)
+            if len(tail) > 250:
+                tail = tail[-200:]
+            to_print = (
+                texts if not saved_evt.is_set()
+                else texts[:_SD_CONSOLE_BATCH_AFTER_SAVE]
+            )
+            if to_print:
+                print("\n".join(f"[sd-cli] {t}" for t in to_print), flush=True)
+            if not model_loaded:
+                for t in texts:
+                    low = t.lower()
+                    if "load" in low and any(
+                        k in low for k in ("loaded", "load model", "diffusion", "vae", "tensor")
+                    ):
+                        model_loaded = True
+                        print(f"[sd-cli] *** MODEL ACTIVITY ({time.time() - t0:.1f}s) ***", flush=True)
+                        break
+            if ended:
                 break
         try:
             proc.wait(timeout=8)
@@ -2380,7 +2563,7 @@ def _run_sd_cli_once_unlocked(cmd: List[str], exe: Path, timeout: float = 600.0)
             except Exception:
                 pass
         rc = proc.returncode if proc.returncode is not None else -1
-        if released_after_save and saved_ok:
+        if released_after_save and saved_evt.is_set():
             rc = 0
     except Exception as e:
         print(f"[sd-cli] stream error: {e}", flush=True)
@@ -2390,6 +2573,7 @@ def _run_sd_cli_once_unlocked(cmd: List[str], exe: Path, timeout: float = 600.0)
             pass
         rc = proc.returncode if proc.returncode is not None else -1
     finally:
+        stop_watch.set()
         try:
             if proc.stdout:
                 proc.stdout.close()
@@ -2400,7 +2584,12 @@ def _run_sd_cli_once_unlocked(cmd: List[str], exe: Path, timeout: float = 600.0)
             reader.join(timeout=1.0)
         except Exception:
             pass
-        if not saved_ok:
+        if watcher is not None:
+            try:
+                watcher.join(timeout=1.0)
+            except Exception:
+                pass
+        if not saved_evt.is_set():
             # Failed / cancelled / timed out: no live timer may linger.
             configure.APP_STATE["image_gen_t0"] = None
         # Drop child handles so the OS can reclaim Vulkan allocations
@@ -2413,8 +2602,26 @@ def _run_sd_cli_once_unlocked(cmd: List[str], exe: Path, timeout: float = 600.0)
 
     elapsed = time.time() - t0
     print(f"[sd-cli] finished in {elapsed:.1f}s  exit={rc}", flush=True)
+    # Where did the time go? (load / sampling / decode+save) — diagnostic only.
+    try:
+        if marks["first_step"] is not None:
+            sit0 = marks["sit_first"] or 0.0
+            pre = max(0.0, marks["first_step"] - t0 - sit0)
+            samp = max(0.0, marks["last_step"] - marks["first_step"]) + sit0
+            end_t = state["saved_at"] if saved_evt.is_set() else time.time()
+            post = max(0.0, end_t - marks["last_step"])
+            print(
+                f"[sd-timing] load+encode {pre:.0f}s | sampling {samp:.0f}s "
+                f"({marks['steps']}/{marks['total']} steps, last {marks['sit_last'] or 0:.1f}s/it) | "
+                f"decode+save {post:.0f}s | total {end_t - t0:.0f}s",
+                flush=True,
+            )
+        else:
+            print("[sd-timing] no sampling-step lines seen (could not split the time)", flush=True)
+    except Exception:
+        pass
     # Marker so callers can treat "saved" even if the exact Path lookup fails
-    if saved_ok and "[[SAVED_OK]]" not in "\n".join(tail[-5:]):
+    if saved_evt.is_set() and "[[SAVED_OK]]" not in "\n".join(tail[-5:]):
         tail.append("[[SAVED_OK]]")
     tail.extend(flags)
     return "\n".join(tail), int(rc if rc is not None else -1)
@@ -3243,12 +3450,21 @@ def generate_images_from_prompts(
                 flush=True,
             )
             clear_still_markers()
+            # Start the live UI timer as soon as this still is announced so the
+            # status bar is never timer-less (Cover/Theme already do this via
+            # their thinner call path). The runner re-marks at sd-cli start and
+            # finalises the measured time on PNG ready — MUST close early.
+            # (The timer is NEVER allowed to run out to the previous estimate:
+            #  the instant the image exists, _run_sd_cli_once_unlocked closes it
+            #  and this loop moves straight on to the next still.)
+            mark_still_started()
             if progress_callback:
                 progress_callback(
-                    f"Image {line_no}/{total} [{var}/{freq}]: {line_text[:50]}",
+                    f"{line_text[:80]}",
                     0.35 + 0.55 * (work_done / work_total),
                     {"phase": "images", "line": line_no, "total": total},
                 )
+
 
             hint = seq_hints[var - 1] if var - 1 < len(seq_hints) else ""
             seq_bit = f" [Sequence {var}/{freq}: {hint}.]" if hint else ""
@@ -3398,7 +3614,7 @@ def generate_images_from_prompts(
             work_done += 1
             if progress_callback:
                 progress_callback(
-                    f"Image {line_no}/{total} [{var}/{freq}] done ({img_elapsed:.0f}s)",
+                    f"done ({img_elapsed:.0f}s)",
                     0.35 + 0.55 * (work_done / work_total),
                     {"phase": "images", "line": line_no, "total": total},
                 )
