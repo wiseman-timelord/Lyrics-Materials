@@ -56,6 +56,7 @@ Available on [HuggingFace.Co](https://huggingface.co/)...
 [Outro]
 **outro**
 ```
+- If it crashes back to the batch menu, and wont start up because of "port" issues, then try and find python processes and close them, and try again, albeit, give the machine a restart for good measure. This typically happens when more than 1 instance is running. 
 
 ### Notation:
 - This program was created through converting Image-Glamour, there was extensive testing required to confirm things and craft the prompts, and on top of that there was 2/3 stages of major corruption of prompting for setbacks, but WiseMan-TimeLord, struggled with injuries and endeavored to produce results.
