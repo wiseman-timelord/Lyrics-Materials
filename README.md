@@ -1,5 +1,5 @@
 # Lyrics-Materials
-Status: Beta - Mid-Late development, its mostly there since v0.30. phase now is longer testing and refining (it takes long). Some things are buggy, but this will be worked on too. 
+Status: Beta - Mid-Late development, its mostly there since v0.30. phase now is longer testing and refining (it takes long). Some things are buggy, but this will be worked on too. Modes other than realistic are quite interesting, such as computer game graphics.
 
 ### Description:
 It convert lines of lyrics into AI generated images, up to 30 per line (20 is quite fast enough for me). The idea is one could arrange these in a movie editor, and tactically use theme images for fillers in the video or promotional material, so its a program to make simple AI music videos. One could also take the line of lyrics and the generated images, and feed that into AI video generator to make clips, that could then be assembled into a video clips.
@@ -84,6 +84,7 @@ Lyrics-Materials/
 ```
 
 ### Development:
+- There needs to be more emphasis on the line of lyrics, and less emphasis on the theme, maybe even a slider, ie, Line Only, Line More, Narrative More, Narrative. IE where with narrative more the whole thing would work more like a story (so logic of song must be fully worked out), while and line more would be more towards the specific line of lyrics, and only would be absolute of each type. 
 - Experiments with Qwen-Image 2.1 - if its better, and facial accuracy is more frequent, or some neat features, then possibly switch, if "its the one".
 - I do want option to, have or not have, background actors. This requires an additional iteration and prompting to assess, if there are background actors in the scene, and what type of being, and outfit style (if any), and pose/activity, then merge that with other details for generation of image.
 - Main issue is on Management Page; project configuration panels are iffy when using Details Mode, and dont load correctly first time, user is left to click away to other modes on the switch and back.
