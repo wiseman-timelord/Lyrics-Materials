@@ -826,6 +826,11 @@ def _normalize_section_label(kind: str, number: str) -> str:
     return title
 
 
+def _is_bridge_label(label: str) -> bool:
+    """True when a section label is a Bridge / Bridge N (case-insensitive)."""
+    return (label or "").strip().lower().startswith("bridge")
+
+
 def parse_lyrics(raw: str) -> List[Dict[str, Any]]:
     """
     Split pasted lyrics into ordered entries.
@@ -1789,6 +1794,50 @@ def analyze_song_and_sections(
     example_labels = section_labels[:2] if section_labels else ["Intro", "Chorus 1"]
     ex0 = example_labels[0]
     ex1 = example_labels[1] if len(example_labels) > 1 else "Chorus 1"
+
+    # Inject Visual Style so OVERALL / SECTIONS lock to the chosen world
+    style = configure.normalize_style(cfg.get("style"))
+    style_guidance = ""
+    if style == configure.STYLE_TECHNO:
+        style_guidance = (
+            "VISUAL STYLE LOCK — Techno Apocalypse:\n"
+            "The main figure is the winner of the game and Director General of the Authorians "
+            "(robot/clone faction). The planet has been taken over by the Dark Iteration "
+            "(AI calculations too complex for human minds) acting on the main figure's behalf.\n"
+            "Primary environments:\n"
+            "  Surface — urban battlefield ruins, abandoned data-server farms, neon signs "
+            "flickering like dying stars, cyber-gold against charcoal voids, scavengers in "
+            "rags/gasmasks/helmets, grey military androids with yellow/blue LED trims, "
+            "wreckage and broken LED streetlights.\n"
+            "  Subsurface — smashed steel doors, UV-lit control rooms dripping with UV paint, "
+            "holographic planetary displays and floating cuneiform, crackling electric "
+            "vortexes that open portals for robot troops, improvised android raves with "
+            "tinfoil hats and multi-colour lasers.\n"
+            "Tone: mythic yet mechanical, reverence mixed with dread, glitching infrastructure, "
+            "cyber-ritual. Palette: fractured cyber-gold, charcoal voids, intense multi-colour "
+            "UV and electric arcs.\n"
+            "OVERALL must name the Dark Iteration / Authorians context and the surface-vs-"
+            "subsurface split. OTHER_FIGURES must include wasteland scavengers and grey "
+            "military androids with yellow/blue LED trims when the lyrics support crowds or "
+            "secondary presence. SECTIONS must stay inside this universe (server farms, tunnels, "
+            "UV control rooms, android raves, holographic portals) — never generic city streets.\n\n"
+        )
+    elif style == configure.STYLE_DARK:
+        style_guidance = (
+            "VISUAL STYLE LOCK — dark and gloomy: low-key lighting, heavy shadows, sombre "
+            "atmosphere, restrained colour. OVERALL and SECTIONS must stay moody and dim.\n\n"
+        )
+    elif style == configure.STYLE_LIGHT:
+        style_guidance = (
+            "VISUAL STYLE LOCK — light and bright: high-key soft light, clean composition, "
+            "hopeful mood. OVERALL and SECTIONS must stay airy and luminous.\n\n"
+        )
+    elif style == configure.STYLE_COLORFUL:
+        style_guidance = (
+            "VISUAL STYLE LOCK — colorful and wild: saturated colours, dynamic shapes, "
+            "playful high energy. OVERALL and SECTIONS must stay vivid and kinetic.\n\n"
+        )
+
     prompt = (
         "You are a music-video art director. Write structured production notes.\n"
         "Reply with ONLY the four blocks below. Use real sentences, not keyword lists.\n"
@@ -1796,13 +1845,19 @@ def analyze_song_and_sections(
         "Never describe the MAIN character's clothing or hair style — "
         "those are configured separately in the UI. Secondary people in OTHER_FIGURES "
         "MAY have distinct outfits when the lyrics imply them.\n\n"
+        f"{style_guidance}"
         "OVERALL:\n"
-        "Write 3-5 complete sentences: narrative arc, mood, setting, colour palette, visual tone.\n\n"
+        "Write 3-5 complete sentences: narrative arc, mood, setting, colour palette, visual tone.\n"
+        "When a VISUAL STYLE LOCK is present above, weave its world, palette and tone into "
+        "every sentence of OVERALL.\n\n"
         f"{char_instr}\n"
         "SECTIONS:\n"
         f"For EACH of these section names write one non-empty paragraph (2-3 sentences): {labels_list}.\n"
         "Label each paragraph with the exact section name followed by a colon.\n"
-        "Focus on camera, setting, action, and mood — not wardrobe.\n\n"
+        "Focus on camera, setting, action, and mood — not wardrobe.\n"
+        "Bridge sections (if any) are transitional: describe the visual/mood shift "
+        "from the preceding section toward the following one — not a standalone scene.\n"
+        "When a VISUAL STYLE LOCK is present, keep every section inside that universe.\n\n"
         "Example format (replace with content about THIS song):\n"
         "OVERALL:\n"
         "A lone figure moves through cold neon streets at night. The palette is steel blue and amber. "
@@ -2115,6 +2170,16 @@ def generate_visual_prompts(
     other_figures = (analysis or {}).get("other_figures") or ""
     presence_map = (analysis or {}).get("character_presence") or {}
 
+    # Ordered unique section labels as they appear (for Bridge prev/next context)
+    ordered_secs: List[str] = []
+    _seen_secs: set = set()
+    for e in parsed:
+        if e.get("type") == "line":
+            lab = e.get("section") or "Body"
+            if lab not in _seen_secs:
+                ordered_secs.append(lab)
+                _seen_secs.add(lab)
+
     prompts: List[str] = []
     presence_per_line: List[str] = []
     total = len(lines)
@@ -2141,6 +2206,36 @@ def generate_visual_prompts(
                 {"phase": "prompts", "line": line_no, "total": total},
             )
         sec_note = section_notes.get(sec, "")
+
+        # Bridge lines: pull previous + following section notes so the still
+        # can act as a visual transition between those sections.
+        bridge_ctx = ""
+        if _is_bridge_label(sec):
+            try:
+                bidx = ordered_secs.index(sec)
+            except ValueError:
+                bidx = -1
+            prev_lab = ordered_secs[bidx - 1] if bidx > 0 else None
+            next_lab = ordered_secs[bidx + 1] if (bidx >= 0 and bidx + 1 < len(ordered_secs)) else None
+            prev_note = (section_notes.get(prev_lab) or "") if prev_lab else ""
+            next_note = (section_notes.get(next_lab) or "") if next_lab else ""
+            bits = []
+            if prev_lab:
+                bits.append(f"Previous section ({prev_lab}): {prev_note[:100]}" if prev_note else f"Previous section ({prev_lab})")
+            if next_lab:
+                bits.append(f"Following section ({next_lab}): {next_note[:100]}" if next_note else f"Following section ({next_lab})")
+            if bits:
+                bridge_ctx = (
+                    "This is a BRIDGE line — transitional between the sections above and below.\n"
+                    + "\n".join(bits) + "\n"
+                    + "Visuals should shift mood/setting/camera from the previous section "
+                    "toward the following one.\n"
+                )
+            else:
+                bridge_ctx = (
+                    "This is a BRIDGE line — transitional. "
+                    "Shift mood/setting/camera between the surrounding song sections.\n"
+                )
 
         # Structured SCENE + POSE only. Character appearance is injected later
         # from UI/ref identity — never ask the model to describe the main character.
@@ -2189,10 +2284,18 @@ def generate_visual_prompts(
                 f"Secondary people (not the main reference): {other_figures[:220]}\n"
             )
 
+        if bridge_ctx:
+            section_block = (
+                f"{bridge_ctx}"
+                f"Section note ({sec}): {(sec_note or '')[:120]}\n"
+            )
+        else:
+            section_block = f"Section note ({sec}): {(sec_note or '')[:120]}\n"
+
         instruction = (
             f"Lyric (mood only — do not quote it in the reply): {line}\n"
             f"Setting context: {(overall or '')[:180]}\n"
-            f"Section note ({sec}): {(sec_note or '')[:120]}\n"
+            f"{section_block}"
             f"{presence_rule}\n"
             f"{other_bit}"
             "Reply with EXACTLY these two labels and nothing else:\n"

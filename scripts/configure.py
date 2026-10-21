@@ -672,9 +672,48 @@ def backend_device_token(backend: str) -> str:
 STYLE_LIGHT = "light and bright"
 STYLE_DARK = "dark and gloomy"
 STYLE_COLORFUL = "colorful and wild"
-STYLE_CHOICES = [STYLE_LIGHT, STYLE_DARK, STYLE_COLORFUL]
+STYLE_TECHNO = "Techno Apocalypse"
+# Full catalogue (includes locked styles). UI dropdown uses style_choices_for_ui().
+STYLE_CHOICES = [STYLE_LIGHT, STYLE_DARK, STYLE_COLORFUL, STYLE_TECHNO]
+STYLE_PUBLIC = [STYLE_LIGHT, STYLE_DARK, STYLE_COLORFUL]
 # Default visual style for new projects / fresh installs
 STYLE_DEFAULT = STYLE_DARK
+# Exact string that unlocks STYLE_TECHNO in the Visual Style dropdown.
+# Stored under preferences.json key "passkey". No UI hint is shown.
+STYLE_UNLOCK_PASSKEY = "WiseMan-TimeLord"
+
+
+def _read_passkey_raw() -> str:
+    """Read passkey from preferences.json without normalising style (avoids recursion)."""
+    try:
+        path = get_preferences_path()
+        if not path.is_file():
+            return ""
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return str(data.get("passkey") or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def is_style_unlocked(style: str | None = None) -> bool:
+    """True when the given style (or STYLE_TECHNO if omitted) is available to the UI."""
+    target = (style or STYLE_TECHNO).strip()
+    if target in STYLE_PUBLIC:
+        return True
+    if target != STYLE_TECHNO:
+        return False
+    return _read_passkey_raw() == STYLE_UNLOCK_PASSKEY
+
+
+def style_choices_for_ui() -> list:
+    """Dropdown choices: public styles + Techno only when passkey matches."""
+    choices = list(STYLE_PUBLIC)
+    if is_style_unlocked(STYLE_TECHNO):
+        choices.append(STYLE_TECHNO)
+    return choices
 
 
 def normalize_style(value: str | None) -> str:
@@ -682,9 +721,12 @@ def normalize_style(value: str | None) -> str:
     Map a UI / session / prefs visual-style value to a canonical STYLE_CHOICES entry.
     Empty / unknown values fall back to STYLE_DEFAULT (dark and gloomy), never to
     STYLE_LIGHT unless the user explicitly selected it.
+    Locked styles fall back to STYLE_DEFAULT when the passkey is not set.
     """
     v = (value or "").strip()
     if v in STYLE_CHOICES:
+        if v == STYLE_TECHNO and not is_style_unlocked(STYLE_TECHNO):
+            return STYLE_DEFAULT
         return v
     low = v.lower().replace("_", " ").replace("-", " ")
     aliases = {
@@ -699,8 +741,16 @@ def normalize_style(value: str | None) -> str:
         "wild": STYLE_COLORFUL,
         "colorful and wild": STYLE_COLORFUL,
         "colourful and wild": STYLE_COLORFUL,
+        "techno": STYLE_TECHNO,
+        "techno apocalypse": STYLE_TECHNO,
+        "tech apocalypse": STYLE_TECHNO,
+        "dark iteration": STYLE_TECHNO,
+        "authorians": STYLE_TECHNO,
     }
-    return aliases.get(low, STYLE_DEFAULT)
+    resolved = aliases.get(low, STYLE_DEFAULT)
+    if resolved == STYLE_TECHNO and not is_style_unlocked(STYLE_TECHNO):
+        return STYLE_DEFAULT
+    return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -1320,6 +1370,7 @@ STYLE_FADE_RGB = {
     STYLE_LIGHT: (255, 255, 255),      # white
     STYLE_DARK: (0, 0, 0),             # black
     STYLE_COLORFUL: (128, 0, 128),     # purple proxy for rainbow (ffmpeg limitation)
+    STYLE_TECHNO: (20, 40, 60),        # deep charcoal-cyan (cyber void)
 }
 
 # Default prompt templates per visual style (seed for prompting.json)
@@ -1338,6 +1389,21 @@ STYLE_PROMPT_TEMPLATES = {
         "Create a vivid, colourful, high-energy visual description for a music-video still. "
         "Emphasize saturated colours, dynamic shapes, and playful wildness. "
         "Subject of the image: {line}"
+    ),
+    STYLE_TECHNO: (
+        "Create a Techno Apocalypse music-video still. World: decaying digital utopia "
+        "conquered by the Dark Iteration (AI calculations too complex for human minds) "
+        "on behalf of the main figure — winner of the game and Director General of the "
+        "Authorians (robot/clone faction). Surface: urban battlefield ruins, abandoned "
+        "data-server farms, neon signs flickering like dying stars, cyber-gold against "
+        "charcoal voids, scavengers in rags/gasmasks, grey military androids with yellow/"
+        "blue LED trims, wreckage and broken LED streetlights. Subsurface: smashed steel "
+        "doors, UV-lit control rooms with UV paint, holographic planetary displays and "
+        "floating cuneiform, crackling electric vortexes/portals for robot troops, "
+        "improvised android raves with tinfoil hats and multi-colour lasers. Tone: "
+        "mythic yet mechanical, reverence mixed with dread, glitching infrastructure, "
+        "cyber-ritual. Palette locked to fractured cyber-gold, charcoal voids, intense "
+        "multi-colour UV and electric arcs. Subject of the image: {line}"
     ),
 }
 
@@ -2212,12 +2278,14 @@ PREFERENCES_KEYS = [
     "lyrics_thumbs_per_row",
     "bleep_section_completion",
     "bleep_video_completion",
+    "passkey",
 ]
 
 
 def _default_preferences() -> Dict[str, Any]:
     return {
         "style": STYLE_DEFAULT,
+        "passkey": "",
         "video_format": VIDEO_MP4,
         "max_thumbnails": DEFAULT_MAX_THUMBNAILS,
         "input_thumbnail_size": DEFAULT_INPUT_THUMBNAIL,
@@ -2257,6 +2325,7 @@ PROMPTING_KEYS = [
     STYLE_LIGHT,
     STYLE_DARK,
     STYLE_COLORFUL,
+    STYLE_TECHNO,
 ]
 
 
@@ -2265,6 +2334,7 @@ def _default_prompting() -> Dict[str, Any]:
         STYLE_LIGHT: STYLE_PROMPT_TEMPLATES[STYLE_LIGHT],
         STYLE_DARK: STYLE_PROMPT_TEMPLATES[STYLE_DARK],
         STYLE_COLORFUL: STYLE_PROMPT_TEMPLATES[STYLE_COLORFUL],
+        STYLE_TECHNO: STYLE_PROMPT_TEMPLATES[STYLE_TECHNO],
     }
 
 

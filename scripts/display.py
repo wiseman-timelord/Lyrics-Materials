@@ -5712,7 +5712,8 @@ def _build_prompting_tab() -> None:
     gr.Markdown(
         "### Visual style prompt templates\n"
         "Each template is used per lyric line. `{line}` is replaced with the lyric text. "
-        "Song/section analysis notes are injected automatically by the pipeline."
+        "Song/section analysis notes are injected automatically by the pipeline. "
+        "Techno Apocalypse also injects a world-lock into the assessment phase."
     )
     _prompt["light"] = gr.Textbox(
         label=configure.STYLE_LIGHT,
@@ -5729,17 +5730,23 @@ def _build_prompting_tab() -> None:
         lines=4,
         value=data.get(configure.STYLE_COLORFUL, ""),
     )
+    _prompt["techno"] = gr.Textbox(
+        label=configure.STYLE_TECHNO,
+        lines=8,
+        value=data.get(configure.STYLE_TECHNO, ""),
+    )
     with gr.Row():
         _prompt["save"] = gr.Button("Save Prompt Templates", variant="primary")
         _prompt["reset"] = gr.Button("Reset to Defaults")
 
 
 def _wire_prompting_events(status_box) -> None:
-    def _save(light, dark, colorful):
+    def _save(light, dark, colorful, techno):
         configure.update_prompting({
             configure.STYLE_LIGHT: light,
             configure.STYLE_DARK: dark,
             configure.STYLE_COLORFUL: colorful,
+            configure.STYLE_TECHNO: techno,
         })
         return "Prompt templates saved."
 
@@ -5750,17 +5757,18 @@ def _wire_prompting_events(status_box) -> None:
             defaults[configure.STYLE_LIGHT],
             defaults[configure.STYLE_DARK],
             defaults[configure.STYLE_COLORFUL],
+            defaults[configure.STYLE_TECHNO],
             "Reset to defaults.",
         )
 
     _prompt["save"].click(
         _save,
-        inputs=[_prompt["light"], _prompt["dark"], _prompt["colorful"]],
+        inputs=[_prompt["light"], _prompt["dark"], _prompt["colorful"], _prompt["techno"]],
         outputs=status_box,
     )
     _prompt["reset"].click(
         _reset,
-        outputs=[_prompt["light"], _prompt["dark"], _prompt["colorful"], status_box],
+        outputs=[_prompt["light"], _prompt["dark"], _prompt["colorful"], _prompt["techno"], status_box],
     )
 
 
@@ -6021,11 +6029,18 @@ def _build_pref_tab() -> None:
             value=bool(prefs.get("bleep_video_completion", False)),
             info="Beep when all materials are ready. Both on → double bleep.",
         )
+    _pref["passkey"] = gr.Textbox(
+        label="Passkey",
+        value=str(prefs.get("passkey") or ""),
+        type="password",
+        lines=1,
+        max_lines=1,
+    )
     _pref["save_btn"] = gr.Button("Save Preferences", variant="primary")
 
 
 def _wire_pref_events(status_box) -> None:
-    def _save(max_thumbs, lyrics_per_row, bleep_section, bleep_video):
+    def _save(max_thumbs, lyrics_per_row, bleep_section, bleep_video, passkey):
         try:
             per = int(lyrics_per_row)
         except (TypeError, ValueError):
@@ -6037,12 +6052,25 @@ def _wire_pref_events(status_box) -> None:
             "lyrics_thumbs_per_row": per,
             "bleep_section_completion": bool(bleep_section),
             "bleep_video_completion": bool(bleep_video),
+            "passkey": str(passkey or "").strip(),
         })
+        choices = configure.style_choices_for_ui()
+        # Keep current selection if still valid; otherwise fall back to default
+        cur = configure.normalize_style(configure.load_preferences().get("style"))
+        if cur not in choices:
+            cur = configure.STYLE_DEFAULT
+            configure.update_preferences({"style": cur})
+        style_upd = gr.update(choices=choices, value=cur)
         return (
             f"Preferences saved — lyrics stills show {per} per row "
-            f"(Thumbnails tab refreshes on next gallery update)."
+            f"(Thumbnails tab refreshes on next gallery update).",
+            style_upd,
         )
 
+    outs = [status_box]
+    # Refresh Visual Style dropdown when present (Management tab)
+    if _gen.get("style") is not None:
+        outs.append(_gen["style"])
     _pref["save_btn"].click(
         _save,
         inputs=[
@@ -6050,8 +6078,9 @@ def _wire_pref_events(status_box) -> None:
             _pref["lyrics_per_row"],
             _pref["bleep_section"],
             _pref["bleep_video"],
+            _pref["passkey"],
         ],
-        outputs=status_box,
+        outputs=outs,
     )
 
 
