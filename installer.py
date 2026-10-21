@@ -374,6 +374,21 @@ def write_default_prompting() -> None:
             "Emphasize saturated colours, dynamic shapes, and playful wildness. "
             "Subject of the image: {line}"
         ),
+        "Techno Apocalypse": (
+            "Create a Techno Apocalypse music-video still. World: decaying digital utopia "
+            "conquered by the Dark Iteration (AI calculations too complex for human minds) "
+            "on behalf of the main figure — winner of the game and Director General of the "
+            "Authorians (robot/clone faction). Surface: urban battlefield ruins, abandoned "
+            "data-server farms, neon signs flickering like dying stars, cyber-gold against "
+            "charcoal voids, scavengers in rags/gasmasks, grey military androids with yellow/"
+            "blue LED trims, wreckage and broken LED streetlights. Subsurface: smashed steel "
+            "doors, UV-lit control rooms with UV paint, holographic planetary displays and "
+            "floating cuneiform, crackling electric vortexes/portals for robot troops, "
+            "improvised android raves with tinfoil hats and multi-colour lasers. Tone: "
+            "mythic yet mechanical, reverence mixed with dread, glitching infrastructure, "
+            "cyber-ritual. Palette locked to fractured cyber-gold, charcoal voids, intense "
+            "multi-colour UV and electric arcs. Subject of the image: {line}"
+        ),
     }
     with open(_PROMPTING_PATH, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
@@ -835,25 +850,107 @@ def _missing_build_tools() -> List[str]:
 # ---------------------------------------------------------------------------
 # Compile fallback (simplified from original)
 # ---------------------------------------------------------------------------
+def _git_submodules_init(dest: Path) -> None:
+    """Init/update git submodules (sd.cpp needs ggml/; llama may have none)."""
+    git = find_git()
+    if not git or not dest.is_dir():
+        return
+    gitmodules = dest / ".gitmodules"
+    if not gitmodules.is_file():
+        return
+    log("  Initialising git submodules (recursive)…")
+    try:
+        # --depth 1 keeps the submodule trees small; --recursive for nested deps
+        subprocess.check_call(
+            [
+                str(git), "-C", str(dest),
+                "submodule", "update", "--init", "--recursive", "--depth", "1",
+            ],
+            timeout=900,
+        )
+    except subprocess.CalledProcessError:
+        # Some older git versions reject --depth on submodule; retry without it
+        log("  submodule --depth failed — retrying full submodule fetch…")
+        subprocess.check_call(
+            [
+                str(git), "-C", str(dest),
+                "submodule", "update", "--init", "--recursive",
+            ],
+            timeout=1200,
+        )
+
+
 def _git_clone(url: str, dest: Path, ref: str) -> None:
+    """
+    Clone (or update) a source tree and initialise submodules.
+
+    stable-diffusion.cpp vendors ggml as a submodule under ggml/ — without
+    submodule init, cmake fails with "ggml does not contain a CMakeLists.txt".
+    """
     git = find_git()
     if not git:
         fatal("git clone", "Git not found on PATH")
     if dest.exists():
         log(f"Source already cached: {dest}")
         # fetch + checkout
-        subprocess.check_call([str(git), "-C", str(dest), "fetch", "--depth", "1", "origin", ref])
-        subprocess.check_call([str(git), "-C", str(dest), "checkout", ref])
-        return
+        try:
+            subprocess.check_call(
+                [str(git), "-C", str(dest), "fetch", "--depth", "1", "origin", ref],
+                timeout=600,
+            )
+            subprocess.check_call(
+                [str(git), "-C", str(dest), "checkout", ref],
+                timeout=120,
+            )
+        except subprocess.CalledProcessError as e:
+            # Cached tree may be on a detached tag that fetch-depth cannot update;
+            # wipe and re-clone cleanly.
+            log(f"  cached tree update failed ({e}) — re-cloning…")
+            _safe_rmtree(dest)
+        else:
+            _git_submodules_init(dest)
+            return
     dest.parent.mkdir(parents=True, exist_ok=True)
     log(f"Cloning {url} @ {ref} ...")
-    subprocess.check_call(
-        [str(git), "clone", "--depth", "1", "--branch", ref, url, str(dest)],
-        timeout=600,
-    )
+    # Prefer --recurse-submodules so ggml/ arrives in one shot
+    clone_cmd = [
+        str(git), "clone", "--depth", "1", "--branch", ref,
+        "--recurse-submodules", "--shallow-submodules",
+        url, str(dest),
+    ]
+    try:
+        subprocess.check_call(clone_cmd, timeout=1200)
+    except subprocess.CalledProcessError:
+        # Tag may not work with --branch on some remotes; plain clone + checkout
+        log("  clone --branch failed — trying plain clone + checkout…")
+        if dest.exists():
+            _safe_rmtree(dest)
+        subprocess.check_call(
+            [str(git), "clone", "--recurse-submodules", url, str(dest)],
+            timeout=1200,
+        )
+        subprocess.check_call(
+            [str(git), "-C", str(dest), "checkout", ref],
+            timeout=120,
+        )
+        _git_submodules_init(dest)
+    else:
+        # Ensure submodules even if recurse partially failed
+        _git_submodules_init(dest)
 
 
-def _run_cmake_build(src: Path, build: Path, defs: List[str], jobs: int) -> bool:
+def _run_cmake_build(
+    src: Path,
+    build: Path,
+    defs: List[str],
+    jobs: int,
+    targets: Optional[List[str]] = None,
+) -> bool:
+    """
+    Configure + build. When `targets` is set, only those CMake targets are
+    built (avoids unrelated failures such as llama-app needing
+    llama-server-impl.lib when LLAMA_BUILD_SERVER=OFF).
+    """
     cmake = find_cmake()
     if not cmake:
         return False
@@ -866,6 +963,9 @@ def _run_cmake_build(src: Path, build: Path, defs: List[str], jobs: int) -> bool
         log(f"cmake configure failed: {e}")
         return False
     build_cmd = [str(cmake), "--build", str(build), "--config", "Release", "-j", str(jobs)]
+    if targets:
+        for t in targets:
+            build_cmd.extend(["--target", t])
     log("cmake build: " + " ".join(build_cmd))
     try:
         subprocess.check_call(build_cmd)
@@ -879,12 +979,29 @@ def compile_llama(cpu: Dict[str, Any], use_vulkan: bool) -> str:
     src = _BUILD_TEMP / "lc_src"
     build = _BUILD_TEMP / "lc_build"
     _git_clone(LLAMA_CPP_SOURCE_URL, src, LLAMA_CPP_REF)
-    defs = ["-DGGML_NATIVE=ON", "-DLLAMA_BUILD_SERVER=OFF"]
+    # Server / tests / examples / app are not required. Building the full
+    # tree can fail on llama-app → llama-server-impl.lib even with
+    # LLAMA_BUILD_SERVER=OFF (b11100 still generates the app project).
+    # Only request the binary we actually ship: llama-completion.
+    defs = [
+        "-DGGML_NATIVE=ON",
+        "-DLLAMA_BUILD_SERVER=OFF",
+        "-DLLAMA_BUILD_TESTS=OFF",
+        "-DLLAMA_BUILD_EXAMPLES=OFF",
+        "-DLLAMA_CURL=OFF",
+    ]
     if use_vulkan:
         defs.append("-DGGML_VULKAN=ON")
     jobs = int(cpu.get("build_jobs", HEAVY_THREADS))
-    if not _run_cmake_build(src, build, defs, jobs):
-        fatal("Compile llama.cpp", "cmake build failed")
+    # Target list: llama-completion is the tool we need; fall back to
+    # full build only if the named target is missing (older trees).
+    if not _run_cmake_build(
+        src, build, defs, jobs,
+        targets=["llama-completion"],
+    ):
+        log("  targeted llama-completion build failed — retrying without --target")
+        if not _run_cmake_build(src, build, defs, jobs, targets=None):
+            fatal("Compile llama.cpp", "cmake build failed")
     bin_dir = _ROOT / LLAMA_BIN_DIR
     bin_dir.mkdir(parents=True, exist_ok=True)
     candidates = list(build.rglob("llama-completion.exe")) + list(build.rglob("llama-cli.exe"))
@@ -905,10 +1022,26 @@ def compile_sd(cpu: Dict[str, Any], use_vulkan: bool) -> str:
         _git_clone(SD_CPP_SOURCE_URL, src, SD_CPP_RELEASE_TAG)
     except Exception:
         _git_clone(SD_CPP_SOURCE_URL, src, "master")
+    # ggml is a required submodule — refuse to configure without it
+    ggml_cmake = src / "ggml" / "CMakeLists.txt"
+    if not ggml_cmake.is_file():
+        log("  ggml/ submodule missing after clone — forcing submodule init…")
+        _git_submodules_init(src)
+    if not ggml_cmake.is_file():
+        fatal(
+            "Compile sd.cpp",
+            "ggml/ submodule still missing (no CMakeLists.txt). "
+            "Delete the sd_src folder under TEMP/lyrics_materials and retry, "
+            "or use Download instead of Compile.",
+        )
     defs = ["-DGGML_NATIVE=ON", "-DSD_BUILD_EXAMPLES=ON"]
     if use_vulkan:
         defs.append("-DGGML_VULKAN=ON")
     jobs = int(cpu.get("build_jobs", HEAVY_THREADS))
+    # Wipe stale build dir so a previous failed configure does not poison CMake
+    if build.exists():
+        log(f"  clearing previous sd build dir: {build}")
+        _safe_rmtree(build)
     if not _run_cmake_build(src, build, defs, jobs):
         fatal("Compile sd.cpp", "cmake build failed")
     bin_dir = _ROOT / SD_BIN_DIR
