@@ -643,31 +643,45 @@ def _llama_download_url(use_vulkan: bool) -> str:
 
 
 def install_llama_prebuilt(use_vulkan: bool) -> str:
+    """
+    Download + extract the official win-cpu / win-vulkan release zip.
+    Always re-extracts the requested flavor so switching CPU↔Vulkan is reliable.
+    """
     bin_dir = _ROOT / LLAMA_BIN_DIR
     bin_dir.mkdir(parents=True, exist_ok=True)
-    existing = bin_dir / LLAMA_BIN_NAME
-    if existing.exists():
-        log(f"llama-completion already present: {existing}")
-        return "already present"
-
+    kind = "Vulkan" if use_vulkan else "CPU"
     zip_name = _llama_asset_name(use_vulkan)
     cache = _DATA_DIR / "downloads" / zip_name
     url = _llama_download_url(use_vulkan)
-    _download_with_retry(url, cache, f"llama.cpp {LLAMA_CPP_REF} ({'Vulkan' if use_vulkan else 'CPU'})")
+    _download_with_retry(url, cache, f"llama.cpp {LLAMA_CPP_REF} ({kind})")
+
+    # Clear previous exes so a CPU binary is not left beside a Vulkan extract
+    for name in (LLAMA_BIN_NAME, "llama-cli.exe", "llama-server.exe", "main.exe"):
+        old = bin_dir / name
+        if old.is_file():
+            try:
+                old.unlink()
+            except OSError:
+                pass
 
     wanted = [LLAMA_BIN_NAME, "llama-cli.exe", "llama-server.exe"]
-    extracted = _extract_zip(cache, bin_dir, wanted)
+    _extract_zip(cache, bin_dir, wanted)
     # Official builds may still ship llama-cli; rename/copy if completion missing
     if not (bin_dir / LLAMA_BIN_NAME).exists():
         for alt in ("llama-cli.exe", "main.exe"):
-            p = bin_dir / alt
-            if p.exists():
-                shutil.copy2(p, bin_dir / LLAMA_BIN_NAME)
+            alt_p = bin_dir / alt
+            if alt_p.exists():
+                shutil.copy2(alt_p, bin_dir / LLAMA_BIN_NAME)
                 log(f"  note: using {alt} as llama-completion.exe fallback")
                 break
     if not (bin_dir / LLAMA_BIN_NAME).exists():
         fatal("llama.cpp extract", f"{LLAMA_BIN_NAME} not found in {zip_name}")
-    return f"downloaded ({'Vulkan' if use_vulkan else 'CPU'})"
+    # Marker so Debug can show which flavor is on disk
+    try:
+        (bin_dir / ".backend_flavor").write_text(kind.lower(), encoding="utf-8")
+    except OSError:
+        pass
+    return f"downloaded ({kind})"
 
 
 # ---------------------------------------------------------------------------
@@ -687,21 +701,34 @@ def _sd_download_url(use_vulkan: bool) -> str:
 
 
 def install_sd_prebuilt(use_vulkan: bool) -> str:
+    """
+    Download + extract the official win-cpu / win-vulkan release zip.
+    Always re-extracts the requested flavor so switching CPU↔Vulkan is reliable.
+    """
     bin_dir = _ROOT / SD_BIN_DIR
     bin_dir.mkdir(parents=True, exist_ok=True)
-    if (bin_dir / "sd-cli.exe").exists() or (bin_dir / "sd.exe").exists():
-        log(f"sd-cli already present under {bin_dir}")
-        return "already present"
-
+    kind = "Vulkan" if use_vulkan else "CPU"
     zip_name = _sd_asset_name(use_vulkan)
     cache = _DATA_DIR / "downloads" / zip_name
     url = _sd_download_url(use_vulkan)
-    _download_with_retry(url, cache, f"sd.cpp {SD_CPP_RELEASE_TAG} ({'Vulkan' if use_vulkan else 'CPU'})")
+    _download_with_retry(url, cache, f"sd.cpp {SD_CPP_RELEASE_TAG} ({kind})")
+
+    for name in ("sd-cli.exe", "sd.exe", "sd-server.exe"):
+        old = bin_dir / name
+        if old.is_file():
+            try:
+                old.unlink()
+            except OSError:
+                pass
 
     _extract_zip(cache, bin_dir, ["sd-cli.exe", "sd.exe", "sd-server.exe"])
     if not any((bin_dir / n).exists() for n in ("sd-cli.exe", "sd.exe")):
         fatal("sd.cpp extract", f"sd-cli.exe not found in {zip_name}")
-    return f"downloaded ({'Vulkan' if use_vulkan else 'CPU'})"
+    try:
+        (bin_dir / ".backend_flavor").write_text(kind.lower(), encoding="utf-8")
+    except OSError:
+        pass
+    return f"downloaded ({kind})"
 
 
 # ---------------------------------------------------------------------------
@@ -978,6 +1005,10 @@ def _run_cmake_build(
 def compile_llama(cpu: Dict[str, Any], use_vulkan: bool) -> str:
     src = _BUILD_TEMP / "lc_src"
     build = _BUILD_TEMP / "lc_build"
+    # Fresh build dir when switching CPU↔Vulkan avoids stale CMake cache
+    if build.exists():
+        log(f"  clearing previous llama build dir: {build}")
+        _safe_rmtree(build)
     _git_clone(LLAMA_CPP_SOURCE_URL, src, LLAMA_CPP_REF)
     # Server / tests / examples / app are not required. Building the full
     # tree can fail on llama-app → llama-server-impl.lib even with

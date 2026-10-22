@@ -38,6 +38,8 @@ import scripts.display as display
 APP_TITLE = "Lyrics-Materials"
 SERVER_NAME = "127.0.0.1"
 SERVER_PORT = 7867
+# Prefer 7867; if busy (e.g. Image-Glamour / another Gradio), scan upward.
+SERVER_PORT_CANDIDATES = list(range(7867, 7888)) + list(range(7860, 7867))
 
 
 def _program_icon_path() -> Path | None:
@@ -85,6 +87,32 @@ def _wait_for_server(host: str, port: int, timeout: float = 25.0) -> bool:
         except OSError:
             time.sleep(0.1)
     return False
+
+
+def _port_is_free(host: str, port: int) -> bool:
+    """True when nothing is listening / bound on host:port."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((host, port))
+            return True
+    except OSError:
+        return False
+
+
+def _pick_free_port(host: str = SERVER_NAME, preferred: int = SERVER_PORT) -> int:
+    """
+    Choose a free local port. Prefer `preferred`, then the candidate list.
+    Falls back to OS-assigned ephemeral if everything in the list is taken.
+    """
+    ordered = [preferred] + [p for p in SERVER_PORT_CANDIDATES if p != preferred]
+    for port in ordered:
+        if _port_is_free(host, port):
+            return port
+    # Last resort: let the OS pick
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((host, 0))
+        return int(s.getsockname()[1])
 
 
 class _ExitBridge(QObject):
@@ -202,9 +230,14 @@ def main() -> None:
         str(configure.get_images_dir()),
         str(configure.get_ref_cache_dir()),
     ]
+    # Prefer 7867; only hop ports when the socket is actually taken.
+    chosen_port = _pick_free_port(SERVER_NAME, SERVER_PORT)
+    if chosen_port != SERVER_PORT:
+        print(f"  Port {SERVER_PORT} in use — binding to {chosen_port}.")
+
     launch_kwargs = dict(
-        server_name=SERVER_NAME,
-        server_port=SERVER_PORT,
+        server_name="127.0.0.1",
+        server_port=chosen_port,
         share=False,
         inbrowser=False,
         prevent_thread_lock=True,
@@ -218,22 +251,122 @@ def main() -> None:
     if _head_script:
         launch_kwargs["head"] = _head_script
 
-    try:
-        _server_app, local_url, _share_url = blocks_app.launch(**launch_kwargs)
-    except ValueError as e:
-        # Gradio 6 sometimes raises a misleading "localhost not accessible" error
-        # when an internal startup fault occurs — retry once with an explicit URL root.
-        print(f"  WARNING: Gradio launch issue ({e})")
-        print("  Retrying launch…")
-        launch_kwargs["server_name"] = "127.0.0.1"
-        try:
-            _server_app, local_url, _share_url = blocks_app.launch(**launch_kwargs)
-        except Exception as e2:
-            print(f"ERROR: Gradio failed to start: {e2}")
-            raise
+    # Gradio 6 starts the HTTP server, then probes "is localhost reachable?".
+    # That probe often false-fails (DNS localhost, timing, sibling apps) and
+    # raises ValueError EVEN THOUGH the server is already listening. The older
+    # launcher recovered by retrying once on the same port. Port-hopping made
+    # things worse: it abandoned a live server and failed every candidate.
+    #
+    # Strategy:
+    #   1) launch on chosen_port
+    #   2) on the known ValueError — if the port answers, treat as success
+    #   3) otherwise close + one same-port retry (matches pre-Techno behaviour)
+    #   4) only then try the next free port (real bind conflicts)
+    local_url = None
+    last_err: Exception | None = None
+    ports_to_try = [chosen_port] + [
+        p for p in SERVER_PORT_CANDIDATES
+        if p != chosen_port and _port_is_free(SERVER_NAME, p)
+    ][:6]
 
-    if not _wait_for_server(SERVER_NAME, SERVER_PORT):
-        print("ERROR: Gradio server did not come up in time.")
+    for attempt, port in enumerate(ports_to_try, 1):
+        launch_kwargs["server_port"] = port
+        launch_kwargs["server_name"] = "127.0.0.1"
+        os.environ["GRADIO_SERVER_NAME"] = "127.0.0.1"
+        os.environ["GRADIO_SERVER_PORT"] = str(port)
+
+        def _try_launch() -> tuple:
+            return blocks_app.launch(**launch_kwargs)
+
+        def _server_alive() -> bool:
+            return _wait_for_server("127.0.0.1", port, timeout=4.0)
+
+        def _accept_live(reason: str) -> str:
+            url = f"http://127.0.0.1:{port}/"
+            print(f"  {reason}")
+            print(f"  Using live server at {url}")
+            return url
+
+        try:
+            if attempt > 1:
+                print(f"  Trying port {port}…")
+                try:
+                    blocks_app.close(verbose=False)
+                except Exception:
+                    pass
+                time.sleep(0.4)
+            _server_app, local_url, _share_url = _try_launch()
+            chosen_port = port
+            last_err = None
+            break
+        except ValueError as e:
+            last_err = e
+            msg = str(e).lower()
+            is_localhost_probe = (
+                "localhost" in msg or "shareable link" in msg or "share=true" in msg
+            )
+            print(f"  WARNING: Gradio launch issue on :{port} ({e})")
+            if is_localhost_probe and _server_alive():
+                # Server is up; Gradio's post-start probe lied.
+                local_url = _accept_live(
+                    "Gradio localhost-probe failed, but the server is responding."
+                )
+                chosen_port = port
+                last_err = None
+                break
+            if is_localhost_probe:
+                # Same-port retry — this is what the working older launcher did.
+                print("  Retrying launch on the same port…")
+                try:
+                    blocks_app.close(verbose=False)
+                except Exception:
+                    pass
+                time.sleep(0.5)
+                try:
+                    _server_app, local_url, _share_url = _try_launch()
+                    chosen_port = port
+                    last_err = None
+                    break
+                except ValueError as e2:
+                    last_err = e2
+                    print(f"  WARNING: retry still raised ({e2})")
+                    if _server_alive():
+                        local_url = _accept_live(
+                            "Retry raised, but the server is responding."
+                        )
+                        chosen_port = port
+                        last_err = None
+                        break
+                    # Fall through to next port only if still dead
+                except Exception as e2:
+                    last_err = e2
+                    print(f"  WARNING: retry failed ({e2})")
+            # Non-probe ValueError: stop hopping
+            if not is_localhost_probe:
+                break
+        except OSError as e:
+            last_err = e
+            print(f"  WARNING: bind failed on :{port} ({e})")
+            # Real port conflict — try next free port
+            continue
+        except Exception as e:
+            last_err = e
+            print(f"  WARNING: Gradio failed on :{port} ({e})")
+            if _server_alive():
+                local_url = _accept_live("Exception after bind, server still up.")
+                chosen_port = port
+                last_err = None
+                break
+
+    if not local_url:
+        print(f"ERROR: Gradio failed to start (last error: {last_err})")
+        raise SystemExit(1) from last_err
+
+    print(f"  Gradio listening on {local_url}")
+
+    # Confirm the socket still answers before opening the Qt window
+    if not _wait_for_server("127.0.0.1", chosen_port, timeout=10.0):
+        print(f"ERROR: Gradio server did not come up on port {chosen_port} in time.")
         sys.exit(1)
 
     qt_app = QApplication(sys.argv)
