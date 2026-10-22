@@ -5006,12 +5006,16 @@ def generate_cover_image(
             cfg_cover["cover_mode"] = True
             cfg_cover["ambient_mode"] = True  # no people on covers
             cfg_cover["cover_uses_character"] = False
-            out = _generate_named_still(
-                dest, cover_prompt + var_bit, cfg_cover,
-                reference_image="",
-                attach_ref=False,
-            )
-            images.append(out)
+            try:
+                out = _generate_named_still(
+                    dest, cover_prompt + var_bit, cfg_cover,
+                    reference_image="",
+                    attach_ref=False,
+                )
+                images.append(out)
+            finally:
+                if configure.APP_STATE.get("cover_slot_generating") == slot0:
+                    configure.APP_STATE["cover_slot_generating"] = None
         elapsed = time.time() - t0
         configure.APP_STATE["session_status"] = "stopped"
         configure.APP_STATE["cover_slot_generating"] = None
@@ -5337,6 +5341,11 @@ def generate_theme_images(
             except Exception as e:
                 print(f"[theme] failed theme slot {slot_no}: {e}", flush=True)
                 raise
+            finally:
+                # Clear busy flag for this slot so the UI can show the real PNG
+                # immediately (not wait until the whole batch ends).
+                if configure.APP_STATE.get("theme_slot_generating") == slot0:
+                    configure.APP_STATE["theme_slot_generating"] = None
 
         elapsed = time.time() - t0
         configure.APP_STATE["session_status"] = "stopped"

@@ -580,8 +580,8 @@ def _action_btn_updates(lyrics: str = "", song_name: str = "", *, running: bool 
     Thumbnails (per section): gen · Complete Gen · Emergency Stop
 
     idle empty   → Generate only
-    idle partial → ReGenerate + Complete Gen
-    idle full    → ReGenerate only
+    idle partial → ReGenerate Images + Complete Gen
+    idle full    → ReGenerate Images only
     running      → Emergency Stop only on each section (+ management stop)
 
     Returns 13 updates:
@@ -589,11 +589,31 @@ def _action_btn_updates(lyrics: str = "", song_name: str = "", *, running: bool 
       cover_gen, cover_complete, cover_stop,
       theme_gen, theme_complete, theme_stop,
       lyrics_gen, lyrics_complete, lyrics_stop
+
+    Hard gate: Emergency Stop is shown ONLY while a live job is generating and
+    cancel has not been requested. Late ticks from a dying job_stream cannot
+    re-show Stop after Emergency Stop has already restored idle buttons.
     """
+    # ── Hard gate against stuck Emergency Stop ──────────────────────────
+    if running:
+        still_live = bool(configure.APP_STATE.get("generating"))
+        try:
+            if inference.is_cancel_requested():
+                still_live = False
+        except Exception:
+            pass
+        st = str(configure.APP_STATE.get("session_status") or "").lower()
+        if st in ("idle", "stopped", "done", "error", "failed", ""):
+            # Stop / finish already cleared the job — never re-assert Stop
+            if not still_live:
+                running = False
+        if not still_live:
+            running = False
+
     hide = gr.update(visible=False)
     # Force-hide for Emergency Stop buttons (mgmt + sections) when idle
     stop_hide = gr.update(
-        value="Emergency Stop", visible=False, interactive=False,
+        value="Emergency Stop", visible=False, interactive=False, variant="stop",
     )
     if running:
         mgmt_stop = gr.update(
@@ -1056,6 +1076,8 @@ def _job_stream(
         cur_seq = _still_done_seq()
         saved_now = cur_seq != seen_seq
         seen_seq = cur_seq
+        # Always refresh gallery on progress events and saved stills so
+        # Complete Gen / single-slot fills update the thumb immediately.
         heavy = got_event or saved_now or (now - last_heavy) > heavy_every
         if heavy:
             last_heavy = now
@@ -1067,14 +1089,42 @@ def _job_stream(
         else:
             status = _live_status_line(default_msg, default_info)
 
-        # Nothing new to say (same text, no event, no saved still): skip the
-        # send, but still re-assert Emergency Stop every ~2 s.
+        # Nothing new to say (same text, no event, no saved still): skip the send.
         if not heavy and status == last_status and (now - last_send) < 2.0:
             continue
+
+        # Abort BEFORE yielding if this job was superseded or Emergency Stop
+        # already cleared the running flags. Otherwise a late tick can re-show
+        # Emergency Stop after stop has already restored Generate / Complete Gen.
+        if job_id is not None and not _ui_job_is_current(job_id):
+            break
+        if not configure.APP_STATE.get("generating"):
+            # Stop / finished: never re-assert running=True button set
+            break
+        try:
+            if inference.is_cancel_requested():
+                break
+        except Exception:
+            pass
+
+        # Re-check immediately before yield — stop may have fired between
+        # the earlier generating check and here.
+        if not configure.APP_STATE.get("generating"):
+            break
+        try:
+            if inference.is_cancel_requested():
+                break
+        except Exception:
+            pass
+
         last_status = status
         last_send = now
         sid = configure.APP_STATE.get("active_session_id") or active_session_id or ""
         run_btns = _action_btn_updates(lyrics, song_name, running=True)
+        # Hard gate may have demoted running→idle; if so, exit the stream
+        # so we don't keep a half-running UI alive.
+        if not configure.APP_STATE.get("generating"):
+            break
         gal = gallery_fn(sid) if heavy else _gallery_tab_noop()
         yield (status, *run_btns, sid) + gal + tuple(extra_tail)
         if ended:
@@ -1802,7 +1852,11 @@ def _simple_grid_updates(
             real = paths[i] if i < len(paths) and paths[i] else None
             is_busy = i in busy_idx
             is_queued = (i in queued_idx) and not is_busy
-            if is_busy:
+            # Prefer the real still as soon as it exists — do not keep the
+            # "generating" placeholder after the PNG is on disk.
+            if real and not is_busy:
+                value = real
+            elif is_busy:
                 value = gen_img or real or no_img
             elif is_queued:
                 value = que_img or no_img
@@ -1813,20 +1867,28 @@ def _simple_grid_updates(
             updates.append(gr.update(visible=True))
             updates.append(gr.update(value=value, height=th))
             if has_btns:
-                updates.append(gr.update(
-                    visible=True,
-                    interactive=not is_busy and not is_queued,
-                    value="…" if (is_busy or is_queued) else "Regenerate",
-                ))
-                updates.append(gr.update(
-                    visible=True,
-                    interactive=bool(real) and not is_busy,
-                ))
+                # Empty slot → Generate only. Filled → ReGenerate + Remove.
+                # Busy/queued → "…" on primary, hide Remove.
+                if is_busy or is_queued:
+                    updates.append(gr.update(
+                        visible=True, interactive=False, value="…",
+                    ))
+                    updates.append(gr.update(visible=False, interactive=False))
+                elif real:
+                    updates.append(gr.update(
+                        visible=True, interactive=True, value="ReGenerate",
+                    ))
+                    updates.append(gr.update(visible=True, interactive=True))
+                else:
+                    updates.append(gr.update(
+                        visible=True, interactive=True, value="Generate",
+                    ))
+                    updates.append(gr.update(visible=False, interactive=False))
         else:
             updates.append(gr.update(visible=False))
             updates.append(gr.update(value=None))
             if has_btns:
-                updates.append(gr.update(visible=False, value="Regenerate"))
+                updates.append(gr.update(visible=False, value="Generate"))
                 updates.append(gr.update(visible=False))
     return updates
 
@@ -2030,14 +2092,23 @@ def _thumb_panel_updates(paths: Optional[List[str]] = None) -> List[Any]:
         classes = _section_slot_classes(line_no)
         updates.append(gr.update(visible=True, elem_classes=classes))
         updates.append(gr.update(value=value, height=th))
-        can_regen = not is_busy and not is_queued
-        can_remove = bool(real) and not is_busy
-        updates.append(gr.update(
-            visible=True,
-            interactive=can_regen,
-            value="…" if (is_busy or is_queued) else "Regenerate",
-        ))
-        updates.append(gr.update(visible=True, interactive=can_remove))
+        # Empty → Generate only. Filled → ReGenerate + Remove. Busy → "…".
+        if is_busy or is_queued:
+            updates.append(gr.update(
+                visible=True, interactive=False,
+                value="…",
+            ))
+            updates.append(gr.update(visible=False, interactive=False))
+        elif real:
+            updates.append(gr.update(
+                visible=True, interactive=True, value="ReGenerate",
+            ))
+            updates.append(gr.update(visible=True, interactive=True))
+        else:
+            updates.append(gr.update(
+                visible=True, interactive=True, value="Generate",
+            ))
+            updates.append(gr.update(visible=False, interactive=False))
     return updates
 
 
@@ -2658,7 +2729,7 @@ def _build_thumbnails_tab() -> None:
                             )
                             with gr.Row(elem_classes=["thumb-btn-row"]):
                                 btn = gr.Button(
-                                    "Regenerate",
+                                    "Generate",
                                     visible=slot_vis,
                                     size="sm",
                                     elem_classes=["thumb-regen-btn"],
@@ -2667,7 +2738,7 @@ def _build_thumbnails_tab() -> None:
                                 )
                                 rmv = gr.Button(
                                     "Remove",
-                                    visible=slot_vis,
+                                    visible=False,
                                     size="sm",
                                     variant="stop",
                                     elem_classes=["thumb-remove-btn"],
@@ -2784,7 +2855,7 @@ def _build_thumbnails_tab() -> None:
                         )
                         with gr.Row(elem_classes=["thumb-btn-row"]):
                             btn = gr.Button(
-                                "Regenerate",
+                                "Generate",
                                 visible=slot_vis,
                                 size="sm",
                                 elem_classes=["thumb-regen-btn"],
@@ -2793,7 +2864,7 @@ def _build_thumbnails_tab() -> None:
                             )
                             rmv = gr.Button(
                                 "Remove",
-                                visible=slot_vis,
+                                visible=False,
                                 size="sm",
                                 variant="stop",
                                 elem_classes=["thumb-remove-btn"],
@@ -3284,18 +3355,27 @@ def _wire_create_events(status_box) -> None:
 
     def _stop(lyrics="", song_name=""):
         msg = inference.emergency_stop()
+        # Clear running flags FIRST so any concurrent _job_stream tick sees
+        # generating=False and refuses to re-assert Emergency Stop.
         configure.APP_STATE["session_status"] = "idle"
         configure.APP_STATE["generating"] = False
         configure.APP_STATE["image_gen_t0"] = None
+        configure.APP_STATE["still_finished_at"] = None
+        configure.APP_STATE["still_finished_secs"] = None
         configure.APP_STATE["cover_slot_generating"] = None
         configure.APP_STATE["theme_slot_generating"] = None
         configure.APP_STATE["thumb_generating_line"] = None
+        configure.APP_STATE["thumb_queued_lines"] = []
         configure.APP_STATE["prefer_stop"] = False
+        configure.APP_STATE["regen_busy_lines"] = []
+        configure.APP_STATE["regen_busy_keys"] = []
         _begin_ui_job("stop")  # invalidate any residual UI timer loops
         # Do NOT clear_cancel_state() here — the lyrics/theme/cover worker loops
         # still need is_cancel_requested() True so they exit. Cancel is cleared
         # when the next job starts (clear_cancel_state at pipeline entry).
+        # Recompute idle AFTER flags are cleared so the hard gate cannot show Stop.
         idle = _action_btn_updates(lyrics or "", song_name or "", running=False)
+        print("[ui] Emergency Stop — restored Generate / Complete Gen / ReGenerate", flush=True)
         return (msg, *idle)
 
     def _stop_from_thumb(lyrics, song_name, style, image_size, image_frequency, steps, cfg_scale, ref_image, hair_style, outfit_worn, negative_prompt, active_session_id):
@@ -3338,6 +3418,11 @@ def _wire_create_events(status_box) -> None:
         configure.APP_STATE["cover_slot_generating"] = None
         configure.APP_STATE["theme_slot_generating"] = None
         configure.APP_STATE["thumb_generating_line"] = None
+        configure.APP_STATE["thumb_queued_lines"] = []
+        try:
+            _begin_ui_job("cancel")
+        except Exception:
+            pass
 
     # Management Emergency Stop (+ restores button labels)
     # queue=False so stop runs immediately while a long lyrics generator is queued
