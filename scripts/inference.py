@@ -1816,11 +1816,14 @@ def analyze_song_and_sections(
             "Tone: mythic yet mechanical, reverence mixed with dread, glitching infrastructure, "
             "cyber-ritual. Palette: fractured cyber-gold, charcoal voids, intense multi-colour "
             "UV and electric arcs.\n"
-            "OVERALL must name the Dark Iteration / Authorians context and the surface-vs-"
-            "subsurface split. OTHER_FIGURES must include wasteland scavengers and grey "
-            "military androids with yellow/blue LED trims when the lyrics support crowds or "
-            "secondary presence. SECTIONS must stay inside this universe (server farms, tunnels, "
-            "UV control rooms, android raves, holographic portals) — never generic city streets.\n\n"
+            "OVERALL should lead with place, palette, and infrastructure (surface ruins vs "
+            "subsurface UV bases, cyber-gold/charcoal, electric vortexes) so Cover/Theme stills "
+            "can reuse it as empty worldspace. Name the Dark Iteration / Authorians as lore, "
+            "not as a portrait. Put the main figure's look only in CHARACTER. "
+            "OTHER_FIGURES: wasteland scavengers and grey military androids with yellow/blue "
+            "LED trims when crowds are needed (lyrics stills only). "
+            "SECTIONS stay inside this universe (server farms, tunnels, UV control rooms, "
+            "android raves, holographic portals) — never generic city streets.\n\n"
         )
     elif style == configure.STYLE_DARK:
         style_guidance = (
@@ -2293,9 +2296,14 @@ def generate_visual_prompts(
             section_block = f"Section note ({sec}): {(sec_note or '')[:120]}\n"
 
         instruction = (
+            "Build one music-video still description with this priority mix:\n"
+            "  ~50% the lyric line mood/action (primary)\n"
+            "  ~33% the section note (Intro / Chorus / Bridge / Outro setting)\n"
+            "  ~17% the overall song world (palette/tone only)\n"
             f"Lyric (mood only — do not quote it in the reply): {line}\n"
-            f"Setting context: {(overall or '')[:180]}\n"
-            f"{section_block}"
+            f"Section ({sec}) — secondary context: {(sec_note or '')[:160]}\n"
+            f"Overall world (light touch only): {(overall or '')[:120]}\n"
+            f"{bridge_ctx if bridge_ctx else ''}"
             f"{presence_rule}\n"
             f"{other_bit}"
             "Reply with EXACTLY these two labels and nothing else:\n"
@@ -4269,9 +4277,15 @@ def generate_theme_prompts_from_assessment(
     except (TypeError, ValueError):
         requested = 1
     n = max(1, min(int(configure.THEME_COUNT_MAX), requested))
-    overall = (analysis.get("overall") or "").strip()
-    if not overall:
+    overall_raw = (analysis.get("overall") or "").strip()
+    if not overall_raw:
         return []
+    # Theme stills must be pure landscape/worldspace — strip any people/agents
+    # that OVERALL may contain (esp. Techno Apocalypse / faction language).
+    overall = _scrub_people_language(overall_raw) or overall_raw
+    # If scrub left almost nothing, keep palette/setting keywords only
+    if len(overall) < 40:
+        overall = overall_raw
 
     model_path, role = _resolve_prompt_model(cfg)
     if not model_path:
@@ -4280,19 +4294,21 @@ def generate_theme_prompts_from_assessment(
     style = str(cfg.get("style") or configure.STYLE_DEFAULT)
     title = (song_name or "").replace("_", " ").strip()
     prompt = (
-        "You are writing visual prompts for music-video THEME stills "
-        "(empty worldspace between lyric lines — never character shots, never cover art).\n"
+        "You are writing visual prompts for music-video THEME stills.\n"
+        "THEME = empty game-world landscape / environment only.\n"
+        "Never cover art. Never character shots. Never objects-on-a-table (that is Cover).\n"
         f"Song title (context only): {title or '(untitled)'}\n"
         f"Visual style preference: {style}\n\n"
-        "SOURCE — OVERALL assessment ONLY (discard any character, outfit, or face notes):\n"
+        "SOURCE — OVERALL world notes (already scrubbed of people; use PLACE / LIGHT / PALETTE only):\n"
         f"{overall}\n\n"
         f"Write exactly {n} distinct environment prompts, numbered 1..{n}.\n"
         "Rules for EVERY prompt:\n"
-        "- Worldspace only: architecture, landscape, weather, light, colour, atmosphere, scale\n"
-        "- Empty of people: no person, character, face, body, silhouette, figure, crowd, "
-        "humanoid, protagonist, lone figure, navigator, or implied human presence\n"
-        "- Do not name or describe any character from the song\n"
-        "- Do not narrate anyone walking, standing, or navigating the space\n"
+        "- Landscape / architecture / weather / light / colour / atmosphere / scale only\n"
+        "- Absolutely empty of characters: no person, face, body, silhouette, figure, crowd, "
+        "scavenger, survivor, android, robot, clone, troop, humanoid, protagonist, lone figure, "
+        "navigator, or any implied presence\n"
+        "- Do not narrate anyone walking, standing, dancing, or navigating\n"
+        "- Wide or medium establishing views of the worldspace — not product-style close-ups\n"
         "- One dense positive paragraph suitable for Flux\n"
         "- No text, logos, captions, or lyrics in the image\n"
         "- No 'Prompt:' labels, no quotes, no preamble\n\n"
@@ -4328,12 +4344,14 @@ def generate_theme_prompts_from_assessment(
             re.S,
         ):
             body = re.sub(r"\s+", " ", m.group(2)).strip().strip('"').strip()
+            body = _scrub_people_language(body) or body
             if len(body) > 20:
                 prompts.append(body)
         if not prompts:
             # Fallback: split non-empty lines
             for line in raw.splitlines():
                 t = re.sub(r"^\s*\d+[.)\:\-]\s*", "", line).strip()
+                t = _scrub_people_language(t) or t
                 if len(t) > 40:
                     prompts.append(t)
 
@@ -4555,27 +4573,29 @@ def _generate_named_still(
 
 def _scrub_people_language(text: str) -> str:
     """
-    Strip or neutralize wording that invites people / characters / faces
-    into Cover or Theme stills. Used on LLM concept sentences and
-    OVERALL-derived interpretation snippets before they enter the final
-    positive prompt.
+    Strip wording that invites people / characters / faces / humanoid agents
+    into Cover or Theme stills. Covers scavengers, androids, clones, troops,
+    robots, crowds — anything that is not pure empty worldspace.
     """
     t = (text or "").strip()
     if not t:
         return ""
-    # Full-sentence patterns that centre a human subject
     patterns = [
-        r"(?i)\b(?:a|the|one)\s+(?:lone\s+)?(?:figure|person|man|woman|girl|boy|child|human|character|protagonist|singer|stranger)\b[^.;]*[.;]?",
-        r"(?i)\b(?:figures?|people|humans?|persons?|faces?|portraits?|silhouettes?|crowds?|bodies)\b[^.;]*[.;]?",
-        r"(?i)\b(?:he|she|they)\s+(?:walks?|stands?|sits?|navigates?|moves?|looks?|stares?|runs?|waits?)\b[^.;]*[.;]?",
-        r"(?i)\b(?:close[- ]?up\s+of\s+a\s+face|portrait\s+of|the\s+singer|the\s+protagonist|the\s+character)\b[^.;]*[.;]?",
+        # Human-centred subjects
+        r"(?i)\b(?:a|the|one)\s+(?:lone\s+)?(?:figure|person|man|woman|girl|boy|child|human|character|protagonist|singer|stranger|nonconformist|director|general|winner)\b[^.;]*[.;]?",
+        r"(?i)\b(?:figures?|people|humans?|persons?|faces?|portraits?|silhouettes?|crowds?|bodies|scavengers?|survivors?|inhabitants?|troops?|soldiers?)\b[^.;]*[.;]?",
+        r"(?i)\b(?:he|she|they)\s+(?:walks?|stands?|sits?|navigates?|moves?|looks?|stares?|runs?|waits?|dances?|shouts?)\b[^.;]*[.;]?",
+        r"(?i)\b(?:close[- ]?up\s+of\s+a\s+face|portrait\s+of|the\s+singer|the\s+protagonist|the\s+character|the\s+main\s+(?:figure|character|character's))\b[^.;]*[.;]?",
         r"(?i)\bhumanoid\b[^.;]*[.;]?",
+        # Machine / faction agents that still read as "characters" in stills
+        r"(?i)\b(?:androids?|robots?|clones?|cyborgs?|mechs?|drones?|minions?|authorians?|cyber[- ]?magi)\b[^.;]*[.;]?",
+        r"(?i)\b(?:a|the|one)\s+(?:group\s+of\s+)?(?:cloaked|shadowy)\s+(?:figures?|gatekeepers?|guards?)\b[^.;]*[.;]?",
+        r"(?i)\b(?:director\s+general|dark\s+iteration)\b[^.;]*[.;]?",
     ]
     out = t
     for pat in patterns:
         out = re.sub(pat, " ", out)
     out = re.sub(r"\s{2,}", " ", out).strip(" ,;:-")
-    # If scrubbing emptied the text, drop it entirely
     if len(out) < 12:
         return ""
     return out
@@ -4748,8 +4768,10 @@ def _build_cover_prompt(
         body = f"{body}; theme: {interp.rstrip('.')}"
     body = (
         body.rstrip(".;")
-        + ". Presented cleanly in the song worldspace — no people, no faces, "
-          "no figures, no silhouettes, no humanoid subjects, no character portraits. "
+        + ". Close-up of that single object resting on a surface in the song's game-world. "
+          "Absolutely no characters or background characters: no people, faces, figures, "
+          "silhouettes, scavengers, androids, robots, clones, crowds, or humanoid subjects. "
+          "No landscape establishing shot — the object fills the frame. "
           "All surfaces are smooth and unmarked, free of lettering, inscriptions, "
           "engraving or symbols that resemble writing."
     )
