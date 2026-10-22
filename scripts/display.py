@@ -151,16 +151,71 @@ def _open_project_folder() -> str:
     return _open_output_folder()
 
 
-def _models_configured() -> bool:
+def _models_config_problems() -> List[str]:
+    """
+    Human-readable list of what blocks assessment / generation.
+    Empty list means models look configured.
+    """
+    problems: List[str] = []
     cfg = _cfg()
     text_m = configure.resolve_text_model_path(cfg)
+    th_raw = (cfg.get("thinking_model_path") or "").strip()
+    enc_raw = (cfg.get("encoder_model_path") or "").strip()
     diff = (cfg.get("imagegen_model_path") or "").strip()
-    # VAE is validated at generate time (Flux.2 resolver); not required to unlock Generate
-    if not text_m or not Path(text_m).expanduser().exists():
-        return False
-    if not diff or not Path(diff).expanduser().exists():
-        return False
-    return True
+    # VAE is validated at generate time; not required to unlock Assessment
+
+    if not text_m:
+        if not th_raw and not enc_raw:
+            problems.append(
+                "Thinking model path is empty (Configuration → Text Model / Thinking)."
+            )
+        else:
+            problems.append(
+                f"Thinking model path is set but unresolved "
+                f"(thinking={th_raw or '(empty)'}, encoder={enc_raw or '(empty)'})."
+            )
+    else:
+        p = Path(text_m).expanduser()
+        if not p.is_file():
+            problems.append(f"Thinking model file not found: {p}")
+
+    if not diff:
+        problems.append(
+            "Diffusion model path is empty (Configuration → ImageGen → Diffusion model)."
+        )
+    else:
+        p = Path(diff).expanduser()
+        if not p.is_file():
+            problems.append(f"Diffusion model file not found: {p}")
+
+    # Helpful non-blocking notes (do not block unlock)
+    llama = None
+    try:
+        from scripts import utilities as _u
+        bs = _u.get_build_status()
+        if not bs.get("llama_built"):
+            problems.append("llama-completion binary missing (run Installation).")
+        if not bs.get("sd_built"):
+            problems.append("sd-cli binary missing (run Installation).")
+    except Exception:
+        pass
+
+    return problems
+
+
+def _models_configured() -> bool:
+    return len(_models_config_problems()) == 0
+
+
+def _models_config_status_message() -> str:
+    probs = _models_config_problems()
+    if not probs:
+        return "Models look configured (Thinking + Diffuser paths exist on disk)."
+    lines = ["Cannot run yet — fix the following:"]
+    for i, p in enumerate(probs, 1):
+        lines.append(f"  {i}. {p}")
+    lines.append("Open the Configuration tab, set paths, Save Configuration, then return here.")
+    return "\n".join(lines)
 
 
 def _assessment_path(project_dir: str = "") -> Optional[Path]:
@@ -556,19 +611,20 @@ def _action_btn_updates(lyrics: str = "", song_name: str = "", *, running: bool 
 
     models_ok = _models_configured()
     if not models_ok:
+        # Interactive so a click can report *why* configuration is incomplete
         disabled = gr.update(
             value="Configure the Pages First",
-            interactive=False,
+            interactive=True,
             variant="secondary",
             visible=True,
         )
         c_g, c_c, c_s = _section_btn_triple("cover", lyrics, running=False, can_run=False)
         t_g, t_c, t_s = _section_btn_triple("theme", lyrics, running=False, can_run=False)
         l_g, l_c, l_s = _section_btn_triple("lyrics", lyrics, running=False, can_run=False)
-        # Override gen labels when models missing
-        c_g = gr.update(value="Configure First", interactive=False, variant="secondary", visible=True)
-        t_g = gr.update(value="Configure First", interactive=False, variant="secondary", visible=True)
-        l_g = gr.update(value="Configure First", interactive=False, variant="secondary", visible=True)
+        # Override gen labels when models missing (still clickable for the same diagnostic)
+        c_g = gr.update(value="Configure First", interactive=True, variant="secondary", visible=True)
+        t_g = gr.update(value="Configure First", interactive=True, variant="secondary", visible=True)
+        l_g = gr.update(value="Configure First", interactive=True, variant="secondary", visible=True)
         return (
             disabled, hide, hide, stop_hide,
             c_g, c_c, c_s,
@@ -2364,11 +2420,12 @@ def _build_create_tab() -> None:
                     )
                     _gen["steps"] = gr.Slider(
                         label="Steps",
-                        minimum=1,
-                        maximum=20,
-                        step=1,
+                        minimum=2,
+                        maximum=24,
+                        step=2,
                         value=int(_g0.get("imagegen_steps") or configure.DEFAULT_STEPS),
                         scale=1,
+                        info="Even steps only (2, 4, 6 … 24).",
                     )
                     _gen["cfg"] = gr.Slider(
                         label="CFG",
@@ -2521,7 +2578,8 @@ def _build_create_tab() -> None:
                         else ("Re-run Assessment" if _has_assess0 else "Run Assessment")
                     ),
                     variant="primary" if (_models_ok0 and _can_assess0) else "secondary",
-                    interactive=bool(_models_ok0 and _can_assess0),
+                    # Always clickable: when models missing, click explains what is wrong
+                    interactive=True,
                     visible=True,
                     elem_id="assess-btn",
                 )
@@ -3342,6 +3400,10 @@ def _wire_create_events(status_box) -> None:
 
     def _on_assess_click_ui(active_id: str = ""):
         """Instant UI feedback on Assess: status line + collapse Session slots."""
+        if not _models_configured():
+            msg = _models_config_status_message()
+            print(f"[config] {msg}", flush=True)
+            return (_status_plain(msg),) + _collapse_sidebar_updates(active_id or "")
         return (_status_plain(_ASSESS_START_MSG),) + _collapse_sidebar_updates(active_id or "")
 
     _gen["sidebar_toggle"].click(
@@ -4257,7 +4319,7 @@ def _wire_create_events(status_box) -> None:
             return
         if not _models_configured():
             yield (
-                _status_plain("Configure Thinking model path first."),
+                _status_plain(_models_config_status_message()),
                 *idle_btns, active_session_id or "",
             ) + _gallery_sessions_tab(active_session_id or "")
             return
@@ -4627,8 +4689,10 @@ def _wire_create_events(status_box) -> None:
         idle_btns = _action_btn_updates(lyrics, song_name, running=False)
         run_btns = _action_btn_updates(lyrics, song_name, running=True)
         if not _models_configured():
+            msg = _models_config_status_message()
+            print(f"[config] {msg}", flush=True)
             yield (
-                _status_plain("Configure Thinking + Diffuser models on the Configuration tab first."),
+                _status_plain(msg),
                 *idle_btns, active_session_id or "",
             ) + _gallery_sessions_tab(active_session_id or "") + _no_mode
             return
@@ -4798,7 +4862,7 @@ def _wire_create_events(status_box) -> None:
         run_btns = _action_btn_updates(lyrics, song_name, running=True)
         if not _models_configured():
             yield (
-                _status_plain("Configure Thinking + Diffuser models on the Configuration tab first."),
+                _status_plain(_models_config_status_message()),
                 *idle_btns, active_session_id or "",
             ) + _gallery_sessions_tab(active_session_id or "")
             return
@@ -6029,10 +6093,14 @@ def _build_pref_tab() -> None:
             value=bool(prefs.get("bleep_video_completion", False)),
             info="Beep when all materials are ready. Both on → double bleep.",
         )
+    # Passkey: plaintext while typing; masked stars after save/load.
+    # Real value lives only in preferences.json; UI shows "*" * len when set.
+    _pk_raw = str(prefs.get("passkey") or "")
+    _pk_display = ("*" * len(_pk_raw)) if _pk_raw else ""
     _pref["passkey"] = gr.Textbox(
         label="Passkey",
-        value=str(prefs.get("passkey") or ""),
-        type="password",
+        value=_pk_display,
+        type="text",
         lines=1,
         max_lines=1,
     )
@@ -6040,6 +6108,17 @@ def _build_pref_tab() -> None:
 
 
 def _wire_pref_events(status_box) -> None:
+    def _resolve_passkey_input(typed: str) -> str:
+        """
+        If the field still shows only stars matching the stored length, keep
+        the stored passkey (user did not edit). Otherwise take the new text.
+        """
+        typed = str(typed or "")
+        stored = configure._read_passkey_raw()
+        if stored and typed == ("*" * len(stored)):
+            return stored
+        return typed.strip()
+
     def _save(max_thumbs, lyrics_per_row, bleep_section, bleep_video, passkey):
         try:
             per = int(lyrics_per_row)
@@ -6047,30 +6126,30 @@ def _wire_pref_events(status_box) -> None:
             per = configure.DEFAULT_LYRICS_THUMBS_PER_ROW
         if per not in configure.LYRICS_THUMBS_PER_ROW_CHOICES:
             per = configure.DEFAULT_LYRICS_THUMBS_PER_ROW
+        real_pk = _resolve_passkey_input(passkey)
         configure.update_preferences({
             "max_thumbnails": int(max_thumbs),
             "lyrics_thumbs_per_row": per,
             "bleep_section_completion": bool(bleep_section),
             "bleep_video_completion": bool(bleep_video),
-            "passkey": str(passkey or "").strip(),
+            "passkey": real_pk,
         })
         choices = configure.style_choices_for_ui()
-        # Keep current selection if still valid; otherwise fall back to default
         cur = configure.normalize_style(configure.load_preferences().get("style"))
         if cur not in choices:
             cur = configure.STYLE_DEFAULT
             configure.update_preferences({"style": cur})
         style_upd = gr.update(choices=choices, value=cur)
-        return (
+        pk_display = ("*" * len(real_pk)) if real_pk else ""
+        msg = (
             f"Preferences saved — lyrics stills show {per} per row "
-            f"(Thumbnails tab refreshes on next gallery update).",
-            style_upd,
+            f"(Thumbnails tab refreshes on next gallery update)."
         )
+        # Always (status, style, passkey) — style dropdown exists on Management tab
+        return msg, style_upd, gr.update(value=pk_display)
 
-    outs = [status_box]
-    # Refresh Visual Style dropdown when present (Management tab)
-    if _gen.get("style") is not None:
-        outs.append(_gen["style"])
+    # style dropdown is built in Management before Preferences is wired
+    outs = [status_box, _gen["style"], _pref["passkey"]]
     _pref["save_btn"].click(
         _save,
         inputs=[
