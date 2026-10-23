@@ -9,7 +9,7 @@ It convert lines of lyrics into AI generated images, up to 30 per line (20 is qu
 ![Generation_Page](https://github.com/wiseman-timelord/Lyrics-Materials/blob/main/media/Management_Page.jpg)
 
 - Here is Newer version, but the GUI/Controls are improved and somewhat final design (v0.43)...
-![Generation_Page](https://github.com/wiseman-timelord/Lyrics-Materials/blob/main/media/Thumbnails_Page_v025.jpg)
+![Generation_Page](https://github.com/wiseman-timelord/Lyrics-Materials/blob/main/media/Thumbnails_Page_v43.jpg)
 
 - The Configuration page is refined, with two individual models columns (v0.25)...
 ![Generation_Page](https://github.com/wiseman-timelord/Lyrics-Materials/blob/main/media/Configuration_Page.jpg)
