@@ -1,5 +1,5 @@
 # Lyrics-Materials
-Status: Beta - Mid-development; the program seems to work ok v0.40+, fixed some button issues in v0.42, after the recent improvement of prompts/styles. Installer tested/fixed for install option 4 Vulkan-Compile on v0.38, so assuming its working ok still. 
+Status: Beta - Mid-development; the program seems to work, fixed some button/slot issues in v0.42-v0.43, after the recent improvement of prompts/styles. Installer tested/fixed for install option 4 Vulkan-Compile on v0.38, assuming its working. 
 
 ### Description:
 It convert lines of lyrics into AI generated images, up to 30 per line (20 is quite fast enough for me). The idea is one could arrange these in a movie editor, and tactically use theme images for fillers in the video or promotional material, so its a program to make simple AI music videos. One could also take the line of lyrics and the generated images, and feed that into AI video generator to make clips, that could then be assembled into a video clips.
