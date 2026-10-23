@@ -1,5 +1,5 @@
 # Lyrics-Materials
-Status: Beta - Mid-development; the program seems to work ok, recent improvement of prompts/styles. Installer tested/fixed for install option 4 Vulkan-Compile on v0.38, so assuming its working ok. 
+Status: Beta - Mid-development; the program seems to work ok v0.40+, fixed some button issues in v0.42, after the recent improvement of prompts/styles. Installer tested/fixed for install option 4 Vulkan-Compile on v0.38, so assuming its working ok still. 
 
 ### Description:
 It convert lines of lyrics into AI generated images, up to 30 per line (20 is quite fast enough for me). The idea is one could arrange these in a movie editor, and tactically use theme images for fillers in the video or promotional material, so its a program to make simple AI music videos. One could also take the line of lyrics and the generated images, and feed that into AI video generator to make clips, that could then be assembled into a video clips.
@@ -22,6 +22,12 @@ It convert lines of lyrics into AI generated images, up to 30 per line (20 is qu
 - **Clever Model Handling;** configure the Encoding processes to, OtherGPU or CPU, to extend Flux2 GPU Memory, while still generating Prompts on GPU too.
 - **Local Tool;** not requiring the use of online antigenic services to create your own local model based music slideshows.
 - **libraries;** llama.cpp for song analysis + per-line visual prompts, stable-diffusion.cpp for Flux.2-klein. ffmpeg for utility/probe.
+
+### Requirements:
+This part of the readme needs completing...
+- Windows 10/11.
+- Python ~3.12.
+- Internet for install of libraries/binaries.
 
 ### Models
 Available on [HuggingFace.Co](https://huggingface.co/)...  
