@@ -552,6 +552,49 @@ def _project_has_any_images(project_dir: str = "") -> bool:
 
 
 
+def _preseed_section_queue(kind: str, mode: str = "generate") -> None:
+    """
+    Mark every slot a Cover / Theme run is about to fill as QUEUED *before* the
+    first UI refresh, so the grid shows thumbnails_qued_for_generation.jpg for
+    the waiting slots instead of No Image while prompts are still being written.
+
+    complete / generate → slots without a still on disk
+    regenerate          → every slot in the current Image Frequency
+    inference.py overwrites these lists with the authoritative values once it
+    has worked out the real plan, and clears them when the run ends.
+    """
+    kind = (kind or "").strip().lower()
+    if kind not in ("cover", "theme"):
+        return
+    try:
+        if kind == "cover":
+            target = max(0, int(configure.frequency_cover_count(_current_freq_label())))
+        else:
+            target = max(0, int(configure.frequency_theme_count(_current_freq_label())))
+    except Exception:
+        target = 0
+    if target <= 0:
+        configure.APP_STATE[f"{kind}_slot_queued"] = []
+        return
+    folder = (configure.APP_STATE.get("current_project_folder") or "").strip()
+    have: set = set()
+    if folder and Path(folder).is_dir():
+        try:
+            have = {i for i, pth in _named_slot_map(kind, folder).items() if pth}
+        except Exception:
+            have = set()
+    m = (mode or "generate").strip().lower()
+    if m == "regenerate":
+        queued = list(range(target))
+    else:
+        queued = [i for i in range(target) if i not in have]
+    cap = COVER_SLOTS if kind == "cover" else THEME_SLOTS
+    queued = [i for i in queued if i < cap]
+    configure.APP_STATE[f"{kind}_slot_queued"] = queued
+    configure.APP_STATE[f"{kind}_slot_generating"] = None
+    configure.APP_STATE[f"{kind}_slot_expected"] = min(target, cap)
+
+
 def _begin_ui_job(kind: str = "job") -> int:
     """Bump UI job id so any prior generator loop exits on the next tick."""
     try:
@@ -3366,6 +3409,8 @@ def _wire_create_events(status_box) -> None:
         configure.APP_STATE["theme_slot_generating"] = None
         configure.APP_STATE["thumb_generating_line"] = None
         configure.APP_STATE["thumb_queued_lines"] = []
+        configure.APP_STATE["cover_slot_queued"] = []
+        configure.APP_STATE["theme_slot_queued"] = []
         configure.APP_STATE["prefer_stop"] = False
         configure.APP_STATE["regen_busy_lines"] = []
         configure.APP_STATE["regen_busy_keys"] = []
@@ -3419,6 +3464,8 @@ def _wire_create_events(status_box) -> None:
         configure.APP_STATE["theme_slot_generating"] = None
         configure.APP_STATE["thumb_generating_line"] = None
         configure.APP_STATE["thumb_queued_lines"] = []
+        configure.APP_STATE["cover_slot_queued"] = []
+        configure.APP_STATE["theme_slot_queued"] = []
         try:
             _begin_ui_job("cancel")
         except Exception:
@@ -4514,7 +4561,6 @@ def _wire_create_events(status_box) -> None:
         progress=gr.Progress(track_tqdm=False),
     ):
         idle_btns = _action_btn_updates(lyrics, song_name, running=False)
-        run_btns = _action_btn_updates(lyrics, song_name, running=True)
         if not _can_cover(song_name):
             yield (
                 _status_plain("Song name and models are required for a cover image."),
@@ -4522,7 +4568,13 @@ def _wire_create_events(status_box) -> None:
             ) + _gallery_sessions_tab(active_session_id or "")
             return
 
+        # Clear any stale Emergency-Stop latch, then raise the live flags BEFORE
+        # the first yield. _action_btn_updates(running=True) and _job_stream both
+        # key off APP_STATE["generating"]; without it the stream exits at once and
+        # the idle (ReGenerate / Complete Gen) buttons are shown mid-inference.
+        inference.clear_cancel_state()
         configure.APP_STATE["session_status"] = "running"
+        configure.APP_STATE["generating"] = True
         job_id = _begin_ui_job("cover")
         c = _cfg()
         cfg = dict(c)
@@ -4579,6 +4631,8 @@ def _wire_create_events(status_box) -> None:
             s = configure.get_session_by_id(active_session_id)
             if s and Path(s["path"]).is_dir():
                 resume_folder = s["path"]
+        _preseed_section_queue("cover", str(configure.APP_STATE.get("gen_mode") or "generate"))
+        run_btns = _action_btn_updates(lyrics, song_name, running=True)
         yield (
             _status_from_progress("Generating cover image…", 0.0, {"phase": "cover", "line": 1, "total": 1}),
             *run_btns, active_session_id or "",
@@ -4618,6 +4672,9 @@ def _wire_create_events(status_box) -> None:
             default_msg="Generating cover still…",
             default_info={"phase": "cover", "line": 1, "total": 1},
         )
+        # _job_stream can end early (cancel / superseded); never report "done"
+        # while the worker is still running.
+        th.join(timeout=1.0)
         r = result_holder.get("r") or {}
         msg = r.get("message") or "Cover done."
         sid = r.get("session_id") or configure.APP_STATE.get("active_session_id") or active_session_id or ""
@@ -4626,6 +4683,8 @@ def _wire_create_events(status_box) -> None:
             configure.update_generation({"last_project_folder": r["project_folder"]})
         configure.APP_STATE["generating"] = False
         configure.APP_STATE["session_status"] = "idle"
+        configure.APP_STATE["cover_slot_queued"] = []
+        configure.APP_STATE["cover_slot_generating"] = None
         # Force idle button set so Emergency Stop is hidden on every section
         idle_btns = _action_btn_updates(lyrics, song_name, running=False)
         yield (
@@ -4637,7 +4696,6 @@ def _wire_create_events(status_box) -> None:
         progress=gr.Progress(track_tqdm=False),
     ):
         idle_btns = _action_btn_updates(lyrics, song_name, running=False)
-        run_btns = _action_btn_updates(lyrics, song_name, running=True)
         if not _can_theme(lyrics, song_name):
             yield (
                 _status_plain("Song name, lyrics, and models are required for theme images."),
@@ -4645,7 +4703,13 @@ def _wire_create_events(status_box) -> None:
             ) + _gallery_sessions_tab(active_session_id or "")
             return
 
+        # Clear any stale Emergency-Stop latch, then raise the live flags BEFORE
+        # the first yield. _action_btn_updates(running=True) and _job_stream both
+        # key off APP_STATE["generating"]; without it the stream exits at once and
+        # the idle (ReGenerate / Complete Gen) buttons are shown mid-inference.
+        inference.clear_cancel_state()
         configure.APP_STATE["session_status"] = "running"
+        configure.APP_STATE["generating"] = True
         job_id = _begin_ui_job("theme")
         c = _cfg()
         cfg = dict(c)
@@ -4703,6 +4767,8 @@ def _wire_create_events(status_box) -> None:
             s = configure.get_session_by_id(active_session_id)
             if s and Path(s["path"]).is_dir():
                 resume_folder = s["path"]
+        _preseed_section_queue("theme", str(configure.APP_STATE.get("gen_mode") or "generate"))
+        run_btns = _action_btn_updates(lyrics, song_name, running=True)
         yield (
             _status_from_progress(
                 "Analysing song & generating theme images…",
@@ -4743,6 +4809,9 @@ def _wire_create_events(status_box) -> None:
             default_msg="Generating theme still…",
             default_info={"phase": "theme"},
         )
+        # _job_stream can end early (cancel / superseded); never report "done"
+        # while the worker is still running.
+        th.join(timeout=1.0)
         r = result_holder.get("r") or {}
         msg = r.get("message") or "Theme images done."
         sid = r.get("session_id") or configure.APP_STATE.get("active_session_id") or active_session_id or ""
@@ -4751,6 +4820,8 @@ def _wire_create_events(status_box) -> None:
             configure.update_generation({"last_project_folder": r["project_folder"]})
         configure.APP_STATE["generating"] = False
         configure.APP_STATE["session_status"] = "idle"
+        configure.APP_STATE["theme_slot_queued"] = []
+        configure.APP_STATE["theme_slot_generating"] = None
         # Force idle button set so Emergency Stop is hidden on every section
         idle_btns = _action_btn_updates(lyrics, song_name, running=False)
         yield (
