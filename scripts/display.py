@@ -588,11 +588,105 @@ def _preseed_section_queue(kind: str, mode: str = "generate") -> None:
         queued = list(range(target))
     else:
         queued = [i for i in range(target) if i not in have]
+        if m == "generate" and not queued:
+            # inference.py wipes + redoes a full set in plain "generate" mode
+            queued = list(range(target))
     cap = COVER_SLOTS if kind == "cover" else THEME_SLOTS
     queued = [i for i in queued if i < cap]
     configure.APP_STATE[f"{kind}_slot_queued"] = queued
     configure.APP_STATE[f"{kind}_slot_generating"] = None
     configure.APP_STATE[f"{kind}_slot_expected"] = min(target, cap)
+
+
+def _preseed_lyrics_queue(lyrics: str = "", mode: str = "generate", folder: str = "") -> None:
+    """
+    List every lyric line that still needs a still as QUEUED before the first
+    refresh, so the Lyrics grid shows thumbnails_qued_for_generation.jpg for the
+    waiting slots (not No Image) while assessment / prompts are still running.
+
+    complete / generate → lines with any missing variant on disk
+    regenerate          → every line (stills are wiped when the image phase starts)
+    The queue is consumed line by line by _track_lyrics_event() and cleared when
+    the run ends or Emergency Stop fires.
+    """
+    n = 0
+    try:
+        from scripts.inference import parse_lyrics, lyric_lines_only
+        n = len(lyric_lines_only(parse_lyrics(lyrics or "")))
+    except Exception:
+        n = 0
+    if n > 0:
+        configure.APP_STATE["thumb_expected_count"] = n
+    else:
+        try:
+            n = int(configure.APP_STATE.get("thumb_expected_count") or 0)
+        except (TypeError, ValueError):
+            n = 0
+    if n <= 0:
+        configure.APP_STATE["thumb_queued_lines"] = []
+        return
+    per = _lyrics_per_line_count()
+    folder = (folder or configure.APP_STATE.get("current_project_folder") or "").strip()
+    by_key: Dict[Tuple[int, int], str] = {}
+    by_line: Dict[int, str] = {}
+    if folder and Path(folder).is_dir():
+        try:
+            paths = _list_project_images(folder)
+            by_key = _variant_path_map(paths)
+            by_line = _line_path_map(paths)
+        except Exception:
+            by_key, by_line = {}, {}
+    m = (mode or "generate").strip().lower()
+    if m == "regenerate":
+        queued = list(range(1, n + 1))
+    else:
+        queued = []
+        for ln in range(1, n + 1):
+            if per <= 1:
+                if ln not in by_line and (ln, 1) not in by_key:
+                    queued.append(ln)
+            elif any((ln, v) not in by_key for v in range(1, per + 1)):
+                queued.append(ln)
+    configure.APP_STATE["thumb_queued_lines"] = queued
+    configure.APP_STATE["thumb_generating_line"] = None
+
+
+def _track_lyrics_event(it) -> None:
+    """
+    Progress-event hook shared by the Lyrics and All-Assets runs: move a line
+    from QUEUED → GENERATING when the pipeline announces it. Lines that are
+    skipped because the still already exists never flash the Generating image.
+    """
+    try:
+        msg, _frac, info = it
+    except Exception:
+        return
+    info = info or {}
+    phase = info.get("phase") or ""
+    line = info.get("line")
+    if phase in ("images", "regen") and line is not None:
+        try:
+            n = int(line)
+        except (TypeError, ValueError):
+            return
+        _unqueue_line(n)
+        raw = str(info.get("_raw_msg") or msg or "").lower()
+        if "skipped" in raw and "exist" in raw:
+            configure.APP_STATE["thumb_generating_line"] = None
+            return
+        configure.APP_STATE["thumb_generating_line"] = n
+    elif phase in ("done", "error"):
+        configure.APP_STATE["thumb_generating_line"] = None
+
+
+def _clear_all_queues() -> None:
+    """Nothing stays queued / generating once a run ends or is stopped."""
+    configure.APP_STATE["thumb_queued_lines"] = []
+    configure.APP_STATE["thumb_generating_line"] = None
+    configure.APP_STATE["cover_slot_queued"] = []
+    configure.APP_STATE["theme_slot_queued"] = []
+    configure.APP_STATE["cover_slot_generating"] = None
+    configure.APP_STATE["theme_slot_generating"] = None
 
 
 def _begin_ui_job(kind: str = "job") -> int:
@@ -617,7 +711,9 @@ def _ui_job_is_current(job_id: int) -> bool:
         return False
 
 
-def _action_btn_updates(lyrics: str = "", song_name: str = "", *, running: bool = False):
+def _action_btn_updates(
+    lyrics: str = "", song_name: str = "", *, running: bool = False, arm_sync: bool = True,
+):
     """
     Management: Assessment · All Assets · Lyrics Prompts · Emergency Stop
     Thumbnails (per section): gen · Complete Gen · Emergency Stop
@@ -652,6 +748,15 @@ def _action_btn_updates(lyrics: str = "", song_name: str = "", *, running: bool 
                 running = False
         if not still_live:
             running = False
+
+    # Remember which button set this call hands to the UI.
+    configure.APP_STATE["ui_btn_mode"] = "running" if running else "idle"
+    if not running and arm_sync:
+        # Every idle hand-off arms the idle-sync timer: for the next few ticks it
+        # re-sends the authoritative idle buttons (Emergency Stop hidden), so the
+        # browser converges even when a stale "running" update is applied after
+        # the stop's idle update.
+        configure.APP_STATE["ui_idle_sync_left"] = 8
 
     hide = gr.update(visible=False)
     # Force-hide for Emergency Stop buttons (mgmt + sections) when idle
@@ -1163,12 +1268,25 @@ def _job_stream(
         last_status = status
         last_send = now
         sid = configure.APP_STATE.get("active_session_id") or active_session_id or ""
+        # Build the (slow) gallery update FIRST, then re-check the stop gates and
+        # only then build the running buttons. Emergency Stop can fire while the
+        # gallery is being scanned; a "running" button set built before that
+        # would arrive after the stop's idle set and leave Emergency Stop showing.
+        gal = gallery_fn(sid) if heavy else _gallery_tab_noop()
+        if job_id is not None and not _ui_job_is_current(job_id):
+            break
+        if not configure.APP_STATE.get("generating"):
+            break
+        try:
+            if inference.is_cancel_requested():
+                break
+        except Exception:
+            pass
         run_btns = _action_btn_updates(lyrics, song_name, running=True)
         # Hard gate may have demoted running→idle; if so, exit the stream
         # so we don't keep a half-running UI alive.
         if not configure.APP_STATE.get("generating"):
             break
-        gal = gallery_fn(sid) if heavy else _gallery_tab_noop()
         yield (status, *run_btns, sid) + gal + tuple(extra_tail)
         if ended:
             break
@@ -2057,12 +2175,15 @@ def _thumb_panel_updates(paths: Optional[List[str]] = None) -> List[Any]:
             busy.add(int(x))
         except (TypeError, ValueError):
             pass
+    # Batch run's current line is handled per variant below (finished variants
+    # keep their still; only the one being made shows Generating).
+    batch_line = None
     cur = configure.APP_STATE.get("thumb_generating_line")
     if cur is not None:
         try:
-            busy.add(int(cur))
+            batch_line = int(cur)
         except (TypeError, ValueError):
-            pass
+            batch_line = None
     # Per-(line,variant) busy from regen jobs
     busy_keys: set = set()
     for x in (configure.APP_STATE.get("regen_busy_keys") or []):
@@ -2122,7 +2243,18 @@ def _thumb_panel_updates(paths: Optional[List[str]] = None) -> List[Any]:
         if not real and per == 1:
             real = by_key.get((line_no, 1)) or _line_path_map(paths, variant=0).get(line_no)
         is_busy = (line_no in busy) or ((line_no, var) in busy_keys)
-        is_queued = (line_no in queued) and not is_busy
+        is_queued = (line_no in queued) and not is_busy and not real
+        if not is_busy and not real and batch_line == line_no:
+            # Current batch line: first variant still missing is generating,
+            # any later missing variants of the same line wait in the queue.
+            first_missing = next(
+                (v for v in range(1, max(per, 1) + 1) if (line_no, v) not in by_key),
+                var,
+            )
+            if per <= 1 or var == first_missing:
+                is_busy, is_queued = True, False
+            else:
+                is_busy, is_queued = False, True
         if is_busy:
             value = gen_img or no_img
         elif is_queued:
@@ -3408,13 +3540,14 @@ def _wire_create_events(status_box) -> None:
         configure.APP_STATE["cover_slot_generating"] = None
         configure.APP_STATE["theme_slot_generating"] = None
         configure.APP_STATE["thumb_generating_line"] = None
-        configure.APP_STATE["thumb_queued_lines"] = []
-        configure.APP_STATE["cover_slot_queued"] = []
-        configure.APP_STATE["theme_slot_queued"] = []
+        _clear_all_queues()
         configure.APP_STATE["prefer_stop"] = False
         configure.APP_STATE["regen_busy_lines"] = []
         configure.APP_STATE["regen_busy_keys"] = []
         _begin_ui_job("stop")  # invalidate any residual UI timer loops
+        # Give an in-flight tick of the dying generator a moment to emit (and
+        # end) before the idle set is built, so the idle set is the last word.
+        time.sleep(0.35)
         # Do NOT clear_cancel_state() here — the lyrics/theme/cover worker loops
         # still need is_cancel_requested() True so they exit. Cancel is cleared
         # when the next job starts (clear_cancel_state at pipeline entry).
@@ -3463,9 +3596,7 @@ def _wire_create_events(status_box) -> None:
         configure.APP_STATE["cover_slot_generating"] = None
         configure.APP_STATE["theme_slot_generating"] = None
         configure.APP_STATE["thumb_generating_line"] = None
-        configure.APP_STATE["thumb_queued_lines"] = []
-        configure.APP_STATE["cover_slot_queued"] = []
-        configure.APP_STATE["theme_slot_queued"] = []
+        _clear_all_queues()
         try:
             _begin_ui_job("cancel")
         except Exception:
@@ -3950,8 +4081,6 @@ def _wire_create_events(status_box) -> None:
     ):
         # Idle restore vs running (hide generate trio, show Emergency Stop)
         idle_btns = _action_btn_updates(lyrics, song_name, running=False)
-        run_btns = _action_btn_updates(lyrics, song_name, running=True)
-
 
         if not _can_create(lyrics, song_name):
             yield (
@@ -3961,7 +4090,11 @@ def _wire_create_events(status_box) -> None:
             ) + _gallery_sessions_tab(active_session_id or "")
             return
 
+        # Raise the live flags BEFORE building the running buttons (the hard gate
+        # in _action_btn_updates demotes running→idle while generating is False).
+        inference.clear_cancel_state()
         configure.APP_STATE["session_status"] = "running"
+        configure.APP_STATE["generating"] = True
         job_id = _begin_ui_job("lyrics")
 
         c = _cfg()
@@ -4034,16 +4167,12 @@ def _wire_create_events(status_box) -> None:
             pass
         configure.APP_STATE["thumb_generating_line"] = None
         configure.APP_STATE["regen_busy_lines"] = []
-        configure.APP_STATE["thumb_queued_lines"] = []
-        # Every lyric line without a still on disk is now listed for generation
-        try:
-            _n_q = int(configure.APP_STATE.get("thumb_expected_count") or 0)
-            _have = _line_path_map(_list_project_images(resume_folder)) if resume_folder else {}
-            configure.APP_STATE["thumb_queued_lines"] = [
-                k for k in range(1, min(_n_q, THUMB_SLOTS) + 1) if k not in _have
-            ]
-        except Exception:
-            configure.APP_STATE["thumb_queued_lines"] = []
+        # Every lyric line that still needs a still is listed as QUEUED now, and
+        # stays queued until the pipeline announces it (see _track_lyrics_event).
+        _preseed_lyrics_queue(
+            lyrics, str(configure.APP_STATE.get("gen_mode") or "generate"), resume_folder,
+        )
+        run_btns = _action_btn_updates(lyrics, song_name, running=True)
 
         yield (
             _status_plain("Starting lyrics slideshow pipeline…"),
@@ -4096,23 +4225,12 @@ def _wire_create_events(status_box) -> None:
             n_lines = 0
         if n_lines > 0:
             configure.APP_STATE["thumb_expected_count"] = n_lines
-        configure.APP_STATE["thumb_generating_line"] = None
-        configure.APP_STATE["regen_busy_lines"] = []
-        configure.APP_STATE["thumb_queued_lines"] = []
+        # NOTE: the queued-line list seeded above must survive the worker start.
 
         def _on_lyrics_event(it) -> None:
             msg, frac, info = it
-            # Track which still is currently generating (1-based)
-            phase = (info or {}).get("phase") or ""
-            line = (info or {}).get("line")
-            if phase in ("images", "regen") and line is not None:
-                try:
-                    configure.APP_STATE["thumb_generating_line"] = int(line)
-                    _unqueue_line(int(line))
-                except (TypeError, ValueError):
-                    pass
-            elif phase in ("done", "error"):
-                configure.APP_STATE["thumb_generating_line"] = None
+            # QUEUED → GENERATING bookkeeping (1-based lines)
+            _track_lyrics_event(it)
             try:
                 progress(float(frac), desc=msg)
             except Exception:
@@ -4149,9 +4267,11 @@ def _wire_create_events(status_box) -> None:
                 "last_project_folder": r.get("project_folder") or "",
             })
             configure.APP_STATE["active_session_id"] = sid
+        th.join(timeout=1.0)
         configure.APP_STATE["generating"] = False
         # Run finished/stopped/failed: nothing from the batch stays queued
         configure.APP_STATE["thumb_queued_lines"] = []
+        configure.APP_STATE["thumb_generating_line"] = None
 
         # Drain regenerate queue (queued while this run was busy)
         q = list(configure.APP_STATE.get("regen_queue") or [])
@@ -5015,7 +5135,6 @@ def _wire_create_events(status_box) -> None:
         using the current assessment / settings.
         """
         idle_btns = _action_btn_updates(lyrics, song_name, running=False)
-        run_btns = _action_btn_updates(lyrics, song_name, running=True)
         if not _models_configured():
             yield (
                 _status_plain(_models_config_status_message()),
@@ -5035,10 +5154,12 @@ def _wire_create_events(status_box) -> None:
             ) + _gallery_sessions_tab(active_session_id or "")
             return
 
+        inference.clear_cancel_state()
         configure.APP_STATE["generating"] = True
         configure.APP_STATE["session_status"] = "running"
         assets_complete = _all_assets_complete(lyrics)
         label = "ReGen All Assets" if assets_complete else "Gen All Assets"
+        run_btns = _action_btn_updates(lyrics, song_name, running=True)
         yield (
             _status_plain(f"{label}…"),
             *run_btns, active_session_id or "",
@@ -5099,6 +5220,16 @@ def _wire_create_events(status_box) -> None:
                 *run_btns, active_session_id or "",
             ) + _gallery_sessions_tab(active_session_id or "")
 
+        # Cover, Theme AND Lyrics slots that still need a still are QUEUED up
+        # front, so no section sits on "No Image" while an earlier one is working.
+        _preseed_section_queue("cover", "generate")
+        _preseed_section_queue("theme", "generate")
+        _preseed_lyrics_queue(lyrics, "generate", folder or "")
+        yield (
+            _status_plain(f"{label}…"),
+            *run_btns, active_session_id or "",
+        ) + _gallery_sessions_tab(active_session_id or "")
+
         import queue
         import threading
         prog_q: queue.Queue = queue.Queue()
@@ -5113,7 +5244,9 @@ def _wire_create_events(status_box) -> None:
                 configure.APP_STATE["status_last_msg"] = msg
                 configure.APP_STATE["status_last_frac"] = frac
                 configure.APP_STATE["status_last_info"] = info or {}
-                prog_q.put((_status_from_progress(msg, frac, info or {}), frac, info or {}))
+                _info = dict(info or {})
+                _info["_raw_msg"] = msg
+                prog_q.put((_status_from_progress(msg, frac, info or {}), frac, _info))
             except Exception:
                 pass
 
@@ -5179,11 +5312,13 @@ def _wire_create_events(status_box) -> None:
             None, prog_q, th, lyrics, song_name, active_session_id,
             default_msg=f"{label}…",
             default_info={"phase": "start"},
+            on_event=_track_lyrics_event,
         )
 
         th.join(timeout=5)
         configure.APP_STATE["generating"] = False
         configure.APP_STATE["session_status"] = "stopped"
+        _clear_all_queues()
         r = result_holder.get("r") or {}
         msg = " · ".join(result_holder.get("messages") or []) or r.get("message") or "All assets done."
         sid = r.get("session_id") or configure.APP_STATE.get("active_session_id") or active_session_id or ""
@@ -5232,6 +5367,42 @@ def _wire_create_events(status_box) -> None:
             finally:
                 configure.APP_STATE.pop("gen_mode", None)
         return _wrapped
+
+    def _reconcile_idle_buttons(lyrics="", song_name=""):
+        """
+        Idle-sync for the button row. While nothing is generating, and for a few
+        ticks after any stop / finish / idle hand-off, re-send the authoritative
+        idle button set (Generate / ReGenerate / Complete Gen shown, every
+        Emergency Stop hidden). Browser-side update ordering between the Stop
+        click and the dying generator is not guaranteed, so one idle update is
+        not always the last word; this makes the UI converge. No-op during a live
+        run, and a no-op once the sync window has drained.
+        """
+        noop = _btn_pad()
+        if configure.APP_STATE.get("generating"):
+            return noop
+        try:
+            left = int(configure.APP_STATE.get("ui_idle_sync_left") or 0)
+        except (TypeError, ValueError):
+            left = 0
+        if left <= 0:
+            return noop
+        configure.APP_STATE["ui_idle_sync_left"] = left - 1
+        return _action_btn_updates(
+            lyrics or "", song_name or "", running=False, arm_sync=False,
+        )
+
+    try:
+        _btn_timer = gr.Timer(1.5)
+        _btn_timer.tick(
+            _reconcile_idle_buttons,
+            inputs=[_gen["lyrics"], _gen["song_name"]],
+            outputs=_action_btn_components(),
+            queue=False,
+            show_progress="hidden",
+        )
+    except Exception as _e:
+        print(f"[ui] idle-button reconcile timer not bound: {_e}", flush=True)
 
     def _stop_for_run_outputs(lyrics="", song_name="", active_session_id=""):
         """Dedicated Emergency Stop for Thumbnails section stop buttons."""
