@@ -28,6 +28,20 @@ This part of the readme needs completing...
 - Windows 10/11.
 - Python ~3.12.
 - Internet for install of libraries/binaries.
+- A GPU with 12GB or more VRAM, Grok did an assessment for 8GB VRAM with, encoder on CPU and Flux2 model Split...
+```
+Size,Area vs 768×512,8 GB Split outlook
+640 × 360,0.59×,Safe
+720 × 405,0.74×,Safe
+768 × 432,0.84×,Safe
+768 × 512,1.00×,Known-good on your 8 GB
+896 × 504,1.15×,Should fit if little else holds VRAM
+1024 × 512,1.33×,Marginal — may OOM with driver/fragmentation
+1024 × 768,2.00×,Expected crash / OOM (matches what you see)
+1280 × 720,2.34×,OOM on 8 GB
+1280 × 768,2.50×,OOM
+1366 × 768,2.67×,OOM
+```
 
 ### Models
 Available on [HuggingFace.Co](https://huggingface.co/)...  
