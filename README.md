@@ -28,7 +28,7 @@ This part of the readme needs completing...
 - Windows 10/11.
 - Python ~3.12.
 - Internet for install of libraries/binaries.
-- A GPU with 12GB or more VRAM, Grok did an assessment for 8GB VRAM with, Qwen3 encoder on CPU and Flux2 model Split...
+- Grok did an assessment for 8GB VRAM with Qwen3 encoder with CPU and Flux2 model Split...
 ```
 Size,Area vs 768×512,8 GB Split outlook
 640 × 360,0.59×,Safe
@@ -42,6 +42,7 @@ Size,Area vs 768×512,8 GB Split outlook
 1280 × 768,2.50×,OOM
 1366 × 768,2.67×,OOM
 ```
+...ask Grok and remember to say, how much vram you have and "Qwen3 encoder on CPU and Flux2 model Split" (split allows higher resolutions).
 
 ### Models
 Available on [HuggingFace.Co](https://huggingface.co/)...  
