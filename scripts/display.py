@@ -2611,7 +2611,7 @@ def _build_create_tab() -> None:
                 with gr.Row():
                     _gen["style"] = gr.Dropdown(
                         label="Visual Style",
-                        choices=configure.STYLE_CHOICES,
+                        choices=configure.style_choices_for_ui(),
                         value=initial_style,
                         info="Mood / prompt template (light, dark, colourful).",
                     )
@@ -6100,12 +6100,15 @@ _prompt: Dict[str, Any] = {}
 
 def _build_prompting_tab() -> None:
     data = _prompting()
-    gr.Markdown(
+    unlocked = configure.is_style_unlocked()
+    md = (
         "### Visual style prompt templates\n"
         "Each template is used per lyric line. `{line}` is replaced with the lyric text. "
-        "Song/section analysis notes are injected automatically by the pipeline. "
-        "Techno Apocalypse also injects a world-lock into the assessment phase."
+        "Song/section analysis notes are injected automatically by the pipeline."
     )
+    if unlocked:
+        md += " Techno Apocalypse also injects a world-lock into the assessment phase."
+    gr.Markdown(md)
     _prompt["light"] = gr.Textbox(
         label=configure.STYLE_LIGHT,
         lines=4,
@@ -6121,10 +6124,12 @@ def _build_prompting_tab() -> None:
         lines=4,
         value=data.get(configure.STYLE_COLORFUL, ""),
     )
+    # Hidden when the WiseMan-TimeLord passkey is not set (Preferences).
     _prompt["techno"] = gr.Textbox(
         label=configure.STYLE_TECHNO,
         lines=8,
         value=data.get(configure.STYLE_TECHNO, ""),
+        visible=unlocked,
     )
     with gr.Row():
         _prompt["save"] = gr.Button("Save Prompt Templates", variant="primary")
@@ -6133,16 +6138,27 @@ def _build_prompting_tab() -> None:
 
 def _wire_prompting_events(status_box) -> None:
     def _save(light, dark, colorful, techno):
-        configure.update_prompting({
+        updates = {
             configure.STYLE_LIGHT: light,
             configure.STYLE_DARK: dark,
             configure.STYLE_COLORFUL: colorful,
-            configure.STYLE_TECHNO: techno,
-        })
+        }
+        # Only write Techno when unlocked — avoid wiping the stored template
+        # from a hidden Gradio field that may send empty/stale text.
+        if configure.is_style_unlocked():
+            updates[configure.STYLE_TECHNO] = techno
+        configure.update_prompting(updates)
         return "Prompt templates saved."
 
     def _reset():
         defaults = configure._default_prompting()
+        # Preserve locked Techno template on disk when passkey is not set
+        if not configure.is_style_unlocked():
+            current = configure.load_prompting()
+            defaults[configure.STYLE_TECHNO] = current.get(
+                configure.STYLE_TECHNO,
+                defaults[configure.STYLE_TECHNO],
+            )
         configure.save_prompting(defaults)
         return (
             defaults[configure.STYLE_LIGHT],
@@ -6468,15 +6484,18 @@ def _wire_pref_events(status_box) -> None:
             configure.update_preferences({"style": cur})
         style_upd = gr.update(choices=choices, value=cur)
         pk_display = ("*" * len(real_pk)) if real_pk else ""
+        # Show/hide Techno Apocalypse prompt template with the same unlock gate
+        techno_vis = gr.update(visible=configure.is_style_unlocked())
         msg = (
             f"Preferences saved — lyrics stills show {per} per row "
             f"(Thumbnails tab refreshes on next gallery update)."
         )
-        # Always (status, style, passkey) — style dropdown exists on Management tab
-        return msg, style_upd, gr.update(value=pk_display)
+        # status, style dropdown, passkey field, techno prompt box visibility
+        return msg, style_upd, gr.update(value=pk_display), techno_vis
 
-    # style dropdown is built in Management before Preferences is wired
-    outs = [status_box, _gen["style"], _pref["passkey"]]
+    # style dropdown is built in Management before Preferences is wired;
+    # techno textbox lives on the Prompting tab.
+    outs = [status_box, _gen["style"], _pref["passkey"], _prompt["techno"]]
     _pref["save_btn"].click(
         _save,
         inputs=[

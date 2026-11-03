@@ -1263,6 +1263,8 @@ def character_identity_clause(
         bits.append(f"{bp} build")
     if hp:
         bits.append(f"hair {hp}")
+    # Flux.2-klein often defaults to closed eyes; keep lids open without locking gaze.
+    bits.append("eyes open")
     bits.append("anatomically correct hands")
     if wear:
         bits.append(f"wearing {wear}")
@@ -1280,6 +1282,12 @@ def still_header(image_style: str = "", visual_style: str = "") -> str:
         mood = STYLE_DEFAULT
     parts = [lead, mood, "cinematic composition", "coherent lighting"]
     return ", ".join(parts) + "."
+
+
+# Open-eyes lock appended to character-bearing lyric stills (not cover/theme).
+# Flux.2-klein frequently closes eyelids under dramatic light / motion blur;
+# positive + negative pairing is the reliable counter.
+OPEN_EYES_CLAUSE = "Eyes open."
 
 
 def compose_lyric_still_prompt(
@@ -1345,6 +1353,8 @@ def compose_lyric_still_prompt(
     id_s = (identity or "").strip()
     if id_s:
         parts.append(id_s)
+        # Reinforce open eyes whenever a character identity is in the frame
+        parts.append(OPEN_EYES_CLAUSE)
 
     pose_s = _clean_clause(pose)
     if pose_s:
@@ -1446,6 +1456,7 @@ DEFAULT_NEGATIVE_BODY = (
     "deformed, bad anatomy, extra limbs, missing limbs, mutated limbs, "
     "mutated hands, fused fingers, fewer than five fingers on each hand, "
     "exaggerated proportions, contorted pose, head on backwards. "
+    "closed eyes. "
     "2 or more characters based on reference image. ghosts. "
     "electronic devices, mobile phones, headphones."
 )
@@ -1472,42 +1483,55 @@ DEFAULT_SAMPLER = "euler_a"
 DEFAULT_SEED = -1
 
 # Still output sizes (width × height) — user-selectable in Generation tab
+# Labels always use the unicode multiply sign "×" for the dropdown.
+IMAGE_SIZE_640x360 = "640 × 360"
+IMAGE_SIZE_720x405 = "720 × 405"
+IMAGE_SIZE_768x432 = "768 × 432"
 IMAGE_SIZE_768x512 = "768 × 512"
 IMAGE_SIZE_1024x512 = "1024 × 512"
 IMAGE_SIZE_1024x768 = "1024 × 768"
-IMAGE_SIZE_1280x768 = "1280 × 768"
 IMAGE_SIZE_1280x720 = "1280 × 720"
-IMAGE_SIZE_640x360 = "640 × 360"
+IMAGE_SIZE_1280x768 = "1280 × 768"
+IMAGE_SIZE_1366x768 = "1366 × 768"
 IMAGE_SIZE_CHOICES = [
+    IMAGE_SIZE_640x360,
+    IMAGE_SIZE_720x405,
+    IMAGE_SIZE_768x432,
     IMAGE_SIZE_768x512,
     IMAGE_SIZE_1024x512,
     IMAGE_SIZE_1024x768,
-    IMAGE_SIZE_1280x768,
     IMAGE_SIZE_1280x720,
-    IMAGE_SIZE_640x360,
+    IMAGE_SIZE_1280x768,
+    IMAGE_SIZE_1366x768,
 ]
 IMAGE_SIZE_PIXELS = {
+    IMAGE_SIZE_640x360: (640, 360),
+    IMAGE_SIZE_720x405: (720, 405),
+    IMAGE_SIZE_768x432: (768, 432),
     IMAGE_SIZE_768x512: (768, 512),
     IMAGE_SIZE_1024x512: (1024, 512),
     IMAGE_SIZE_1024x768: (1024, 768),
-    IMAGE_SIZE_1280x768: (1280, 768),
     IMAGE_SIZE_1280x720: (1280, 720),
-    IMAGE_SIZE_640x360: (640, 360),
+    IMAGE_SIZE_1280x768: (1280, 768),
+    IMAGE_SIZE_1366x768: (1366, 768),
 }
 DEFAULT_IMAGE_SIZE = IMAGE_SIZE_768x512
 
 # Thumbnail placeholder aspect class for images/thumbnails_*_{regular|wide}.jpg
-# regular: 768×512, 1024×768
-# wide:    1024×512, 1280×768, 1280×720, 640×360
+# regular (~3:2 / 4:3): 768×512, 1024×768
+# wide   (~16:9 / 2:1): 640×360, 720×405, 768×432, 1024×512, 1280×720, 1280×768, 1366×768
 IMAGE_SIZE_ASPECT_REGULAR = "regular"
 IMAGE_SIZE_ASPECT_WIDE = "wide"
 IMAGE_SIZE_ASPECT = {
-    IMAGE_SIZE_768x512: IMAGE_SIZE_ASPECT_REGULAR,
-    IMAGE_SIZE_1024x768: IMAGE_SIZE_ASPECT_REGULAR,
-    IMAGE_SIZE_1024x512: IMAGE_SIZE_ASPECT_WIDE,
-    IMAGE_SIZE_1280x768: IMAGE_SIZE_ASPECT_WIDE,
-    IMAGE_SIZE_1280x720: IMAGE_SIZE_ASPECT_WIDE,
     IMAGE_SIZE_640x360: IMAGE_SIZE_ASPECT_WIDE,
+    IMAGE_SIZE_720x405: IMAGE_SIZE_ASPECT_WIDE,
+    IMAGE_SIZE_768x432: IMAGE_SIZE_ASPECT_WIDE,
+    IMAGE_SIZE_768x512: IMAGE_SIZE_ASPECT_REGULAR,
+    IMAGE_SIZE_1024x512: IMAGE_SIZE_ASPECT_WIDE,
+    IMAGE_SIZE_1024x768: IMAGE_SIZE_ASPECT_REGULAR,
+    IMAGE_SIZE_1280x720: IMAGE_SIZE_ASPECT_WIDE,
+    IMAGE_SIZE_1280x768: IMAGE_SIZE_ASPECT_WIDE,
+    IMAGE_SIZE_1366x768: IMAGE_SIZE_ASPECT_WIDE,
 }
 
 
