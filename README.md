@@ -42,7 +42,7 @@ Size,Area vs 768×512,8 GB Split outlook
 1280 × 768,2.50×,OOM
 1366 × 768,2.67×,OOM
 ```
-...ask Grok and remember to say, how much vram you have and "Qwen3 encoder on CPU and Flux2 model Split" (split allows higher resolutions).
+...ask Grok and remember to say, how much vram you have and "Qwen3 encoder on CPU and Flux2 model load Split/Full".
 
 ### Models
 Available on [HuggingFace.Co](https://huggingface.co/)...  
