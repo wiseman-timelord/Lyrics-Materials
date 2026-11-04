@@ -1444,10 +1444,10 @@ RESOLUTION_PIXELS = {
 }
 
 # Default generation values for Flux.2-klein-4B distilled
-DEFAULT_WIDTH = 768
-DEFAULT_HEIGHT = 512
-DEFAULT_STEPS = 8  # 8 improves eyes / fine detail vs 4 on Flux.2-klein
-DEFAULT_CFG = 1.0
+DEFAULT_WIDTH = 720
+DEFAULT_HEIGHT = 405
+DEFAULT_STEPS = 10  # more improves eyes / fine detail
+DEFAULT_CFG = 1.1
 # Shared negative body (style lead is prepended dynamically from Image Style).
 # Periods group: overlays / quality / anatomy / identity / devices.
 DEFAULT_NEGATIVE_BODY = (
@@ -1484,10 +1484,20 @@ DEFAULT_SEED = -1
 
 # Still output sizes (width × height) — user-selectable in Generation tab
 # Labels always use the unicode multiply sign "×" for the dropdown.
+#
+# VRAM note (Flux.2-klein-4B Q8, Placement=Split, TE/VAE on CPU):
+#   Weights alone ~5.6 GB on GPU (MODEL_VRAM_PROFILES["flux_q8"]["full_gpu_mb"]).
+#   Activation / latent peak scales roughly with pixel area vs 768×512 baseline.
+#   On a true 8 GB card (safe floor ~7000–8000 MiB free at process start):
+#     ≤768×512   — comfortable (known-good)
+#     896×504    — ~+15% area; usually OK if little else holds VRAM
+#     1024×512   — ~+33% area; marginal, may OOM under driver overhead
+#     ≥1024×768  — ~2× area or more; expected OOM on 8 GB Split
 IMAGE_SIZE_640x360 = "640 × 360"
 IMAGE_SIZE_720x405 = "720 × 405"
 IMAGE_SIZE_768x432 = "768 × 432"
 IMAGE_SIZE_768x512 = "768 × 512"
+IMAGE_SIZE_896x504 = "896 × 504"
 IMAGE_SIZE_1024x512 = "1024 × 512"
 IMAGE_SIZE_1024x768 = "1024 × 768"
 IMAGE_SIZE_1280x720 = "1280 × 720"
@@ -1498,6 +1508,7 @@ IMAGE_SIZE_CHOICES = [
     IMAGE_SIZE_720x405,
     IMAGE_SIZE_768x432,
     IMAGE_SIZE_768x512,
+    IMAGE_SIZE_896x504,
     IMAGE_SIZE_1024x512,
     IMAGE_SIZE_1024x768,
     IMAGE_SIZE_1280x720,
@@ -1509,17 +1520,19 @@ IMAGE_SIZE_PIXELS = {
     IMAGE_SIZE_720x405: (720, 405),
     IMAGE_SIZE_768x432: (768, 432),
     IMAGE_SIZE_768x512: (768, 512),
+    IMAGE_SIZE_896x504: (896, 504),
     IMAGE_SIZE_1024x512: (1024, 512),
     IMAGE_SIZE_1024x768: (1024, 768),
     IMAGE_SIZE_1280x720: (1280, 720),
     IMAGE_SIZE_1280x768: (1280, 768),
     IMAGE_SIZE_1366x768: (1366, 768),
 }
-DEFAULT_IMAGE_SIZE = IMAGE_SIZE_768x512
+DEFAULT_IMAGE_SIZE = IMAGE_SIZE_720x405
 
 # Thumbnail placeholder aspect class for images/thumbnails_*_{regular|wide}.jpg
 # regular (~3:2 / 4:3): 768×512, 1024×768
-# wide   (~16:9 / 2:1): 640×360, 720×405, 768×432, 1024×512, 1280×720, 1280×768, 1366×768
+# wide   (~16:9 / 2:1): 640×360, 720×405, 768×432, 896×504, 1024×512,
+#                       1280×720, 1280×768, 1366×768
 IMAGE_SIZE_ASPECT_REGULAR = "regular"
 IMAGE_SIZE_ASPECT_WIDE = "wide"
 IMAGE_SIZE_ASPECT = {
@@ -1527,6 +1540,7 @@ IMAGE_SIZE_ASPECT = {
     IMAGE_SIZE_720x405: IMAGE_SIZE_ASPECT_WIDE,
     IMAGE_SIZE_768x432: IMAGE_SIZE_ASPECT_WIDE,
     IMAGE_SIZE_768x512: IMAGE_SIZE_ASPECT_REGULAR,
+    IMAGE_SIZE_896x504: IMAGE_SIZE_ASPECT_WIDE,
     IMAGE_SIZE_1024x512: IMAGE_SIZE_ASPECT_WIDE,
     IMAGE_SIZE_1024x768: IMAGE_SIZE_ASPECT_REGULAR,
     IMAGE_SIZE_1280x720: IMAGE_SIZE_ASPECT_WIDE,
@@ -1634,15 +1648,15 @@ def merge_negative_prompt(
 # imagegen_frequency remains a synthesized "C#/T#/L#" label for compatibility.
 COVER_COUNT_MIN = 0
 COVER_COUNT_MAX = 10
-DEFAULT_COVER_COUNT = 2
+DEFAULT_COVER_COUNT = 10
 
 THEME_COUNT_MIN = 0
 THEME_COUNT_MAX = 20
-DEFAULT_THEME_COUNT = 4
+DEFAULT_THEME_COUNT = 20
 
 LYRICS_PER_LINE_MIN = 0
 LYRICS_PER_LINE_MAX = 30
-DEFAULT_LYRICS_PER_LINE = 8
+DEFAULT_LYRICS_PER_LINE = 4
 
 DEFAULT_IMAGE_FREQUENCY = (
     f"C{DEFAULT_COVER_COUNT}/T{DEFAULT_THEME_COUNT}/L{DEFAULT_LYRICS_PER_LINE}"
