@@ -1433,6 +1433,7 @@ def _load_analysis_from_disk(project_dir: Path) -> Optional[Dict[str, Any]]:
     character_guidance = ""
     other_figures = ""
     character_presence: Dict[str, str] = {}
+    others_presence: Dict[str, str] = {}
     sections: Dict[str, str] = {}
     mode = None
     buf: List[str] = []
@@ -1450,7 +1451,9 @@ def _load_analysis_from_disk(project_dir: Path) -> Optional[Dict[str, Any]]:
             for line in body.splitlines():
                 if ":" in line:
                     k, v = line.split(":", 1)
-                    character_presence[k.strip()] = v.strip().lower()
+                    main_t, oth_t = _parse_characters_map_line(v)
+                    character_presence[k.strip()] = main_t
+                    others_presence[k.strip()] = oth_t
         elif mode == "SECTIONS":
             for line in body.splitlines():
                 if ":" in line:
@@ -1471,13 +1474,16 @@ def _load_analysis_from_disk(project_dir: Path) -> Optional[Dict[str, Any]]:
     if cmap.exists():
         try:
             for raw in cmap.read_text(encoding="utf-8", errors="replace").splitlines():
-                if ":" in raw and not raw.strip().lower().startswith("section"):
-                    k, v = raw.split(":", 1)
-                    k, v = k.strip(), v.strip().lower()
-                    if k and v in ("none", "silhouette", "distant", "partial", "full"):
-                        if v == "silhouette":
-                            v = "distant"
-                        character_presence[k] = v
+                low = raw.strip().lower()
+                if ":" not in raw or low.startswith("section") or low.startswith("per-line"):
+                    continue
+                k, v = raw.split(":", 1)
+                k = k.strip()
+                if not k:
+                    continue
+                main_t, oth_t = _parse_characters_map_line(v)
+                character_presence[k] = main_t
+                others_presence[k] = oth_t
         except OSError:
             pass
 
@@ -1489,6 +1495,7 @@ def _load_analysis_from_disk(project_dir: Path) -> Optional[Dict[str, Any]]:
         "character_guidance": character_guidance,
         "other_figures": other_figures,
         "character_presence": character_presence,
+        "others_presence": others_presence,
     }
 
 
@@ -1509,6 +1516,50 @@ def _normalize_presence_token(raw: str) -> str:
     if len(t) > 24 or "absent" in t or "without the reference" in t:
         return "none"
     return "none"
+
+
+def _normalize_others_token(raw: str) -> str:
+    """Map support-actor density to none|some|lots."""
+    t = (raw or "").strip().lower()
+    token = re.split(r"[\s,;:]+", t, maxsplit=1)[0] if t else "none"
+    if token in ("none", "no", "absent", "zero"):
+        return "none"
+    if token in ("lots", "many", "crowd", "crowds", "full", "packed"):
+        return "lots"
+    if token in ("some", "few", "partial", "distant", "several", "a-few"):
+        return "some"
+    if "crowd" in t or "many" in t or "lots" in t:
+        return "lots"
+    if "some" in t or "few" in t:
+        return "some"
+    if "none" in t or "no " in t or t in ("", "n/a", "na"):
+        return "none"
+    return "none"
+
+
+def _parse_characters_map_line(value: str) -> Tuple[str, str]:
+    """Parse 'main partial, others some' or legacy 'partial' → (main, others)."""
+    raw = (value or "").strip().lower()
+    main = "partial"
+    others = "none"
+    m_main = re.search(
+        r"\bmain\s*[:\s]\s*(none|distant|silhouette|partial|full)\b",
+        raw,
+    )
+    if m_main:
+        main = m_main.group(1)
+    else:
+        for kw in ("none", "distant", "silhouette", "partial", "full"):
+            if re.search(rf"\b{kw}\b", raw):
+                main = kw
+                break
+    m_oth = re.search(
+        r"\bothers?\s*[:\s]\s*(none|some|lots|few|crowd|many|partial|full|distant)\b",
+        raw,
+    )
+    if m_oth:
+        others = m_oth.group(1)
+    return _normalize_presence_token(main), _normalize_others_token(others)
 
 
 def _load_prompts_from_disk(
@@ -1612,6 +1663,14 @@ def _snapshot_session(
     cfg = cfg or {}
     if images_done is None:
         images_done = len(_existing_image_indices(project_dir))
+    ng = (cfg.get("narrative_guidance") or "").strip()
+    if not ng:
+        try:
+            ng = (configure.load_generation().get("narrative_guidance") or "").strip()
+        except Exception:
+            ng = ""
+    if len(ng) > 128:
+        ng = ng[:128]
     updates: Dict[str, Any] = {
         "song_name": (song_name or cfg.get("project_label") or project_dir.name).strip()
         or project_dir.name,
@@ -1622,6 +1681,7 @@ def _snapshot_session(
         "reference_image": reference_image or "",
         "negative_prompt": (cfg.get("negative_prompt") if cfg.get("negative_prompt") is not None
                             else configure.DEFAULT_NEGATIVE_PROMPT) or "",
+        "narrative_guidance": ng,
         "line_count": int(line_count or 0),
         "images_done": int(images_done),
     }
@@ -1736,7 +1796,9 @@ def analyze_song_and_sections(
       character_guidance: str
       other_figures: str
       character_presence: {section_label: "none"|"distant"|"partial"|"full"}
-        — used programmatically to include/exclude the reference image per line
+        — main/reference character; used to include/exclude the reference image
+      others_presence: {section_label: "none"|"some"|"lots"}
+        — support/background actors density for that section
     """
     if progress_callback:
         progress_callback("Loading model & analysing song/sections…", 0.06, {"phase": "analysis"})
@@ -1750,6 +1812,7 @@ def analyze_song_and_sections(
         "character_guidance": "",
         "other_figures": "",
         "character_presence": {},
+        "others_presence": {},
     }
     if not model_path:
         return empty
@@ -1771,14 +1834,17 @@ def analyze_song_and_sections(
             "Do NOT mention clothing, outfit, wardrobe, gear, uniform, or hair style for the main "
             "character — those are chosen later in the GUI and must not appear here.\n"
             "A reference photo will supply the main character's likeness on some stills.\n"
-            "OTHER_FIGURES: 1-3 sentences on any secondary people the lyrics imply "
+            "OTHER_FIGURES: 1-3 sentences on any secondary/support people the lyrics imply "
             "(friends, crowd, antagonist, partner, etc.): who they are, rough role, and "
             "what they should wear if clothing is relevant to the lyric or scene. "
-            "Secondary people are NOT the reference character and must never share that face.\n"
+            "Secondary people are NOT the reference character and must never share that face. "
+            "Do NOT assign numeric ages to secondary people — age range is set in the UI.\n"
             "If the lyrics never imply other people, write OTHER_FIGURES: none.\n"
-            "CHARACTER_MAP: one line per section as  SectionName: none|distant|partial|full\n"
-            "  none=no main character, distant=character far away only, partial=partly visible, full=clearly present.\n"
-            "  Vary main-character presence across the song when the lyrics support it.\n"
+            "CHARACTER_MAP: one line per section as\n"
+            "  SectionName: main none|distant|partial|full, others none|some|lots\n"
+            "  main = reference character (none=absent, distant=far away, partial=partly visible, full=clearly present).\n"
+            "  others = support/background actors (none=no extras, some=a few, lots=crowd/many).\n"
+            "  Vary main and others independently across the song when the lyrics support it.\n  CRITICAL: if OTHER_FIGURES is 'none', every section MUST use others none.\n  If OTHER_FIGURES describes people, at least one section MUST use others some or lots.\n"
         )
     else:
         char_instr = (
@@ -1786,61 +1852,33 @@ def analyze_song_and_sections(
             "(face, body type, attitude only), or 'none specified'.\n"
             "Do NOT mention clothing, outfit, wardrobe, gear, or hair style for the central figure.\n"
             "OTHER_FIGURES: 1-3 sentences on any secondary people the lyrics imply, including "
-            "appropriate distinct outfits when clothing matters; or 'none'.\n"
-            "CHARACTER_MAP: one line per section as  SectionName: none|distant|partial|full\n"
+            "appropriate distinct outfits when clothing matters; or 'none'. "
+            "Do NOT assign numeric ages to secondary people — age range is set in the UI.\n"
+            "CHARACTER_MAP: one line per section as\n"
+            "  SectionName: main none|distant|partial|full, others none|some|lots\n"
         )
+
+    # Optional user Narrative Guidance (critical overall direction, max 128 chars)
+    _ng = (cfg.get("narrative_guidance") or "").strip()
+    if not _ng:
+        try:
+            _ng = (configure.load_generation().get("narrative_guidance") or "").strip()
+        except Exception:
+            _ng = ""
+    if len(_ng) > 128:
+        _ng = _ng[:128]
+    guidance_block = ""
+    if _ng:
+        guidance_block = (
+            "NARRATIVE GUIDANCE (user-critical instruction — honour this above free invention):\n"
+            f"{_ng}\n\n"
+        )
+        print(f"[analysis] narrative guidance: {_ng!r}", flush=True)
 
     # Rigid, example-led prompt — no trailing "Notes:" (models often free-associate after it)
     example_labels = section_labels[:2] if section_labels else ["Intro", "Chorus 1"]
     ex0 = example_labels[0]
     ex1 = example_labels[1] if len(example_labels) > 1 else "Chorus 1"
-
-    # Inject Visual Style so OVERALL / SECTIONS lock to the chosen world
-    style = configure.normalize_style(cfg.get("style"))
-    style_guidance = ""
-    if style == configure.STYLE_TECHNO:
-        style_guidance = (
-            "VISUAL STYLE LOCK — Techno Apocalypse:\n"
-            "The main figure is the winner of the game and Director General of the Authorians "
-            "(robot/clone faction). The planet has been taken over by the Dark Iteration "
-            "(AI calculations too complex for human minds) acting on the main figure's behalf.\n"
-            "Primary environments:\n"
-            "  Surface — urban battlefield ruins, abandoned data-server farms, neon signs "
-            "flickering like dying stars, cyber-gold against charcoal voids, scavengers in "
-            "rags/gasmasks/helmets, grey military androids with yellow/blue LED trims, "
-            "wreckage and broken LED streetlights.\n"
-            "  Subsurface — smashed steel doors, UV-lit control rooms dripping with UV paint, "
-            "holographic planetary displays and floating cuneiform, crackling electric "
-            "vortexes that open portals for robot troops, improvised android raves with "
-            "tinfoil hats and multi-colour lasers.\n"
-            "Tone: mythic yet mechanical, reverence mixed with dread, glitching infrastructure, "
-            "cyber-ritual. Palette: fractured cyber-gold, charcoal voids, intense multi-colour "
-            "UV and electric arcs.\n"
-            "OVERALL should lead with place, palette, and infrastructure (surface ruins vs "
-            "subsurface UV bases, cyber-gold/charcoal, electric vortexes) so Cover/Theme stills "
-            "can reuse it as empty worldspace. Name the Dark Iteration / Authorians as lore, "
-            "not as a portrait. Put the main figure's look only in CHARACTER. "
-            "OTHER_FIGURES: wasteland scavengers and grey military androids with yellow/blue "
-            "LED trims when crowds are needed (lyrics stills only). "
-            "SECTIONS stay inside this universe (server farms, tunnels, UV control rooms, "
-            "android raves, holographic portals) — never generic city streets.\n\n"
-        )
-    elif style == configure.STYLE_DARK:
-        style_guidance = (
-            "VISUAL STYLE LOCK — dark and gloomy: low-key lighting, heavy shadows, sombre "
-            "atmosphere, restrained colour. OVERALL and SECTIONS must stay moody and dim.\n\n"
-        )
-    elif style == configure.STYLE_LIGHT:
-        style_guidance = (
-            "VISUAL STYLE LOCK — light and bright: high-key soft light, clean composition, "
-            "hopeful mood. OVERALL and SECTIONS must stay airy and luminous.\n\n"
-        )
-    elif style == configure.STYLE_COLORFUL:
-        style_guidance = (
-            "VISUAL STYLE LOCK — colorful and wild: saturated colours, dynamic shapes, "
-            "playful high energy. OVERALL and SECTIONS must stay vivid and kinetic.\n\n"
-        )
-
     prompt = (
         "You are a music-video art director. Write structured production notes.\n"
         "Reply with ONLY the four blocks below. Use real sentences, not keyword lists.\n"
@@ -1848,19 +1886,16 @@ def analyze_song_and_sections(
         "Never describe the MAIN character's clothing or hair style — "
         "those are configured separately in the UI. Secondary people in OTHER_FIGURES "
         "MAY have distinct outfits when the lyrics imply them.\n\n"
-        f"{style_guidance}"
+        f"{guidance_block}"
         "OVERALL:\n"
-        "Write 3-5 complete sentences: narrative arc, mood, setting, colour palette, visual tone.\n"
-        "When a VISUAL STYLE LOCK is present above, weave its world, palette and tone into "
-        "every sentence of OVERALL.\n\n"
+        "Write 3-5 complete sentences: narrative arc, mood, setting, colour palette, visual tone.\n\n"
         f"{char_instr}\n"
         "SECTIONS:\n"
         f"For EACH of these section names write one non-empty paragraph (2-3 sentences): {labels_list}.\n"
         "Label each paragraph with the exact section name followed by a colon.\n"
         "Focus on camera, setting, action, and mood — not wardrobe.\n"
         "Bridge sections (if any) are transitional: describe the visual/mood shift "
-        "from the preceding section toward the following one — not a standalone scene.\n"
-        "When a VISUAL STYLE LOCK is present, keep every section inside that universe.\n\n"
+        "from the preceding section toward the following one — not a standalone scene.\n\n"
         "Example format (replace with content about THIS song):\n"
         "OVERALL:\n"
         "A lone figure moves through cold neon streets at night. The palette is steel blue and amber. "
@@ -1870,8 +1905,8 @@ def analyze_song_and_sections(
         "OTHER_FIGURES:\n"
         "Occasional anonymous street crowd in ordinary coats; no named secondary lead.\n\n"
         "CHARACTER_MAP:\n"
-        f"{ex0}: distant\n"
-        f"{ex1}: full\n\n"
+        f"{ex0}: main distant, others some\n"
+        f"{ex1}: main full, others none\n\n"
         "SECTIONS:\n"
         f"{ex0}: Wide establishing shots of an anonymous crowd. The camera glides; the figure is barely present.\n"
         f"{ex1}: Closer framing on the figure at the edge of a queue. Gestures are subtle, lighting harder.\n\n"
@@ -1899,7 +1934,8 @@ def analyze_song_and_sections(
         print("[analysis] first pass empty/stub — retrying with compact prompt…", flush=True)
         retry_prompt = (
             "Write production notes for this song. Start with OVERALL:\n\n"
-            f"Sections: {labels_list}\n\n"
+            + (f"NARRATIVE GUIDANCE (honour this): {_ng}\n\n" if _ng else "")
+            + f"Sections: {labels_list}\n\n"
             f"Lyrics:\n{lyrics[:3500]}\n\n"
             "Required format:\n"
             "OVERALL:\n"
@@ -1910,7 +1946,7 @@ def analyze_song_and_sections(
             "OTHER_FIGURES:\n"
             "<secondary people from lyrics + their outfits if relevant, or none>\n\n"
             "CHARACTER_MAP:\n"
-            + "\n".join(f"{lab}: partial" for lab in (section_labels or ["Body"]))
+            + "\n".join(f"{lab}: main partial, others none" for lab in (section_labels or ["Body"]))
             + "\n\nSECTIONS:\n"
             + "\n".join(
                 f"{lab}: <2 sentences of visual notes for this section>"
@@ -1990,21 +2026,39 @@ def analyze_song_and_sections(
                 if not note:
                     print(f"[analysis] missing section notes for: {lab}", flush=True)
 
+        others_map: Dict[str, str] = {}
         for s in sections:
             lab = s["label"]
-            found = "partial"
+            found_main = "partial"
+            found_others = "none"
             for line in map_blob.splitlines():
                 if re.match(
                     rf"^{re.escape(lab)}\s*[:.\-–—]",
                     line.strip(),
                     re.I,
                 ):
-                    for kw in ("none", "distant", "silhouette", "partial", "full"):
-                        if re.search(rf"\b{kw}\b", line, re.I):
-                            found = kw
-                            break
+                    low_line = line.lower()
+                    # Prefer explicit "main <token>" then fall back to first main token
+                    m_main = re.search(
+                        r"\bmain\s*[:\s]\s*(none|distant|silhouette|partial|full)\b",
+                        low_line,
+                    )
+                    if m_main:
+                        found_main = m_main.group(1)
+                    else:
+                        for kw in ("none", "distant", "silhouette", "partial", "full"):
+                            if re.search(rf"\b{kw}\b", low_line):
+                                found_main = kw
+                                break
+                    m_oth = re.search(
+                        r"\bothers?\s*[:\s]\s*(none|some|lots|few|crowd|many|partial|full|distant)\b",
+                        low_line,
+                    )
+                    if m_oth:
+                        found_others = m_oth.group(1)
                     break
-            presence[lab] = found
+            presence[lab] = found_main
+            others_map[lab] = found_others
 
         if "SECTIONS" not in (raw or "").upper():
             print("[analysis] WARNING: no SECTIONS heading in reply", flush=True)
@@ -2012,6 +2066,11 @@ def analyze_song_and_sections(
         print(f"[analysis] section notes filled: {filled}/{len(section_labels)}", flush=True)
 
     # Defaults for any section missing a map entry
+    # others_map may be local from the parse branch; ensure it exists
+    try:
+        others_map
+    except NameError:
+        others_map = {}
     for s in sections:
         lab = s["label"]
         section_notes.setdefault(lab, "")
@@ -2021,14 +2080,86 @@ def analyze_song_and_sections(
                 presence[lab] = "distant" if has_character_ref else "none"
             else:
                 presence[lab] = "full" if has_character_ref else "partial"
+        if lab not in others_map:
+            others_map[lab] = "none"
 
-    # Canonicalise legacy silhouette → distant
+    # Canonicalise legacy silhouette → distant for main
     for lab in list(presence.keys()):
         presence[lab] = _normalize_presence_token(presence.get(lab) or "none")
+    # Canonicalise others density tokens
+    for lab in list(others_map.keys()):
+        others_map[lab] = _normalize_others_token(others_map.get(lab) or "none")
 
-    print("[analysis] character presence map:", flush=True)
-    for lab, val in presence.items():
-        print(f"[analysis]   {lab}: {val}", flush=True)
+    # Replace prose "silhouette" wording with "distant figure" so prompts stay consistent
+    def _desilhouette(text: str) -> str:
+        if not text:
+            return text
+        t = re.sub(r"(?i)\bas a silhouette\b", "as a distant figure", text)
+        t = re.sub(r"(?i)\bsilhouette of\b", "distant figure of", t)
+        t = re.sub(r"(?i)\ba silhouette\b", "a distant figure", t)
+        t = re.sub(r"(?i)\bsilhouettes\b", "distant figures", t)
+        t = re.sub(r"(?i)\bsilhouette\b", "distant figure", t)
+        return t
+
+    overall = _desilhouette(overall)
+    character = _desilhouette(character)
+    other_figures = _desilhouette(other_figures)
+    for lab in list(section_notes.keys()):
+        section_notes[lab] = _desilhouette(section_notes.get(lab) or "")
+
+    # Consistency: OTHER_FIGURES text ↔ per-section others density
+    of_clean = (other_figures or "").strip()
+    of_none = (not of_clean) or of_clean.lower() in ("none", "none.", "n/a", "na", "(none)")
+    if of_none:
+        other_figures = ""
+        for lab in list(others_map.keys()):
+            others_map[lab] = "none"
+        for lab in list(presence.keys()):
+            others_map.setdefault(lab, "none")
+        print("[analysis] OTHER_FIGURES empty/none — forcing all sections others=none", flush=True)
+    else:
+        # If prose describes support people but every section says others none,
+        # promote sections whose notes imply people, else mark 'some' on body sections.
+        all_none = all(
+            _normalize_others_token(others_map.get(lab) or "none") == "none"
+            for lab in (presence.keys() or others_map.keys() or ["Body"])
+        )
+        if all_none:
+            people_re = re.compile(
+                r"(crowd|people|figures|actors|soldiers|officers|dancers|"
+                r"throng|spectators|followers|army|mob|extras|bystanders)",
+                re.I,
+            )
+            promoted = 0
+            for lab in list(presence.keys()) or list(section_notes.keys()):
+                note = section_notes.get(lab) or ""
+                if people_re.search(note) or people_re.search(of_clean):
+                    low = lab.lower()
+                    if any(k in low for k in ("intro", "outro", "fade")):
+                        others_map[lab] = "some"
+                    else:
+                        others_map[lab] = "some"
+                    promoted += 1
+            if promoted:
+                print(
+                    f"[analysis] OTHER_FIGURES describes people but CHARACTER_MAP had "
+                    f"others=none everywhere — promoted {promoted} section(s) to others=some",
+                    flush=True,
+                )
+            else:
+                # Keep prose for context but leave map as none (no forced crowds)
+                print(
+                    "[analysis] OTHER_FIGURES text present but no section notes imply people "
+                    "— keeping others=none (prose is advisory only)",
+                    flush=True,
+                )
+
+    print("[analysis] CHARACTERS_MAP (main + others):", flush=True)
+    for lab in presence.keys():
+        print(
+            f"[analysis]   {lab}: main {presence.get(lab)}, others {others_map.get(lab, 'none')}",
+            flush=True,
+        )
 
     # Do NOT invent a default OVERALL when the model failed — empty signals unusable
     if other_figures and other_figures.lower().strip() in ("none", "none.", "n/a", "na"):
@@ -2041,6 +2172,7 @@ def analyze_song_and_sections(
         "character_guidance": character,
         "other_figures": other_figures,
         "character_presence": presence,
+        "others_presence": others_map,
     }
 
 
@@ -2172,6 +2304,10 @@ def generate_visual_prompts(
     char_guide = (analysis or {}).get("character_guidance") or ""
     other_figures = (analysis or {}).get("other_figures") or ""
     presence_map = (analysis or {}).get("character_presence") or {}
+    others_map = (analysis or {}).get("others_presence") or {}
+    support_age_min = cfg.get("support_age_min", configure.SUPPORT_AGE_MIN_DEFAULT)
+    support_age_max = cfg.get("support_age_max", configure.SUPPORT_AGE_MAX_DEFAULT)
+    support_age_bit = configure.support_actor_age_phrase(support_age_min, support_age_max)
 
     # Ordered unique section labels as they appear (for Bridge prev/next context)
     ordered_secs: List[str] = []
@@ -2281,10 +2417,34 @@ def generate_visual_prompts(
                 "POSE: one short clause for figure activity if any figure is present, or none."
             )
 
+        others_pres = _normalize_others_token(others_map.get(sec) or "none")
         other_bit = ""
-        if other_figures and other_figures.lower().strip() not in ("none", "none.", "n/a", "na"):
+        if others_pres == "none":
             other_bit = (
-                f"Secondary people (not the main reference): {other_figures[:220]}\n"
+                "Support/background people: ABSENT for this section. "
+                "Do not invent crowds, extras, bystanders, or secondary figures. "
+                "Environment and objects only unless the lyric itself names a person.\n"
+            )
+        elif others_pres != "none" and other_figures and other_figures.lower().strip() not in ("none", "none.", "n/a", "na"):
+            density = {
+                "some": "a few support actors in the scene",
+                "lots": "many support actors / a crowd in the scene",
+            }.get(others_pres, "support actors in the scene")
+            other_bit = (
+                f"Secondary people (not the main reference): {other_figures[:200]}\n"
+                f"Support-actor density for this section: {density}. "
+                f"All support/background people are {support_age_bit}, "
+                f"adults only — no children or teens.\n"
+            )
+        elif others_pres != "none":
+            density = {
+                "some": "a few anonymous support actors",
+                "lots": "a crowd of support actors",
+            }.get(others_pres, "support actors")
+            other_bit = (
+                f"Include {density} (not the main reference). "
+                f"All support/background people are {support_age_bit}, "
+                f"adults only — no children or teens.\n"
             )
 
         if bridge_ctx:
@@ -2296,14 +2456,9 @@ def generate_visual_prompts(
             section_block = f"Section note ({sec}): {(sec_note or '')[:120]}\n"
 
         instruction = (
-            "Build one music-video still description with this priority mix:\n"
-            "  ~50% the lyric line mood/action (primary)\n"
-            "  ~33% the section note (Intro / Chorus / Bridge / Outro setting)\n"
-            "  ~17% the overall song world (palette/tone only)\n"
             f"Lyric (mood only — do not quote it in the reply): {line}\n"
-            f"Section ({sec}) — secondary context: {(sec_note or '')[:160]}\n"
-            f"Overall world (light touch only): {(overall or '')[:120]}\n"
-            f"{bridge_ctx if bridge_ctx else ''}"
+            f"Setting context: {(overall or '')[:180]}\n"
+            f"{section_block}"
             f"{presence_rule}\n"
             f"{other_bit}"
             "Reply with EXACTLY these two labels and nothing else:\n"
@@ -3315,6 +3470,7 @@ def _appearance_bit(cfg: Dict[str, Any], presence: str = "full") -> str:
         age=cfg.get("ref_age"),
         presence=presence,
         footwear=cfg.get("footwear") or "",
+        eye_color=cfg.get("eye_color") or "",
     )
 
 
@@ -3481,6 +3637,19 @@ def generate_images_from_prompts(
     ).strip().lower()
     if gen_mode not in ("generate", "regenerate", "complete"):
         gen_mode = "generate"
+    if gen_mode == "complete" and progress_callback:
+        # Count missing (line,variant) slots for a clear status line
+        try:
+            total_slots = max(1, len(prompts) * max(1, int(cfg.get("_lyrics_freq") or 1)))
+        except Exception:
+            total_slots = max(1, len(prompts))
+        # existing count from disk is handled inside the loop; announce mode early
+        progress_callback(
+            "Complete Lyrics: filling missing stills only (existing slots kept)",
+            0.35,
+            {"phase": "images", "mode": "complete"},
+        )
+        print("[images] complete mode — skip existing stills; fill gaps only", flush=True)
     if gen_mode == "regenerate":
         # Wipe existing lyric stills so every slot is re-made
         wiped = 0
@@ -4153,6 +4322,16 @@ def _analysis_is_usable(analysis: Optional[Dict[str, Any]]) -> bool:
         ]
         if len(good) >= 1:
             return True
+    # Accept a partial map when the model returned CHARACTER_MAP but sparse prose
+    presence = analysis.get("character_presence") or {}
+    if isinstance(presence, dict) and len(presence) >= 1:
+        # Synthesize a minimal overall so downstream stills can proceed
+        if not overall:
+            analysis["overall"] = (
+                "Visual narrative follows the song structure and mood implied by the lyrics; "
+                "colour and lighting track section energy."
+            )
+        return True
     return False
 
 
@@ -4168,7 +4347,7 @@ def _write_analysis_file(project_dir: Path, analysis: Dict[str, Any]) -> None:
             + (of_block if of_block else "none")
             + "\n\nCHARACTER_MAP\n"
             + "\n".join(
-                f"{k}: {v}"
+                f"{k}: main {v}, others {(analysis.get('others_presence') or {}).get(k, 'none')}"
                 for k, v in (analysis.get("character_presence") or {}).items()
             )
             + "\n\nSECTIONS\n"
@@ -4219,12 +4398,14 @@ def ensure_project_assessment(
             "character_guidance": "",
             "other_figures": "",
             "character_presence": {},
+            "others_presence": {},
         }
 
-    # Drop stale/bad analysis before a forced or recovery run
+    # Drop stale/bad analysis before a forced or recovery run so the model
+    # cannot be influenced by leftover text and the UI cannot show old content.
     try:
         stale = project_dir / "analysis.txt"
-        if force and stale.is_file():
+        if stale.is_file():
             stale.unlink()
             print("[analysis] removed prior analysis.txt for re-run", flush=True)
     except OSError:
@@ -4241,6 +4422,7 @@ def ensure_project_assessment(
     if _analysis_is_usable(analysis):
         _write_analysis_file(project_dir, analysis)
         maybe_bleep_section()
+        print("[analysis] assessment saved (usable)", flush=True)
     else:
         print("[analysis] model reply unusable — not saving analysis.txt", flush=True)
         # Still write a short stub so the Assessment panel shows what went wrong
@@ -4277,15 +4459,9 @@ def generate_theme_prompts_from_assessment(
     except (TypeError, ValueError):
         requested = 1
     n = max(1, min(int(configure.THEME_COUNT_MAX), requested))
-    overall_raw = (analysis.get("overall") or "").strip()
-    if not overall_raw:
+    overall = (analysis.get("overall") or "").strip()
+    if not overall:
         return []
-    # Theme stills must be pure landscape/worldspace — strip any people/agents
-    # that OVERALL may contain (esp. Techno Apocalypse / faction language).
-    overall = _scrub_people_language(overall_raw) or overall_raw
-    # If scrub left almost nothing, keep palette/setting keywords only
-    if len(overall) < 40:
-        overall = overall_raw
 
     model_path, role = _resolve_prompt_model(cfg)
     if not model_path:
@@ -4294,21 +4470,19 @@ def generate_theme_prompts_from_assessment(
     style = str(cfg.get("style") or configure.STYLE_DEFAULT)
     title = (song_name or "").replace("_", " ").strip()
     prompt = (
-        "You are writing visual prompts for music-video THEME stills.\n"
-        "THEME = empty game-world landscape / environment only.\n"
-        "Never cover art. Never character shots. Never objects-on-a-table (that is Cover).\n"
+        "You are writing visual prompts for music-video THEME stills "
+        "(empty worldspace between lyric lines — never character shots, never cover art).\n"
         f"Song title (context only): {title or '(untitled)'}\n"
         f"Visual style preference: {style}\n\n"
-        "SOURCE — OVERALL world notes (already scrubbed of people; use PLACE / LIGHT / PALETTE only):\n"
+        "SOURCE — OVERALL assessment ONLY (discard any character, outfit, or face notes):\n"
         f"{overall}\n\n"
         f"Write exactly {n} distinct environment prompts, numbered 1..{n}.\n"
         "Rules for EVERY prompt:\n"
-        "- Landscape / architecture / weather / light / colour / atmosphere / scale only\n"
-        "- Absolutely empty of characters: no person, face, body, silhouette, figure, crowd, "
-        "scavenger, survivor, android, robot, clone, troop, humanoid, protagonist, lone figure, "
-        "navigator, or any implied presence\n"
-        "- Do not narrate anyone walking, standing, dancing, or navigating\n"
-        "- Wide or medium establishing views of the worldspace — not product-style close-ups\n"
+        "- Worldspace only: architecture, landscape, weather, light, colour, atmosphere, scale\n"
+        "- Empty of people: no person, character, face, body, silhouette, figure, crowd, "
+        "humanoid, protagonist, lone figure, navigator, or implied human presence\n"
+        "- Do not name or describe any character from the song\n"
+        "- Do not narrate anyone walking, standing, or navigating the space\n"
         "- One dense positive paragraph suitable for Flux\n"
         "- No text, logos, captions, or lyrics in the image\n"
         "- No 'Prompt:' labels, no quotes, no preamble\n\n"
@@ -4344,14 +4518,12 @@ def generate_theme_prompts_from_assessment(
             re.S,
         ):
             body = re.sub(r"\s+", " ", m.group(2)).strip().strip('"').strip()
-            body = _scrub_people_language(body) or body
             if len(body) > 20:
                 prompts.append(body)
         if not prompts:
             # Fallback: split non-empty lines
             for line in raw.splitlines():
                 t = re.sub(r"^\s*\d+[.)\:\-]\s*", "", line).strip()
-                t = _scrub_people_language(t) or t
                 if len(t) > 40:
                     prompts.append(t)
 
@@ -4573,29 +4745,27 @@ def _generate_named_still(
 
 def _scrub_people_language(text: str) -> str:
     """
-    Strip wording that invites people / characters / faces / humanoid agents
-    into Cover or Theme stills. Covers scavengers, androids, clones, troops,
-    robots, crowds — anything that is not pure empty worldspace.
+    Strip or neutralize wording that invites people / characters / faces
+    into Cover or Theme stills. Used on LLM concept sentences and
+    OVERALL-derived interpretation snippets before they enter the final
+    positive prompt.
     """
     t = (text or "").strip()
     if not t:
         return ""
+    # Full-sentence patterns that centre a human subject
     patterns = [
-        # Human-centred subjects
-        r"(?i)\b(?:a|the|one)\s+(?:lone\s+)?(?:figure|person|man|woman|girl|boy|child|human|character|protagonist|singer|stranger|nonconformist|director|general|winner)\b[^.;]*[.;]?",
-        r"(?i)\b(?:figures?|people|humans?|persons?|faces?|portraits?|silhouettes?|crowds?|bodies|scavengers?|survivors?|inhabitants?|troops?|soldiers?)\b[^.;]*[.;]?",
-        r"(?i)\b(?:he|she|they)\s+(?:walks?|stands?|sits?|navigates?|moves?|looks?|stares?|runs?|waits?|dances?|shouts?)\b[^.;]*[.;]?",
-        r"(?i)\b(?:close[- ]?up\s+of\s+a\s+face|portrait\s+of|the\s+singer|the\s+protagonist|the\s+character|the\s+main\s+(?:figure|character|character's))\b[^.;]*[.;]?",
+        r"(?i)\b(?:a|the|one)\s+(?:lone\s+)?(?:figure|person|man|woman|girl|boy|child|human|character|protagonist|singer|stranger)\b[^.;]*[.;]?",
+        r"(?i)\b(?:figures?|people|humans?|persons?|faces?|portraits?|silhouettes?|crowds?|bodies)\b[^.;]*[.;]?",
+        r"(?i)\b(?:he|she|they)\s+(?:walks?|stands?|sits?|navigates?|moves?|looks?|stares?|runs?|waits?)\b[^.;]*[.;]?",
+        r"(?i)\b(?:close[- ]?up\s+of\s+a\s+face|portrait\s+of|the\s+singer|the\s+protagonist|the\s+character)\b[^.;]*[.;]?",
         r"(?i)\bhumanoid\b[^.;]*[.;]?",
-        # Machine / faction agents that still read as "characters" in stills
-        r"(?i)\b(?:androids?|robots?|clones?|cyborgs?|mechs?|drones?|minions?|authorians?|cyber[- ]?magi)\b[^.;]*[.;]?",
-        r"(?i)\b(?:a|the|one)\s+(?:group\s+of\s+)?(?:cloaked|shadowy)\s+(?:figures?|gatekeepers?|guards?)\b[^.;]*[.;]?",
-        r"(?i)\b(?:director\s+general|dark\s+iteration)\b[^.;]*[.;]?",
     ]
     out = t
     for pat in patterns:
         out = re.sub(pat, " ", out)
     out = re.sub(r"\s{2,}", " ", out).strip(" ,;:-")
+    # If scrubbing emptied the text, drop it entirely
     if len(out) < 12:
         return ""
     return out
@@ -4768,10 +4938,8 @@ def _build_cover_prompt(
         body = f"{body}; theme: {interp.rstrip('.')}"
     body = (
         body.rstrip(".;")
-        + ". Close-up of that single object resting on a surface in the song's game-world. "
-          "Absolutely no characters or background characters: no people, faces, figures, "
-          "silhouettes, scavengers, androids, robots, clones, crowds, or humanoid subjects. "
-          "No landscape establishing shot — the object fills the frame. "
+        + ". Presented cleanly in the song worldspace — no people, no faces, "
+          "no figures, no silhouettes, no humanoid subjects, no character portraits. "
           "All surfaces are smooth and unmarked, free of lettering, inscriptions, "
           "engraving or symbols that resemble writing."
     )
@@ -4938,11 +5106,17 @@ def generate_cover_image(
             missing_cover_slots = [
                 i for i in range(1, target_n + 1) if i not in existing_cover_map
             ]
+            miss = len(missing_cover_slots)
             print(
-                f"[cover] complete — filling {len(missing_cover_slots)} missing slot(s) "
-                f"of target {target_n}",
+                f"[cover] complete — {miss} of {target_n} are missing; filling gaps only",
                 flush=True,
             )
+            if progress_callback:
+                progress_callback(
+                    f"Complete Cover: {miss} of {target_n} are missing — generating gaps only",
+                    0.12,
+                    {"phase": "images", "mode": "complete"},
+                )
         elif have_n >= target_n and gen_mode != "complete":
             # Legacy auto: full set → wipe & redo
             for old in list(existing_cover_map.values()):
@@ -5006,16 +5180,12 @@ def generate_cover_image(
             cfg_cover["cover_mode"] = True
             cfg_cover["ambient_mode"] = True  # no people on covers
             cfg_cover["cover_uses_character"] = False
-            try:
-                out = _generate_named_still(
-                    dest, cover_prompt + var_bit, cfg_cover,
-                    reference_image="",
-                    attach_ref=False,
-                )
-                images.append(out)
-            finally:
-                if configure.APP_STATE.get("cover_slot_generating") == slot0:
-                    configure.APP_STATE["cover_slot_generating"] = None
+            out = _generate_named_still(
+                dest, cover_prompt + var_bit, cfg_cover,
+                reference_image="",
+                attach_ref=False,
+            )
+            images.append(out)
         elapsed = time.time() - t0
         configure.APP_STATE["session_status"] = "stopped"
         configure.APP_STATE["cover_slot_generating"] = None
@@ -5193,11 +5363,17 @@ def generate_theme_images(
         elif gen_mode == "complete":
             # Fill every empty index in 1..target (gaps + tail). Never wipe.
             missing_slots = [i for i in range(1, target_theme + 1) if i not in existing_map]
+            miss = len(missing_slots)
             print(
-                f"[theme] complete — filling {len(missing_slots)} missing slot(s) "
-                f"of target {target_theme}",
+                f"[theme] complete — {miss} of {target_theme} are missing; filling gaps only",
                 flush=True,
             )
+            if progress_callback:
+                progress_callback(
+                    f"Complete Theme: {miss} of {target_theme} are missing — generating gaps only",
+                    0.12,
+                    {"phase": "images", "mode": "complete"},
+                )
         elif existing_theme_n >= target_theme:
             for old in list(existing_map.values()):
                 try:
@@ -5341,11 +5517,6 @@ def generate_theme_images(
             except Exception as e:
                 print(f"[theme] failed theme slot {slot_no}: {e}", flush=True)
                 raise
-            finally:
-                # Clear busy flag for this slot so the UI can show the real PNG
-                # immediately (not wait until the whole batch ends).
-                if configure.APP_STATE.get("theme_slot_generating") == slot0:
-                    configure.APP_STATE["theme_slot_generating"] = None
 
         elapsed = time.time() - t0
         configure.APP_STATE["session_status"] = "stopped"
@@ -5513,9 +5684,11 @@ def run_prompts_pipeline(
                         f"--- prompt ---\n{pr}\n\n"
                     )
             with open(project_dir / "character_map.txt", "w", encoding="utf-8") as f:
-                f.write("section → presence (none|distant|partial|full)\n")
+                f.write("CHARACTERS_MAP (main = reference, others = support actors)\n")
+                f.write("main: none|distant|partial|full  ·  others: none|some|lots\n")
+                _oth = (analysis or {}).get("others_presence") or {}
                 for lab, val in ((analysis or {}).get("character_presence") or {}).items():
-                    f.write(f"{lab}: {val}\n")
+                    f.write(f"{lab}: main {val}, others {_oth.get(lab, 'none')}\n")
                 f.write("\nper-line:\n")
                 for i, (line, pres) in enumerate(zip(lines, presence_per_line), 1):
                     f.write(f"{i:03d} [{pres}] {line}\n")
@@ -5766,9 +5939,11 @@ def run_materials_pipeline(
                             f"--- prompt ---\n{pr}\n\n"
                         )
                 with open(project_dir / "character_map.txt", "w", encoding="utf-8") as f:
-                    f.write("section → presence (none|distant|partial|full)\n")
+                    f.write("CHARACTERS_MAP (main = reference, others = support actors)\n")
+                    f.write("main: none|distant|partial|full  ·  others: none|some|lots\n")
+                    _oth = analysis.get("others_presence") or {}
                     for lab, val in (analysis.get("character_presence") or {}).items():
-                        f.write(f"{lab}: {val}\n")
+                        f.write(f"{lab}: main {val}, others {_oth.get(lab, 'none')}\n")
                     f.write("\nper-line:\n")
                     for i, (line, pres) in enumerate(zip(lines, presence_per_line), 1):
                         f.write(f"{i:03d} [{pres}] {line}\n")

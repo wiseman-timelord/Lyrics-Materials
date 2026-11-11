@@ -669,63 +669,49 @@ def backend_device_token(backend: str) -> str:
 
 
 # Styles
+# Public styles are always available. Avatar Apocalypse and Techno Apocalypse
+# are gated behind the discrete access code (WiseMan-TimeLord) and must never
+# appear in UI labels or help text that advertise the unlock.
+# They are distinct worldspaces:
+#   Avatar Apocalypse — latter-day Avatar setting after humans wrecked the
+#       surface. Under-earth: dark UV haven in large honeycomb recesses down
+#       tunnels. Surface: post-nuclear wasteland (radiation storms, urban
+#       ruins, ash skies); nature reclaiming; survivors feral/mutant/clan or
+#       sparse Corporate technocrats in domes.
+#   Techno Apocalypse — original mixed tribal / technocrat / ruin worldspace
+#       (yotun tribes, tipis & tree-houses, urban battleground ruins, domes).
 STYLE_LIGHT = "light and bright"
 STYLE_DARK = "dark and gloomy"
 STYLE_COLORFUL = "colorful and wild"
+STYLE_AVATAR = "Avatar Apocalypse"
 STYLE_TECHNO = "Techno Apocalypse"
-# Full catalogue (includes locked styles). UI dropdown uses style_choices_for_ui().
-STYLE_CHOICES = [STYLE_LIGHT, STYLE_DARK, STYLE_COLORFUL, STYLE_TECHNO]
-STYLE_PUBLIC = [STYLE_LIGHT, STYLE_DARK, STYLE_COLORFUL]
+STYLE_CHOICES_PUBLIC = [STYLE_LIGHT, STYLE_DARK, STYLE_COLORFUL]
+STYLE_CHOICES_UNLOCKED = [
+    STYLE_LIGHT, STYLE_DARK, STYLE_COLORFUL, STYLE_AVATAR, STYLE_TECHNO,
+]
+# Default list used by most call sites; prefer style_choices() for UI
+STYLE_CHOICES = STYLE_CHOICES_PUBLIC
 # Default visual style for new projects / fresh installs
 STYLE_DEFAULT = STYLE_DARK
-# Exact string that unlocks STYLE_TECHNO in the Visual Style dropdown.
-# Stored under preferences.json key "passkey". No UI hint is shown.
-STYLE_UNLOCK_PASSKEY = "WiseMan-TimeLord"
+
+_GATED_STYLES = frozenset({STYLE_AVATAR, STYLE_TECHNO})
 
 
-def _read_passkey_raw() -> str:
-    """Read passkey from preferences.json without normalising style (avoids recursion)."""
-    try:
-        path = get_preferences_path()
-        if not path.is_file():
-            return ""
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            return str(data.get("passkey") or "").strip()
-    except Exception:
-        pass
-    return ""
-
-
-def is_style_unlocked(style: str | None = None) -> bool:
-    """True when the given style (or STYLE_TECHNO if omitted) is available to the UI."""
-    target = (style or STYLE_TECHNO).strip()
-    if target in STYLE_PUBLIC:
-        return True
-    if target != STYLE_TECHNO:
-        return False
-    return _read_passkey_raw() == STYLE_UNLOCK_PASSKEY
-
-
-def style_choices_for_ui() -> list:
-    """Dropdown choices: public styles + Techno only when passkey matches."""
-    choices = list(STYLE_PUBLIC)
-    if is_style_unlocked(STYLE_TECHNO):
-        choices.append(STYLE_TECHNO)
-    return choices
+def style_choices() -> List[str]:
+    """Dropdown choices; Avatar Apocalypse + Techno Apocalypse when unlocked."""
+    return list(STYLE_CHOICES_UNLOCKED if is_access_unlocked() else STYLE_CHOICES_PUBLIC)
 
 
 def normalize_style(value: str | None) -> str:
     """
-    Map a UI / session / prefs visual-style value to a canonical STYLE_CHOICES entry.
+    Map a UI / session / prefs visual-style value to a canonical style entry.
     Empty / unknown values fall back to STYLE_DEFAULT (dark and gloomy), never to
     STYLE_LIGHT unless the user explicitly selected it.
-    Locked styles fall back to STYLE_DEFAULT when the passkey is not set.
+    Gated styles are accepted only when access is unlocked; otherwise forced to default.
     """
     v = (value or "").strip()
-    if v in STYLE_CHOICES:
-        if v == STYLE_TECHNO and not is_style_unlocked(STYLE_TECHNO):
+    if v in STYLE_CHOICES_UNLOCKED:
+        if v in _GATED_STYLES and not is_access_unlocked():
             return STYLE_DEFAULT
         return v
     low = v.lower().replace("_", " ").replace("-", " ")
@@ -741,14 +727,23 @@ def normalize_style(value: str | None) -> str:
         "wild": STYLE_COLORFUL,
         "colorful and wild": STYLE_COLORFUL,
         "colourful and wild": STYLE_COLORFUL,
+        # Avatar Apocalypse (and legacy Avatar World / Post-Nuclear labels)
+        "avatar": STYLE_AVATAR,
+        "avatar world": STYLE_AVATAR,
+        "avatar apocalypse": STYLE_AVATAR,
+        "post nuclear avatar world": STYLE_AVATAR,
+        "post-nuclear avatar world": STYLE_AVATAR,
+        "yotun": STYLE_AVATAR,
+        "naturist": STYLE_AVATAR,
+        # Techno Apocalypse (original mixed worldspace)
         "techno": STYLE_TECHNO,
         "techno apocalypse": STYLE_TECHNO,
-        "tech apocalypse": STYLE_TECHNO,
-        "dark iteration": STYLE_TECHNO,
-        "authorians": STYLE_TECHNO,
+        "apocalypse": STYLE_TECHNO,
+        "radiation": STYLE_TECHNO,
+        "wasteland": STYLE_TECHNO,
     }
     resolved = aliases.get(low, STYLE_DEFAULT)
-    if resolved == STYLE_TECHNO and not is_style_unlocked(STYLE_TECHNO):
+    if resolved in _GATED_STYLES and not is_access_unlocked():
         return STYLE_DEFAULT
     return resolved
 
@@ -886,19 +881,28 @@ OUTFIT_SMART_CASUAL_FEMALE = "Casual_Female"
 OUTFIT_JOGGERS = "Joggers"
 OUTFIT_ROCKER = "Rocker"
 OUTFIT_DARKONES = "Darkie"
+OUTFIT_JIGSAW = "Jigsaw Hoodie"
+OUTFIT_TRIBAL = "Tribal"  # access-gated (includes Peacock-feather head-dress)
 OUTFIT_SKIMPY = "Skimpy"
 OUTFIT_NONE = "None"
 ALL_OUTFITS = "All Outfits"
 # Legacy label kept only so old sessions/settings map cleanly to None.
 _OUTFIT_LEGACY_UNDIES = "Undies"
-OUTFIT_CHOICES = [
+# Public list excludes Tribal (access-gated along with Yotun / Avatar / Techno)
+OUTFIT_CHOICES_PUBLIC = [
     OUTFIT_SMART_SUIT, OUTFIT_SMART_CASUAL_MALE, OUTFIT_SMART_CASUAL_FEMALE,
-    OUTFIT_JOGGERS, OUTFIT_ROCKER, OUTFIT_DARKONES, OUTFIT_SKIMPY, OUTFIT_NONE,
+    OUTFIT_JOGGERS, OUTFIT_ROCKER, OUTFIT_DARKONES, OUTFIT_JIGSAW, OUTFIT_SKIMPY, OUTFIT_NONE,
     ALL_OUTFITS,
 ]
+OUTFIT_CHOICES_UNLOCKED = [
+    OUTFIT_SMART_SUIT, OUTFIT_SMART_CASUAL_MALE, OUTFIT_SMART_CASUAL_FEMALE,
+    OUTFIT_JOGGERS, OUTFIT_ROCKER, OUTFIT_DARKONES, OUTFIT_JIGSAW, OUTFIT_TRIBAL, OUTFIT_SKIMPY, OUTFIT_NONE,
+    ALL_OUTFITS,
+]
+OUTFIT_CHOICES = OUTFIT_CHOICES_PUBLIC  # default / legacy alias
 OUTFIT_CONCRETE = [
     OUTFIT_SMART_SUIT, OUTFIT_SMART_CASUAL_MALE, OUTFIT_SMART_CASUAL_FEMALE,
-    OUTFIT_JOGGERS, OUTFIT_ROCKER, OUTFIT_DARKONES, OUTFIT_SKIMPY, OUTFIT_NONE,
+    OUTFIT_JOGGERS, OUTFIT_ROCKER, OUTFIT_DARKONES, OUTFIT_JIGSAW, OUTFIT_TRIBAL, OUTFIT_SKIMPY, OUTFIT_NONE,
 ]
 OUTFIT_DEFAULT = OUTFIT_NONE
 OUTFIT_TOKEN = "<outfit_worn>"
@@ -909,6 +913,8 @@ OUTFIT_WORDS = {
     OUTFIT_JOGGERS: "black-crop-top with grey-jogging-shorts",
     OUTFIT_ROCKER: "long-black-leather-coat with black shirt and grey-jeans",
     OUTFIT_DARKONES: "black-teflon hooded-hiphop-coat zipped-up with hood-down, grey-jeans",
+    OUTFIT_JIGSAW: "jigsaw-pattern hoodie with blue jeans",
+    OUTFIT_TRIBAL: "tribal-nomad with Peacock-feather head-dress outfit",
     OUTFIT_SKIMPY: "skimpy-revealing version of same outfit",
     OUTFIT_NONE: "",
 }
@@ -923,6 +929,7 @@ FOOTWEAR_BLACK_SHOES = "black-shoes"
 FOOTWEAR_MANILA_SHOES = "manila-shoes"
 FOOTWEAR_BLACK_TRAINERS = "black-trainers"
 FOOTWEAR_MANILA_TRAINERS = "manila-trainers"
+FOOTWEAR_MANILA_SANDALS = "manila-sandals"
 FOOTWEAR_NONE = "none-specified"
 FOOTWEAR_CHOICES = [
     FOOTWEAR_BLACK_BOOTS,
@@ -931,6 +938,7 @@ FOOTWEAR_CHOICES = [
     FOOTWEAR_MANILA_SHOES,
     FOOTWEAR_BLACK_TRAINERS,
     FOOTWEAR_MANILA_TRAINERS,
+    FOOTWEAR_MANILA_SANDALS,
     FOOTWEAR_NONE,
 ]
 FOOTWEAR_DEFAULT = FOOTWEAR_NONE
@@ -942,6 +950,7 @@ FOOTWEAR_WORDS = {
     FOOTWEAR_MANILA_SHOES: "manila shoes",
     FOOTWEAR_BLACK_TRAINERS: "black trainers",
     FOOTWEAR_MANILA_TRAINERS: "manila trainers",
+    FOOTWEAR_MANILA_SANDALS: "manila sandals",
     FOOTWEAR_NONE: "",
 }
 
@@ -959,13 +968,15 @@ def normalize_footwear(value: str) -> str:
     aliases = {
         "none": FOOTWEAR_NONE,
         "none-specified": FOOTWEAR_NONE,
-        "boots": FOOTWEAR_BLACK_BOOTS,
-        "shoes": FOOTWEAR_BLACK_SHOES,
+        "boots_b": FOOTWEAR_BLACK_BOOTS,
+        "boots_w": FOOTWEAR_MANILA_BOOTS,
+        "shoes_b": FOOTWEAR_BLACK_SHOES,
+        "shoes_w": FOOTWEAR_MANILA_SHOES,
         "trainers": FOOTWEAR_BLACK_TRAINERS,
-        "sneakers": FOOTWEAR_BLACK_TRAINERS,
+        "sneakers": FOOTWEAR_MANILA_TRAINERS,
+        "sandals": FOOTWEAR_MANILA_SANDALS,
     }
     return aliases.get(low, FOOTWEAR_DEFAULT)
-
 
 def footwear_phrase(value: str) -> str:
     """Concrete footwear description, or empty when none-specified."""
@@ -988,15 +999,24 @@ def clothing_and_footwear_phrase(outfit: str = "", footwear: str = "") -> str:
     return op or fp
 
 
+def outfit_choices_for_ui() -> list:
+    """Dropdown choices; Tribal (Peacock head-dress) only when access is unlocked."""
+    return list(OUTFIT_CHOICES_UNLOCKED if is_access_unlocked() else OUTFIT_CHOICES_PUBLIC)
+
+
 def normalize_outfit(value: str) -> str:
     v = (value or "").strip()
     # Removed "Undies" option — map any saved value to None.
     if v.lower() in ("undies", "underwear only", "underwear"):
         return OUTFIT_NONE
-    if v in OUTFIT_CHOICES:
+    if v == OUTFIT_TRIBAL and not is_access_unlocked():
+        return OUTFIT_DEFAULT
+    if v in OUTFIT_CHOICES_UNLOCKED:
         return v
     for c in OUTFIT_CONCRETE:
         if c.lower() == v.lower():
+            if c == OUTFIT_TRIBAL and not is_access_unlocked():
+                return OUTFIT_DEFAULT
             return c
     return OUTFIT_DEFAULT
 
@@ -1072,6 +1092,42 @@ def gender_phrase(value: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Discrete access code (never advertised in GUI labels or help text)
+# Unlocks:
+#   - Visual styles "Avatar Apocalypse" and "Techno Apocalypse"
+#   - Blue-Yotun bodyshape
+#   - Tribal outfit (includes Peacock-feather head-dress)
+#   - Gleaming Hazel-Grey eyes
+# ---------------------------------------------------------------------------
+ACCESS_CODE = "WiseMan-TimeLord"
+
+
+def is_access_unlocked() -> bool:
+    """True when the discrete access code has been entered this session / prefs."""
+    if bool(APP_STATE.get("access_unlocked")):
+        return True
+    try:
+        if bool(load_preferences().get("access_unlocked")):
+            APP_STATE["access_unlocked"] = True
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def try_unlock_access(code: str) -> bool:
+    """Validate access code; persist unlock flag when correct. Never logs the code."""
+    ok = (code or "").strip() == ACCESS_CODE
+    if ok:
+        APP_STATE["access_unlocked"] = True
+        try:
+            update_preferences({"access_unlocked": True})
+        except Exception:
+            pass
+    return ok
+
+
+# ---------------------------------------------------------------------------
 # Reference image bodyshape (subject token)
 # ---------------------------------------------------------------------------
 BODYSHAPE_OVERWEIGHT = "Overweight"
@@ -1080,15 +1136,24 @@ BODYSHAPE_SLIM = "Slim"
 BODYSHAPE_SKINNY = "Skinny"
 BODYSHAPE_EXOTIC = "Exotic"
 BODYSHAPE_MUSCULAR = "Muscular"
+BODYSHAPE_YOTUN = "Blue-Yotun"
 ALL_BODYSHAPES = "All Shapes"
-BODYSHAPE_CHOICES = [
+# Public list excludes Blue-Yotun (access-gated)
+BODYSHAPE_CHOICES_PUBLIC = [
     BODYSHAPE_OVERWEIGHT, BODYSHAPE_CURVY, BODYSHAPE_SLIM,
     BODYSHAPE_SKINNY, BODYSHAPE_EXOTIC, BODYSHAPE_MUSCULAR,
     ALL_BODYSHAPES,
 ]
+BODYSHAPE_CHOICES_UNLOCKED = [
+    BODYSHAPE_OVERWEIGHT, BODYSHAPE_CURVY, BODYSHAPE_SLIM,
+    BODYSHAPE_SKINNY, BODYSHAPE_EXOTIC, BODYSHAPE_MUSCULAR,
+    BODYSHAPE_YOTUN, ALL_BODYSHAPES,
+]
+BODYSHAPE_CHOICES = BODYSHAPE_CHOICES_PUBLIC  # default / legacy alias
 BODYSHAPE_CONCRETE = [
     BODYSHAPE_OVERWEIGHT, BODYSHAPE_CURVY, BODYSHAPE_SLIM,
     BODYSHAPE_SKINNY, BODYSHAPE_EXOTIC, BODYSHAPE_MUSCULAR,
+    BODYSHAPE_YOTUN,
 ]
 BODYSHAPE_DEFAULT = BODYSHAPE_SLIM
 BODYSHAPE_WORDS = {
@@ -1098,16 +1163,26 @@ BODYSHAPE_WORDS = {
     BODYSHAPE_SKINNY: "skinny",
     BODYSHAPE_EXOTIC: "exotic",
     BODYSHAPE_MUSCULAR: "muscular",
+    BODYSHAPE_YOTUN: "blue-skinned yotun",
     ALL_BODYSHAPES: "",
 }
 
 
+def bodyshape_choices_for_ui() -> list:
+    """Dropdown choices; Blue-Yotun only when access is unlocked."""
+    return list(BODYSHAPE_CHOICES_UNLOCKED if is_access_unlocked() else BODYSHAPE_CHOICES_PUBLIC)
+
+
 def normalize_bodyshape(value: str) -> str:
     v = (value or "").strip()
-    if v in BODYSHAPE_CHOICES:
+    if v == BODYSHAPE_YOTUN and not is_access_unlocked():
+        return BODYSHAPE_DEFAULT
+    if v in BODYSHAPE_CHOICES_UNLOCKED:
         return v
     for c in BODYSHAPE_CONCRETE:
         if c.lower() == v.lower():
+            if c == BODYSHAPE_YOTUN and not is_access_unlocked():
+                return BODYSHAPE_DEFAULT
             return c
     return BODYSHAPE_DEFAULT
 
@@ -1117,6 +1192,72 @@ def bodyshape_phrase(value: str) -> str:
     if key == ALL_BODYSHAPES:
         return ""
     return (BODYSHAPE_WORDS.get(key) or "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Eye colour (main / reference character only)
+# ---------------------------------------------------------------------------
+EYE_BROWN = "Brown"
+EYE_DARK_BROWN = "Dark Brown"
+EYE_HAZEL = "Hazel"
+EYE_AMBER = "Amber"
+EYE_GREEN = "Green"
+EYE_BLUE = "Blue"
+EYE_GREY = "Grey"
+EYE_BLACK = "Black"
+EYE_VIOLET = "Violet"
+EYE_GLEAMING = "Gleaming Hazel-Grey"  # access-gated
+EYE_NONE = "Unspecified"
+EYE_CHOICES_PUBLIC = [
+    EYE_NONE, EYE_BROWN, EYE_DARK_BROWN, EYE_HAZEL, EYE_AMBER,
+    EYE_GREEN, EYE_BLUE, EYE_GREY, EYE_BLACK, EYE_VIOLET,
+]
+EYE_CHOICES_UNLOCKED = EYE_CHOICES_PUBLIC + [EYE_GLEAMING]
+EYE_DEFAULT = EYE_NONE
+EYE_WORDS = {
+    EYE_BROWN: "brown",
+    EYE_DARK_BROWN: "dark brown",
+    EYE_HAZEL: "hazel",
+    EYE_AMBER: "amber",
+    EYE_GREEN: "green",
+    EYE_BLUE: "blue",
+    EYE_GREY: "grey",
+    EYE_BLACK: "black",
+    EYE_VIOLET: "violet",
+    EYE_GLEAMING: "gleaming hazel-grey",
+    EYE_NONE: "",
+}
+
+
+def eye_color_choices_for_ui() -> list:
+    return list(EYE_CHOICES_UNLOCKED if is_access_unlocked() else EYE_CHOICES_PUBLIC)
+
+
+def normalize_eye_color(value: str) -> str:
+    v = (value or "").strip()
+    if not v or v.lower() in ("none", "unspecified", "default", ""):
+        return EYE_NONE
+    if v == EYE_GLEAMING and not is_access_unlocked():
+        return EYE_DEFAULT
+    all_choices = EYE_CHOICES_UNLOCKED
+    if v in all_choices:
+        return v
+    low = v.lower()
+    for c in all_choices:
+        if c.lower() == low:
+            if c == EYE_GLEAMING and not is_access_unlocked():
+                return EYE_DEFAULT
+            return c
+    return EYE_DEFAULT
+
+
+def eye_color_phrase(value: str) -> str:
+    """Natural fragment e.g. 'with green eyes' — empty when unspecified."""
+    key = normalize_eye_color(value)
+    word = (EYE_WORDS.get(key) or "").strip()
+    if not word:
+        return ""
+    return f"with {word} eyes"
 
 
 
@@ -1147,6 +1288,17 @@ AGE_MAX: int = 95
 AGE_DEFAULT: int = 45
 AGE_TOKEN: str = "<age>"
 
+# ---------------------------------------------------------------------------
+# Support-actor (background) age range — Characters panel "Support-actor ages"
+# Applies ONLY to secondary/background people, never the main/reference character.
+# One generic min–max band (Flux.2-klein cannot follow multiple ages in a scene).
+# Bounds are fixed; the user picks a sub-range within them; min/max ordered on write.
+# ---------------------------------------------------------------------------
+SUPPORT_AGE_BOUND_MIN: int = 18
+SUPPORT_AGE_BOUND_MAX: int = 65
+SUPPORT_AGE_MIN_DEFAULT: int = 25
+SUPPORT_AGE_MAX_DEFAULT: int = 45
+
 
 def normalize_age(value) -> int:
     """Clamp to [AGE_MIN, AGE_MAX] and round to nearest 5."""
@@ -1165,6 +1317,39 @@ def age_phrase(value) -> str:
     """Literal age words for identity lock, e.g. '45 years old'."""
     n = normalize_age(value)
     return f"{n} years old"
+
+
+def normalize_support_age(value, *, is_min: bool = True) -> int:
+    """Clamp support-actor age to [18, 65] and round to nearest 5."""
+    default = SUPPORT_AGE_MIN_DEFAULT if is_min else SUPPORT_AGE_MAX_DEFAULT
+    try:
+        n = int(round(float(value)))
+    except (TypeError, ValueError):
+        n = default
+    n = max(SUPPORT_AGE_BOUND_MIN, min(SUPPORT_AGE_BOUND_MAX, n))
+    n = int(round(n / 5.0) * 5)
+    n = max(SUPPORT_AGE_BOUND_MIN, min(SUPPORT_AGE_BOUND_MAX, n))
+    return n
+
+
+def support_actor_age_range(age_min=None, age_max=None) -> tuple:
+    """Return (lo, hi) clamped and ordered within support bounds."""
+    lo = normalize_support_age(age_min, is_min=True)
+    hi = normalize_support_age(age_max, is_min=False)
+    if lo > hi:
+        lo, hi = hi, lo
+    return lo, hi
+
+
+def support_actor_age_phrase(age_min=None, age_max=None) -> str:
+    """
+    Phrase injected only into prompts that include background/support actors.
+    Example: selected 25–45 → "all over 25 and under 45"
+    """
+    lo, hi = support_actor_age_range(age_min, age_max)
+    if lo == hi:
+        return f"all approximately {lo} years old"
+    return f"all over {lo} and under {hi}"
 
 def subject_appearance_clause(
     hair: str = "",
@@ -1207,6 +1392,7 @@ def character_identity_clause(
     age=None,
     presence: str = "full",
     footwear: str = "",
+    eye_color: str = "",
 ) -> str:
     """
     Natural-language character lock for Flux --llm (no instructional CHARACTER: prefix).
@@ -1243,8 +1429,11 @@ def character_identity_clause(
         bits: List[str] = [
             f"A distant {who} matching the reference image"
         ]
+        ep = eye_color_phrase(eye_color)
         if hp:
             bits.append(f"hair {hp}")
+        if ep:
+            bits.append(ep)
         if bp:
             bits.append(f"{bp} build")
         if wear:
@@ -1263,8 +1452,9 @@ def character_identity_clause(
         bits.append(f"{bp} build")
     if hp:
         bits.append(f"hair {hp}")
-    # Flux.2-klein often defaults to closed eyes; keep lids open without locking gaze.
-    bits.append("eyes open")
+    ep = eye_color_phrase(eye_color)
+    if ep:
+        bits.append(ep)
     bits.append("anatomically correct hands")
     if wear:
         bits.append(f"wearing {wear}")
@@ -1282,12 +1472,6 @@ def still_header(image_style: str = "", visual_style: str = "") -> str:
         mood = STYLE_DEFAULT
     parts = [lead, mood, "cinematic composition", "coherent lighting"]
     return ", ".join(parts) + "."
-
-
-# Open-eyes lock appended to character-bearing lyric stills (not cover/theme).
-# Flux.2-klein frequently closes eyelids under dramatic light / motion blur;
-# positive + negative pairing is the reliable counter.
-OPEN_EYES_CLAUSE = "Eyes open."
 
 
 def compose_lyric_still_prompt(
@@ -1353,8 +1537,6 @@ def compose_lyric_still_prompt(
     id_s = (identity or "").strip()
     if id_s:
         parts.append(id_s)
-        # Reinforce open eyes whenever a character identity is in the frame
-        parts.append(OPEN_EYES_CLAUSE)
 
     pose_s = _clean_clause(pose)
     if pose_s:
@@ -1380,7 +1562,8 @@ STYLE_FADE_RGB = {
     STYLE_LIGHT: (255, 255, 255),      # white
     STYLE_DARK: (0, 0, 0),             # black
     STYLE_COLORFUL: (128, 0, 128),     # purple proxy for rainbow (ffmpeg limitation)
-    STYLE_TECHNO: (20, 40, 60),        # deep charcoal-cyan (cyber void)
+    STYLE_AVATAR: (20, 40, 30),        # deep under-earth UV green-black
+    STYLE_TECHNO: (40, 30, 20),        # mixed ruin / tribal brown-black
 }
 
 # Default prompt templates per visual style (seed for prompting.json)
@@ -1400,20 +1583,24 @@ STYLE_PROMPT_TEMPLATES = {
         "Emphasize saturated colours, dynamic shapes, and playful wildness. "
         "Subject of the image: {line}"
     ),
+    STYLE_AVATAR: (
+        "Create a visual description for a music-video still set in an Avatar Apocalypse world: "
+        "a latter-day Avatar setting after humans destroyed the surface. "
+        "Under-earth is a dark UV haven of large honeycomb recesses down tunnels, "
+        "lit by bioluminescent flora where naturist yotun tribes endure. "
+        "The surface is a post-nuclear wasteland of radiation storms, urban ruins, and ash skies, "
+        "part-reclaimed by nature; human survivors are feral, mutant, or clan-based, "
+        "or sparse Corporate technocrats sealed in residential domes. "
+        "Blend subterranean UV organic life with surface ruin and reclaimed wilderness. "
+        "Subject of the image: {line}"
+    ),
     STYLE_TECHNO: (
-        "Create a Techno Apocalypse music-video still. World: decaying digital utopia "
-        "conquered by the Dark Iteration (AI calculations too complex for human minds) "
-        "on behalf of the main figure — winner of the game and Director General of the "
-        "Authorians (robot/clone faction). Surface: urban battlefield ruins, abandoned "
-        "data-server farms, neon signs flickering like dying stars, cyber-gold against "
-        "charcoal voids, scavengers in rags/gasmasks, grey military androids with yellow/"
-        "blue LED trims, wreckage and broken LED streetlights. Subsurface: smashed steel "
-        "doors, UV-lit control rooms with UV paint, holographic planetary displays and "
-        "floating cuneiform, crackling electric vortexes/portals for robot troops, "
-        "improvised android raves with tinfoil hats and multi-colour lasers. Tone: "
-        "mythic yet mechanical, reverence mixed with dread, glitching infrastructure, "
-        "cyber-ritual. Palette locked to fractured cyber-gold, charcoal voids, intense "
-        "multi-colour UV and electric arcs. Subject of the image: {line}"
+        "Create a visual description for a music-video still set in a Techno Apocalypse world: "
+        "naturist spiritual tribes of yotun and technocratic-militaries / raiders. "
+        "Worldspaces include naturist tipis and tree-houses, urban battleground ruins "
+        "part-reclaimed by nature, or technocrat residential domes. "
+        "Blend organic tribal elements with residual high-tech or ruined military hardware. "
+        "Subject of the image: {line}"
     ),
 }
 
@@ -1444,9 +1631,9 @@ RESOLUTION_PIXELS = {
 }
 
 # Default generation values for Flux.2-klein-4B distilled
-DEFAULT_WIDTH = 720
-DEFAULT_HEIGHT = 405
-DEFAULT_STEPS = 10  # more improves eyes / fine detail
+DEFAULT_WIDTH = 768
+DEFAULT_HEIGHT = 432
+DEFAULT_STEPS = 18  # higher detail for Flux.2-klein stills
 DEFAULT_CFG = 1.1
 # Shared negative body (style lead is prepended dynamically from Image Style).
 # Periods group: overlays / quality / anatomy / identity / devices.
@@ -1456,8 +1643,7 @@ DEFAULT_NEGATIVE_BODY = (
     "deformed, bad anatomy, extra limbs, missing limbs, mutated limbs, "
     "mutated hands, fused fingers, fewer than five fingers on each hand, "
     "exaggerated proportions, contorted pose, head on backwards. "
-    "closed eyes. "
-    "2 or more characters based on reference image. ghosts. "
+    "multiple characters based on reference image. ghosts. "
     "electronic devices, mobile phones, headphones."
 )
 # Back-compat alias: full default assumes Photo Realistic style lead.
@@ -1481,6 +1667,7 @@ COVER_NEGATIVE_EXTRA = (
 )
 DEFAULT_SAMPLER = "euler_a"
 DEFAULT_SEED = -1
+
 
 # Still output sizes (width × height) — user-selectable in Generation tab
 # Labels always use the unicode multiply sign "×" for the dropdown.
@@ -1527,7 +1714,7 @@ IMAGE_SIZE_PIXELS = {
     IMAGE_SIZE_1280x768: (1280, 768),
     IMAGE_SIZE_1366x768: (1366, 768),
 }
-DEFAULT_IMAGE_SIZE = IMAGE_SIZE_720x405
+DEFAULT_IMAGE_SIZE = IMAGE_SIZE_768x432
 
 # Thumbnail placeholder aspect class for images/thumbnails_*_{regular|wide}.jpg
 # regular (~3:2 / 4:3): 768×512, 1024×768
@@ -1908,39 +2095,102 @@ MAX_THUMBNAIL_CHOICES = [25, 50, 100]
 THUMBNAIL_COUNT_CHOICES = [25, 50, 100]
 DEFAULT_INPUT_THUMBNAIL = 96  # legacy, unused for layout
 INPUT_THUMBNAIL_CHOICES = [64, 96, 128, 160]  # legacy
-DEFAULT_LYRICS_THUMBS_PER_ROW = 8
-LYRICS_THUMBS_PER_ROW_CHOICES = [4, 6, 8, 10, 12]
+# Shared per-row choices for Cover / Theme / Lyrics thumbnail grids
+THUMBS_PER_ROW_CHOICES = [2, 4, 6, 8, 10]
+DEFAULT_COVER_THUMBS_PER_ROW = 2
+DEFAULT_THEME_THUMBS_PER_ROW = 4
+DEFAULT_LYRICS_THUMBS_PER_ROW = 6
+# Legacy alias kept for older prefs / code paths
+LYRICS_THUMBS_PER_ROW_CHOICES = THUMBS_PER_ROW_CHOICES
+# Max rows visible on one Thumbnails page before pagination kicks in
+THUMBS_MAX_ROWS_PER_PAGE = 10
 
 # ---------------------------------------------------------------------------
 # Session state (in-memory)
 # ---------------------------------------------------------------------------
 APP_STATE: Dict[str, Any] = {
+    # Core process / cancel
     "active_processes": [],
-    "generation_output_paths": [],
     "cancel_requested": False,
-    "last_image_browse_dir": "",
     "models_unloaded": False,
+    "generating": False,
+    "prefer_stop": False,
+    # Paths / last-used
+    "generation_output_paths": [],
+    "last_image_browse_dir": "",
     "last_image_path": "",
     "current_project_folder": "",
-    # Session management (Generation left column)
     "active_session_id": "",       # folder name under output/, or "" for blank new
     "sessions_sidebar_expanded": True,
     "session_status": "idle",      # idle | running | stopped | done
-    # Per-still regenerate queue (0-based line indices); drained when idle
+    # Access (discrete unlock; never advertised)
+    "access_unlocked": False,
+    # Per-still regenerate (lyrics line indices 0-based; drained when idle)
     "regen_queue": [],
-    "generating": False,
-    # 1-based lyric line numbers listed for generation but not started yet
-    # (drives thumbnails_qued_for_generation.jpg in the Materials grid)
-    "thumb_queued_lines": [],
+    "regen_busy_lines": [],
+    "regen_busy_keys": [],
+    "named_regen_queue": [],
+    "named_regen_busy": False,
+    "regen_worker_alive": False,
+    "regen_worker_ctx": None,
+    # Thumbnail / gallery live state (1-based line numbers where noted)
+    "thumb_queued_lines": [],      # listed for generation but not started
+    "thumb_generating_line": None, # currently generating lyric line (1-based) or None
+    "thumb_expected_count": 0,
+    "cover_slot_queued": [],
+    "cover_slot_generating": [],
+    "cover_slot_expected": 0,
+    "theme_slot_queued": [],
+    "theme_slot_generating": [],
+    "theme_slot_expected": 0,
+    "lyrics_page": 0,
+    "thumbs_tab_auto_opened": False,
+    # Live status / timing (UI polls these)
+    "status_last_msg": "",
+    "status_last_info": {},
+    "status_last_frac": 0.0,
+    "image_gen_t0": None,
+    "last_image_gen_seconds": 0.0,
+    "still_finished_secs": None,
+    "still_finished_at": None,
+    "still_done_seq": 0,
+    "gen_mode": "",
+    "ui_job_id": 0,
+    "ui_job_kind": "",
+    # Line → section map (refreshed from lyrics)
+    "line_section_map": {},
 }
 
 
 def init_session_state() -> None:
+    """Reset transient session keys; preserve access unlock and last browse dir."""
     cfg = load_configuration()
     APP_STATE["last_image_browse_dir"] = cfg.get("last_image_browse_dir", "")
     APP_STATE["cancel_requested"] = False
     APP_STATE["active_processes"] = []
     APP_STATE["generation_output_paths"] = []
+    APP_STATE["generating"] = False
+    APP_STATE["prefer_stop"] = False
+    APP_STATE["regen_queue"] = []
+    APP_STATE["regen_busy_lines"] = []
+    APP_STATE["regen_busy_keys"] = []
+    APP_STATE["named_regen_queue"] = []
+    APP_STATE["named_regen_busy"] = False
+    APP_STATE["thumb_queued_lines"] = []
+    APP_STATE["thumb_generating_line"] = None
+    APP_STATE["cover_slot_queued"] = []
+    APP_STATE["cover_slot_generating"] = []
+    APP_STATE["theme_slot_queued"] = []
+    APP_STATE["theme_slot_generating"] = []
+    APP_STATE["image_gen_t0"] = None
+    APP_STATE["still_finished_secs"] = None
+    APP_STATE["still_finished_at"] = None
+    APP_STATE["status_last_msg"] = ""
+    APP_STATE["status_last_info"] = {}
+    APP_STATE["status_last_frac"] = 0.0
+    APP_STATE["gen_mode"] = ""
+    APP_STATE["session_status"] = "idle"
+    # access_unlocked is intentionally preserved across init
 
 
 # ---------------------------------------------------------------------------
@@ -2313,24 +2563,40 @@ PREFERENCES_KEYS = [
     "video_format",
     "max_thumbnails",
     "input_thumbnail_size",
+    "cover_thumbs_per_row",
+    "theme_thumbs_per_row",
     "lyrics_thumbs_per_row",
     "bleep_section_completion",
     "bleep_video_completion",
-    "passkey",
+    "access_unlocked",
 ]
 
 
 def _default_preferences() -> Dict[str, Any]:
     return {
         "style": STYLE_DEFAULT,
-        "passkey": "",
         "video_format": VIDEO_MP4,
         "max_thumbnails": DEFAULT_MAX_THUMBNAILS,
         "input_thumbnail_size": DEFAULT_INPUT_THUMBNAIL,
+        "cover_thumbs_per_row": DEFAULT_COVER_THUMBS_PER_ROW,
+        "theme_thumbs_per_row": DEFAULT_THEME_THUMBS_PER_ROW,
         "lyrics_thumbs_per_row": DEFAULT_LYRICS_THUMBS_PER_ROW,
         "bleep_section_completion": False,
         "bleep_video_completion": False,
+        "access_unlocked": False,
     }
+
+
+def normalize_thumbs_per_row(value: Any, default: int = DEFAULT_LYRICS_THUMBS_PER_ROW) -> int:
+    """Clamp a thumbs-per-row preference to the shared enum."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        n = int(default)
+    if n not in THUMBS_PER_ROW_CHOICES:
+        # nearest allowed
+        n = min(THUMBS_PER_ROW_CHOICES, key=lambda c: abs(c - n))
+    return n
 
 
 def load_preferences() -> Dict[str, Any]:
@@ -2363,6 +2629,7 @@ PROMPTING_KEYS = [
     STYLE_LIGHT,
     STYLE_DARK,
     STYLE_COLORFUL,
+    STYLE_AVATAR,
     STYLE_TECHNO,
 ]
 
@@ -2372,6 +2639,7 @@ def _default_prompting() -> Dict[str, Any]:
         STYLE_LIGHT: STYLE_PROMPT_TEMPLATES[STYLE_LIGHT],
         STYLE_DARK: STYLE_PROMPT_TEMPLATES[STYLE_DARK],
         STYLE_COLORFUL: STYLE_PROMPT_TEMPLATES[STYLE_COLORFUL],
+        STYLE_AVATAR: STYLE_PROMPT_TEMPLATES[STYLE_AVATAR],
         STYLE_TECHNO: STYLE_PROMPT_TEMPLATES[STYLE_TECHNO],
     }
 
@@ -2426,9 +2694,13 @@ GENERATION_KEYS = [
     "footwear",
     "ref_gender",
     "ref_bodyshape",
+    "eye_color",
     "ref_age",
+    "support_age_min",
+    "support_age_max",
     "project_label",
     "last_image_gen_seconds",
+    "narrative_guidance",
 ]
 
 
@@ -2458,9 +2730,13 @@ def _default_generation() -> Dict[str, Any]:
         "footwear": FOOTWEAR_DEFAULT,
         "ref_gender": GENDER_DEFAULT,
         "ref_bodyshape": BODYSHAPE_DEFAULT,
+        "eye_color": EYE_DEFAULT,
         "ref_age": AGE_DEFAULT,
+        "support_age_min": SUPPORT_AGE_MIN_DEFAULT,
+        "support_age_max": SUPPORT_AGE_MAX_DEFAULT,
         "project_label": "",
         "last_image_gen_seconds": 0.0,
+        "narrative_guidance": "",
     }
 
 
