@@ -2625,12 +2625,18 @@ def update_preferences(updates: Dict[str, Any]) -> Dict[str, Any]:
 # prompting.json  (editable visual-style prompt templates)
 # ---------------------------------------------------------------------------
 
+# negative_prompt is the shared default edited on the Prompting tab
+# (Save Prompt Templates). Per-project overrides still flow through the
+# same textbox at generate time and session meta.
+PROMPTING_NEGATIVE_KEY = "negative_prompt"
+
 PROMPTING_KEYS = [
     STYLE_LIGHT,
     STYLE_DARK,
     STYLE_COLORFUL,
     STYLE_AVATAR,
     STYLE_TECHNO,
+    PROMPTING_NEGATIVE_KEY,
 ]
 
 
@@ -2641,6 +2647,7 @@ def _default_prompting() -> Dict[str, Any]:
         STYLE_COLORFUL: STYLE_PROMPT_TEMPLATES[STYLE_COLORFUL],
         STYLE_AVATAR: STYLE_PROMPT_TEMPLATES[STYLE_AVATAR],
         STYLE_TECHNO: STYLE_PROMPT_TEMPLATES[STYLE_TECHNO],
+        PROMPTING_NEGATIVE_KEY: DEFAULT_NEGATIVE_PROMPT,
     }
 
 
@@ -2649,12 +2656,15 @@ def load_prompting() -> Dict[str, Any]:
 
 
 def save_prompting(data: Dict[str, Any]) -> None:
-    filtered = {k: str(v) for k, v in data.items() if k in PROMPTING_KEYS}
-    # Ensure all three styles are always present
     defaults = _default_prompting()
+    filtered: Dict[str, Any] = {}
     for k in PROMPTING_KEYS:
-        if k not in filtered or not str(filtered[k]).strip():
-            filtered[k] = defaults[k]
+        raw = data.get(k, defaults.get(k, ""))
+        text = "" if raw is None else str(raw)
+        if not text.strip():
+            # Empty style / negative → fall back to built-in default
+            text = str(defaults.get(k, ""))
+        filtered[k] = text
     _save_json_atomic(get_prompting_path(), filtered)
 
 
@@ -2663,6 +2673,17 @@ def update_prompting(updates: Dict[str, Any]) -> Dict[str, Any]:
     data.update({k: v for k, v in updates.items() if k in PROMPTING_KEYS})
     save_prompting(data)
     return data
+
+
+def get_default_negative_prompt() -> str:
+    """Negative text from prompting.json, else built-in DEFAULT_NEGATIVE_PROMPT."""
+    try:
+        v = load_prompting().get(PROMPTING_NEGATIVE_KEY)
+        if v is not None and str(v).strip():
+            return str(v)
+    except Exception:
+        pass
+    return DEFAULT_NEGATIVE_PROMPT
 
 
 # ---------------------------------------------------------------------------

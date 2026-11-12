@@ -1978,10 +1978,12 @@ def _thumb_panel_updates(paths: Optional[List[str]] = None) -> List[Any]:
 
     page_items = _lyrics_page_slice(n_lines=n_lines, per=per, page=page)
     expected = min(len(page_items), THUMB_SLOTS)
-    # Only the active Thumbnails section is visible (never all three at once)
+    # Only the active Thumbnails section is visible (never all three at once).
+    # Slot *content* is always filled so switching Cover→Lyrics (or loading a
+    # project while Cover is selected) still shows the correct stills.
     show_section = _current_thumbs_section() == "lyrics"
-    # New project / no lyric lines yet: still show one No Image placeholder slot
-    if expected <= 0 and show_section:
+    # New project / no lyric lines yet: still reserve one No Image placeholder
+    if expected <= 0:
         expected = 1
         page_items = [(1, 1)]
 
@@ -2023,9 +2025,10 @@ def _thumb_panel_updates(paths: Optional[List[str]] = None) -> List[Any]:
     def _phys(logical: int) -> int:
         return (logical // per_row) * THUMB_COLS_MAX + (logical % per_row)
 
-    # Which physical indices hold a still on this page
+    # Which physical indices hold a still on this page (always fill content;
+    # panel visibility is controlled separately via show_section).
     phys_active: Dict[int, int] = {}  # phys_idx → logical idx
-    for logical in range(expected if show_section else 0):
+    for logical in range(expected):
         phys_active[_phys(logical)] = logical
 
     show_pages = bool(show_section and per > 1)
@@ -2039,9 +2042,11 @@ def _thumb_panel_updates(paths: Optional[List[str]] = None) -> List[Any]:
         ),
     ]
     n_logical_rows = (expected + per_row - 1) // per_row if expected > 0 else 0
+    # Row visibility follows content only (same as Cover/Theme). Panel-level
+    # show_section hides the whole Lyrics column; keeping rows "visible" inside
+    # a hidden panel means a pure section switch never leaves an empty grid.
     for r in range(n_rows):
-        row_has = show_section and r < n_logical_rows
-        updates.append(gr.update(visible=row_has))
+        updates.append(gr.update(visible=(r < n_logical_rows)))
 
     for i in range(THUMB_SLOTS):
         logical = phys_active.get(i)
@@ -2518,14 +2523,6 @@ def _build_create_tab() -> None:
                     value=initial_lyrics,
                     elem_id="lyrics-box",
                 )
-                _gen["negative_prompt"] = gr.Textbox(
-                    label="Negative prompt (saved with the project)",
-                    lines=2,
-                    max_lines=4,
-                    value=getattr(configure, "DEFAULT_NEGATIVE_PROMPT", ""),
-                    placeholder="Things to avoid in every still…",
-                    elem_id="negative-prompt-box",
-                )
             _gen["details_name_lyrics"] = _details_nl
 
             # 3 — Song Assessment
@@ -2962,24 +2959,53 @@ def _build_thumbnails_tab() -> None:
             )
 
     def _on_thumbs_section(choice: str):
+        """
+        Switch which Thumbnails panel is visible.
+
+        Visibility-only — do NOT rebuild the whole gallery here. A full
+        `_all_gallery_updates` on every radio click races with timer / generate
+        yields and intermittently paints an empty panel. Slot content is kept
+        current by session load and by generation progress updates.
+        """
         key = _set_thumbs_section(choice or "Cover Images")
-        return (
+        # Lyrics page switcher only meaningful on the Lyrics panel
+        per = 1
+        try:
+            per = _lyrics_per_line_count()
+        except Exception:
+            per = 1
+        show_pages = bool(key == "lyrics" and per > 1)
+        page_upd = gr.update()
+        if _gen.get("lyrics_page_radio") is not None:
+            page_upd = gr.update(
+                visible=show_pages,
+                choices=_lyrics_page_choices(),
+                value=_lyrics_page_label() if show_pages else None,
+            )
+        outs = [
             gr.update(visible=(key == "cover")),
             gr.update(visible=(key == "theme")),
             gr.update(visible=(key == "lyrics")),
-        )
+        ]
+        if _gen.get("lyrics_page_radio") is not None:
+            outs.append(page_upd)
+        return tuple(outs)
 
     if _gen.get("thumbs_section") is not None:
         # Seed default section so the first gallery refresh keeps only Cover visible
         _set_thumbs_section("Cover Images")
+        _section_outs = [
+            _gen.get("cover_panel"),
+            _gen.get("theme_panel"),
+            _gen.get("thumbs_panel"),
+        ]
+        if _gen.get("lyrics_page_radio") is not None:
+            _section_outs.append(_gen["lyrics_page_radio"])
         _gen["thumbs_section"].change(
             _on_thumbs_section,
             inputs=[_gen["thumbs_section"]],
-            outputs=[
-                _gen.get("cover_panel"),
-                _gen.get("theme_panel"),
-                _gen.get("thumbs_panel"),
-            ],
+            outputs=_section_outs,
+            show_progress="hidden",
         )
 
 
@@ -3285,18 +3311,30 @@ def _wire_create_events(status_box) -> None:
     )
 
     def _details_mode_change(mode: str):
+        """
+        Toggle Management detail panels. Keep the switch lightweight and
+        re-assert the shown panel's primary content so Gradio does not paint
+        an empty column after a rapid radio change (common race with Qt WebEngine).
+        """
         m = (mode or "").strip()
         show_settings = m == "Project Settings"
         show_nl = m == "Name and Lyrics"
         show_assess = m == "Song Assessment"
         show_ref = m == "Characters"
-        assess = _load_assessment_text() if show_assess else gr.update()
+        # Always return explicit visible=True/False (never bare gr.update()) so a
+        # cancelled/partial previous event cannot leave every panel hidden.
+        assess_upd = gr.update()
+        if show_assess:
+            try:
+                assess_upd = gr.update(value=_load_assessment_text() or "")
+            except Exception:
+                assess_upd = gr.update()
         return (
-            gr.update(visible=show_settings),
-            gr.update(visible=show_nl),
-            gr.update(visible=show_assess),
-            gr.update(visible=show_ref),
-            gr.update(value=assess) if show_assess else gr.update(),
+            gr.update(visible=bool(show_settings)),
+            gr.update(visible=bool(show_nl)),
+            gr.update(visible=bool(show_assess)),
+            gr.update(visible=bool(show_ref)),
+            assess_upd,
         )
 
     if _gen.get("details_mode") is not None:
@@ -3310,6 +3348,7 @@ def _wire_create_events(status_box) -> None:
                 _gen["details_reference"],
                 _gen["assessment_view"],
             ],
+            show_progress="hidden",
         )
 
     def _save_assessment(text_val: str, song_name: str, lyrics: str, active_session_id: str):
@@ -3754,9 +3793,23 @@ def _wire_create_events(status_box) -> None:
         configure.APP_STATE["session_status"] = (
             "done" if s.get("phase") == "done" else "stopped"
         )
-        imgs = s.get("image_paths") or configure.list_session_images(Path(s["path"]))
+        # Prefer a fresh disk scan so partial projects show every still on load
+        imgs = _list_project_images(s["path"])
+        if not imgs:
+            imgs = s.get("image_paths") or configure.list_session_images(Path(s["path"]))
         configure.APP_STATE["generation_output_paths"] = list(imgs)
-        configure.APP_STATE["thumb_expected_count"] = int(s.get("line_count") or len(imgs) or 0)
+        line_count = int(s.get("line_count") or 0)
+        if line_count <= 0 and imgs:
+            # Derive line count from numbered still filenames
+            try:
+                by_key = _variant_path_map(imgs)
+                if by_key:
+                    line_count = max(ln for ln, _v in by_key.keys())
+            except Exception:
+                line_count = 0
+        if line_count <= 0:
+            line_count = int(s.get("line_count") or len(imgs) or 0)
+        configure.APP_STATE["thumb_expected_count"] = line_count
         configure.APP_STATE["thumb_generating_line"] = None
         configure.APP_STATE["regen_busy_lines"] = []
         configure.APP_STATE["thumb_queued_lines"] = []
@@ -3831,7 +3884,13 @@ def _wire_create_events(status_box) -> None:
             running=False,
         )
         refresh = _refresh_session_slots(sid)
-        return form + tuple(_all_gallery_updates(lyric_paths=list(imgs))) + tuple(refresh) + (gr.update(),)
+        # Pass project path so Cover/Theme/Lyrics all re-scan the same folder
+        return (
+            form
+            + tuple(_all_gallery_updates(project_dir=s["path"], lyric_paths=list(imgs)))
+            + tuple(refresh)
+            + (gr.update(),)
+        )
 
     # Wire each select button with its index
     for i, btn in enumerate(_gen["session_select_btns"]):
@@ -6073,58 +6132,173 @@ _prompt: Dict[str, Any] = {}
 
 def _build_prompting_tab() -> None:
     data = _prompting()
-    gr.Markdown(
-        "### Visual style prompt templates\n"
-        "Each template is used per lyric line. `{line}` is replaced with the lyric text. "
-        "Song/section analysis notes are injected automatically by the pipeline."
-    )
-    _prompt["light"] = gr.Textbox(
-        label=configure.STYLE_LIGHT,
-        lines=4,
-        value=data.get(configure.STYLE_LIGHT, ""),
-    )
-    _prompt["dark"] = gr.Textbox(
-        label=configure.STYLE_DARK,
-        lines=4,
-        value=data.get(configure.STYLE_DARK, ""),
-    )
-    _prompt["colorful"] = gr.Textbox(
-        label=configure.STYLE_COLORFUL,
-        lines=4,
-        value=data.get(configure.STYLE_COLORFUL, ""),
-    )
-    with gr.Row():
-        _prompt["save"] = gr.Button("Save Prompt Templates", variant="primary")
-        _prompt["reset"] = gr.Button("Reset to Defaults")
+    unlocked = configure.is_access_unlocked()
+    # Single vertical Column so Gradio cannot reorder siblings (negative must
+    # sit under the style boxes and above Save / Reset).
+    with gr.Column(elem_id="prompting-tab-body"):
+        gr.Markdown(
+            "### Visual style prompt templates\n"
+            "Each template is used per lyric line. `{line}` is replaced with the lyric text. "
+            "Song/section analysis notes are injected automatically by the pipeline."
+        )
+        _prompt["light"] = gr.Textbox(
+            label=configure.STYLE_LIGHT,
+            lines=4,
+            value=data.get(configure.STYLE_LIGHT, ""),
+        )
+        _prompt["dark"] = gr.Textbox(
+            label=configure.STYLE_DARK,
+            lines=4,
+            value=data.get(configure.STYLE_DARK, ""),
+        )
+        _prompt["colorful"] = gr.Textbox(
+            label=configure.STYLE_COLORFUL,
+            lines=4,
+            value=data.get(configure.STYLE_COLORFUL, ""),
+        )
+        # Gated styles — visible only when access is unlocked (no unlock advertisement)
+        _prompt["avatar"] = gr.Textbox(
+            label=configure.STYLE_AVATAR,
+            lines=5,
+            value=data.get(configure.STYLE_AVATAR, ""),
+            visible=unlocked,
+        )
+        _prompt["techno"] = gr.Textbox(
+            label=configure.STYLE_TECHNO,
+            lines=5,
+            value=data.get(configure.STYLE_TECHNO, ""),
+            visible=unlocked,
+        )
+        # Negative prompt: AFTER style boxes, BEFORE Save / Reset.
+        # Saved with "Save Prompt Templates" into prompting.json (with the style
+        # boxes). Still on _gen so Management / Thumbnails generation wiring
+        # can read the live textbox value at generate time.
+        _neg_init = ""
+        try:
+            _neg_init = str(
+                data.get(configure.PROMPTING_NEGATIVE_KEY)
+                or configure.get_default_negative_prompt()
+            )
+        except Exception:
+            _neg_init = getattr(configure, "DEFAULT_NEGATIVE_PROMPT", "")
+        _gen["negative_prompt"] = gr.Textbox(
+            label="Negative prompt (saved with templates)",
+            lines=3,
+            max_lines=6,
+            value=_neg_init,
+            placeholder="Things to avoid in every still…",
+            elem_id="negative-prompt-box",
+        )
+        with gr.Row(elem_id="prompting-save-row"):
+            _prompt["save"] = gr.Button("Save Prompt Templates", variant="primary")
+            _prompt["reset"] = gr.Button("Reset to Defaults")
 
 
 def _wire_prompting_events(status_box) -> None:
-    def _save(light, dark, colorful):
-        configure.update_prompting({
-            configure.STYLE_LIGHT: light,
-            configure.STYLE_DARK: dark,
-            configure.STYLE_COLORFUL: colorful,
-        })
-        return "Prompt templates saved."
+    def _save(light, dark, colorful, avatar, techno, negative):
+        """
+        Persist style templates + negative prompt into prompting.json.
+
+        Gated Avatar / Techno boxes are only written from the UI when access
+        is unlocked. When locked, existing stored gated templates are kept so
+        a hidden Gradio field cannot wipe them with empty/None values.
+        Public styles + negative always save from the visible boxes.
+        """
+        cur = configure.load_prompting()
+        updates = {
+            configure.STYLE_LIGHT: light if light is not None else cur.get(configure.STYLE_LIGHT, ""),
+            configure.STYLE_DARK: dark if dark is not None else cur.get(configure.STYLE_DARK, ""),
+            configure.STYLE_COLORFUL: colorful if colorful is not None else cur.get(configure.STYLE_COLORFUL, ""),
+            configure.PROMPTING_NEGATIVE_KEY: (
+                negative if negative is not None
+                else cur.get(configure.PROMPTING_NEGATIVE_KEY, configure.DEFAULT_NEGATIVE_PROMPT)
+            ),
+        }
+        if configure.is_access_unlocked():
+            updates[configure.STYLE_AVATAR] = (
+                avatar if avatar is not None else cur.get(configure.STYLE_AVATAR, "")
+            )
+            updates[configure.STYLE_TECHNO] = (
+                techno if techno is not None else cur.get(configure.STYLE_TECHNO, "")
+            )
+        else:
+            # Preserve on-disk gated templates while the boxes are hidden
+            updates[configure.STYLE_AVATAR] = cur.get(
+                configure.STYLE_AVATAR,
+                configure.STYLE_PROMPT_TEMPLATES.get(configure.STYLE_AVATAR, ""),
+            )
+            updates[configure.STYLE_TECHNO] = cur.get(
+                configure.STYLE_TECHNO,
+                configure.STYLE_PROMPT_TEMPLATES.get(configure.STYLE_TECHNO, ""),
+            )
+        configure.update_prompting(updates)
+        # Mirror negative into generation.json so last-used matches templates
+        try:
+            neg = str(updates.get(configure.PROMPTING_NEGATIVE_KEY) or "").strip()
+            if neg:
+                configure.update_generation({"negative_prompt": neg})
+        except Exception:
+            pass
+        # If a project is open, keep its session meta in sync with the box
+        try:
+            proj = (configure.APP_STATE.get("current_project_folder") or "").strip()
+            if proj and Path(proj).is_dir():
+                neg = str(updates.get(configure.PROMPTING_NEGATIVE_KEY) or "").strip()
+                configure.save_session_meta(Path(proj), {"negative_prompt": neg})
+                try:
+                    (Path(proj) / "negative_prompt.txt").write_text(
+                        (neg + "\n") if neg else "", encoding="utf-8"
+                    )
+                except OSError:
+                    pass
+        except Exception:
+            pass
+        return "Prompt templates saved (styles + negative)."
 
     def _reset():
         defaults = configure._default_prompting()
         configure.save_prompting(defaults)
+        try:
+            configure.update_generation({
+                "negative_prompt": defaults.get(
+                    configure.PROMPTING_NEGATIVE_KEY, configure.DEFAULT_NEGATIVE_PROMPT
+                )
+            })
+        except Exception:
+            pass
         return (
             defaults[configure.STYLE_LIGHT],
             defaults[configure.STYLE_DARK],
             defaults[configure.STYLE_COLORFUL],
+            defaults[configure.STYLE_AVATAR],
+            defaults[configure.STYLE_TECHNO],
+            defaults.get(configure.PROMPTING_NEGATIVE_KEY, configure.DEFAULT_NEGATIVE_PROMPT),
             "Reset to defaults.",
         )
 
     _prompt["save"].click(
         _save,
-        inputs=[_prompt["light"], _prompt["dark"], _prompt["colorful"]],
+        inputs=[
+            _prompt["light"],
+            _prompt["dark"],
+            _prompt["colorful"],
+            _prompt["avatar"],
+            _prompt["techno"],
+            _gen["negative_prompt"],
+        ],
         outputs=status_box,
     )
     _prompt["reset"].click(
         _reset,
-        outputs=[_prompt["light"], _prompt["dark"], _prompt["colorful"], status_box],
+        outputs=[
+            _prompt["light"],
+            _prompt["dark"],
+            _prompt["colorful"],
+            _prompt["avatar"],
+            _prompt["techno"],
+            _gen["negative_prompt"],
+            status_box,
+        ],
     )
 
 
@@ -6493,6 +6667,12 @@ def _wire_pref_events(status_box) -> None:
                 configure.load_generation().get("outfit_worn") or configure.OUTFIT_DEFAULT
             )
             outs.append(gr.update(choices=outfit_choices, value=cur_o))
+        # Reveal gated prompt-template boxes on the Prompting tab when unlocked
+        show_gated = bool(ok or configure.is_access_unlocked())
+        if _prompt.get("avatar") is not None:
+            outs.append(gr.update(visible=show_gated))
+        if _prompt.get("techno") is not None:
+            outs.append(gr.update(visible=show_gated))
         return tuple(outs) if len(outs) > 1 else outs[0]
 
     _access_outs = [status_box]
@@ -6504,6 +6684,10 @@ def _wire_pref_events(status_box) -> None:
         _access_outs.append(_gen["style"])
     if _gen.get("outfit_worn") is not None:
         _access_outs.append(_gen["outfit_worn"])
+    if _prompt.get("avatar") is not None:
+        _access_outs.append(_prompt["avatar"])
+    if _prompt.get("techno") is not None:
+        _access_outs.append(_prompt["techno"])
     if _pref.get("access_btn") is not None:
         _pref["access_btn"].click(
             _apply_access,
@@ -6741,9 +6925,22 @@ def build_app():
 #theme-gallery {
   width: 100% !important;
   min-height: 0;
-  overflow-y: auto;
-  max-height: 70vh;
+  /* No internal vertical slider — height follows the visible rows on this page;
+     use the Thumbnails page controls when there are more stills than one page. */
+  overflow-y: visible;
+  max-height: none;
   margin-top: 0.35rem;
+}
+/* Prompting tab: keep vertical document order (style boxes → negative → buttons) */
+#prompting-tab-body {
+  display: flex !important;
+  flex-direction: column !important;
+}
+#prompting-tab-body #negative-prompt-box {
+  order: 0;
+}
+#prompting-save-row {
+  order: 1;
 }
 .materials-thumbs .thumb-row,
 #materials-gallery .thumb-row {
