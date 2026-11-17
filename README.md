@@ -1,5 +1,5 @@
 # Lyrics-Materials
-Status: Beta - Mid-development; the program seems to work, fixed some button/slot issues in v0.42-v0.43, after the recent improvement of prompts/styles. Installer tested/fixed for install option 4 Vulkan-Compile on v0.38, assuming its working. 
+Status: Beta - Initial development done, the program seems to work, still some remaining issues, things have been worked on and expanded. 
 
 ### Description:
 It convert lines of lyrics into AI generated images, up to 30 per line (20 is quite fast enough for me). The idea is one could arrange these in a movie editor, and tactically use theme images for fillers in the video or promotional material, so its a program to make simple AI music videos. One could also take the line of lyrics and the generated images, and feed that into AI video generator to make clips, that could then be assembled into a video clips.
@@ -105,14 +105,12 @@ Lyrics-Materials/
 ```
 
 ### Development:
-- There needs to be more emphasis on the line of lyrics, and less emphasis on the theme, maybe even a slider, ie, Line Only, Line More, Narrative More, Narrative. IE where with narrative more the whole thing would work more like a story (so logic of song must be fully worked out), while and line more would be more towards the specific line of lyrics, and only would be absolute of each type. 
-- Experiments with Qwen-Image 2.1 - if its better, and facial accuracy is more frequent, or some neat features, then possibly switch, if "its the one".
-- I do want option to, have or not have, background actors. This requires an additional iteration and prompting to assess, if there are background actors in the scene, and what type of being, and outfit style (if any), and pose/activity, then merge that with other details for generation of image.
-- Main issue is on Management Page; project configuration panels are iffy when using Details Mode, and dont load correctly first time, user is left to click away to other modes on the switch and back.
-- Installer not checked for a while, as I didnt change packages after early versions, but worked last time used, will be checked at some point. More interested in completing program.
-- The outfits need improving, current list is from Image Glamour plus 2 for artist, though after review. For more range, enumerate common popular outfit types.
-- Option to have NONE of the images with background/other characters; option for all scenes will as are appropriate ONLY feature reference character or just the scene. 
-- If there is no reference image, then all of the relating prompting needs to not mention things such as character control traces in positive and negative prompt.
+- Ideogram 4 integration, and later on Qwen-Image 2.1 integration, and reverting integration if the model is not capable. This will require additional extended testing if everything is ok.
+- Background characters assessment was implemented, and now the sections of the song will have relating assesment consideration to background actors, however I do want option to, have or not have, background actors, IDK songs about being stranded on a desert island.
+- Main issue is on switches where panels are iffy, and require switching away, then switching back to get panel contents. This has been worked on already, but needs further work. Before the Thumbnails pages were broken down into individual image types and pages.
+- Installer was re-tested, and any issues were fixed for ~0.38, should be ok currently.
+- The outfits have been improved, but when other things are done, then this will require further review.
+- If there is no reference image, then all of the relating prompting needs to not mention things such as character control traces in positive and negative prompt. This would then be a video featuring no main character in all section assessments, however as are appropriate to do so to the song, would then be featuring background characters (or just groups of people in this case) or not.
 
 ### Disclaimer:
 - Warnings of quantum-weirdness in advance, but you yourself are the one whom pulls the lever on your own configurations and Lyrics, there is no way I know what your video will turn out like, because it can generate anything; one can always use the Negative prompt to filter out their phobias/fears in a box on the bottom of panel at location of  `Management > Name and Lyrics`.
