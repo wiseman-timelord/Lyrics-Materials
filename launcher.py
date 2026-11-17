@@ -110,9 +110,7 @@ class AppWindow(QMainWindow):
             self.setWindowIcon(icon)
             # Taskbar / window chrome (Windows uses this with AppUserModelID)
             QApplication.instance().setWindowIcon(icon)
-            print(f"  Window icon : {icon_path}")
-        else:
-            print("  Window icon : images/program_icon.ico not found (using default)")
+        # (icon path intentionally not printed — noisy and not useful to the user)
         self._apply_saved_geometry(geometry)
         self.view = QWebEngineView(self)
         self.view.setPage(_QuietPage(self.view))

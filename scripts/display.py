@@ -1288,9 +1288,9 @@ def _thumb_size_px() -> int:
 
 
 def _gallery_height_for(n_images: int) -> int:
-    """Dynamic materials panel height from thumb size + regen button row."""
+    """Dynamic materials panel height from thumb size + button row (3 buttons)."""
     th = _thumb_size_px()
-    cell_h = th + 40  # image + Regenerate button + gap
+    cell_h = th + 52  # image + Regen Image / Regen Prompt / Remove row
     if n_images <= 0:
         return cell_h + 16
     cols = _lyrics_thumbs_per_row()
@@ -2055,6 +2055,7 @@ def _thumb_panel_updates(paths: Optional[List[str]] = None) -> List[Any]:
             updates.append(gr.update(value=None))
             updates.append(gr.update(visible=False, value="Generate"))
             updates.append(gr.update(visible=False))
+            updates.append(gr.update(visible=False))
             continue
 
         line_no, var = page_items[logical]
@@ -2075,15 +2076,23 @@ def _thumb_panel_updates(paths: Optional[List[str]] = None) -> List[Any]:
         classes = _section_slot_classes(line_no)
         updates.append(gr.update(visible=True, elem_classes=classes))
         updates.append(gr.update(value=value, height=th))
-        # Empty slot → only "Generate" (hide Remove). Existing → "Regenerate" + Remove.
+        # Three buttons: Regen Image | Regen Prompt | Remove Image
+        # Empty slot → "Generate" on image btn, hide prompt+remove.
+        # Busy/queued → "…" on image/prompt, hide remove.
+        # Existing → all three interactive.
         if is_busy or is_queued:
+            updates.append(gr.update(visible=True, interactive=False, value="…"))
             updates.append(gr.update(visible=True, interactive=False, value="…"))
             updates.append(gr.update(visible=False, interactive=False))
         elif real:
-            updates.append(gr.update(visible=True, interactive=True, value="Regenerate"))
-            updates.append(gr.update(visible=True, interactive=True))
+            updates.append(gr.update(visible=True, interactive=True, value="Regen Image"))
+            updates.append(gr.update(visible=True, interactive=True, value="Regen Prompt"))
+            updates.append(gr.update(visible=True, interactive=True, value="Remove Image"))
         else:
+            # Empty slot: Generate image, allow Regen Prompt (fix text before render),
+            # hide Remove Image (nothing on disk).
             updates.append(gr.update(visible=True, interactive=True, value="Generate"))
+            updates.append(gr.update(visible=True, interactive=True, value="Regen Prompt"))
             updates.append(gr.update(visible=False, interactive=False))
     return updates
 
@@ -2237,6 +2246,7 @@ def _thumb_panel_outputs() -> List[Any]:
         outs.append(_gen["thumb_cols"][i])
         outs.append(_gen["thumb_imgs"][i])
         outs.append(_gen["thumb_btns"][i])
+        outs.append(_gen["thumb_prompt_btns"][i])
         outs.append(_gen["thumb_remove_btns"][i])
     return outs
 
@@ -2889,7 +2899,8 @@ def _build_thumbnails_tab() -> None:
         _gen["thumbs_panel"] = _thumbs_panel
         _gen["thumb_cols"] = []
         _gen["thumb_imgs"] = []
-        _gen["thumb_btns"] = []
+        _gen["thumb_btns"] = []          # Regen Image
+        _gen["thumb_prompt_btns"] = []   # Regen Prompt
         _gen["thumb_remove_btns"] = []
         _gen["thumb_rows"] = []
         for row_i in range(0, THUMB_SLOTS, THUMB_COLS_MAX):
@@ -2914,25 +2925,34 @@ def _build_thumbnails_tab() -> None:
                         )
                         with gr.Row(elem_classes=["thumb-btn-row"]):
                             btn = gr.Button(
-                                "Regenerate",
+                                "Regen Image",
                                 visible=slot_vis,
                                 size="sm",
                                 elem_classes=["thumb-regen-btn"],
-                                min_width=48,
-                                scale=2,
+                                min_width=40,
+                                scale=1,
+                            )
+                            pbtn = gr.Button(
+                                "Regen Prompt",
+                                visible=slot_vis,
+                                size="sm",
+                                elem_classes=["thumb-prompt-btn"],
+                                min_width=40,
+                                scale=1,
                             )
                             rmv = gr.Button(
-                                "Remove",
+                                "Remove Image",
                                 visible=slot_vis,
                                 size="sm",
                                 variant="stop",
                                 elem_classes=["thumb-remove-btn"],
-                                min_width=48,
+                                min_width=40,
                                 scale=1,
                             )
                         _gen["thumb_cols"].append(col)
                         _gen["thumb_imgs"].append(img)
                         _gen["thumb_btns"].append(btn)
+                        _gen["thumb_prompt_btns"].append(pbtn)
                         _gen["thumb_remove_btns"].append(rmv)
             _gen["thumb_rows"].append(trow)
         with gr.Row(elem_id="lyrics-thumb-action-row"):
@@ -2960,12 +2980,10 @@ def _build_thumbnails_tab() -> None:
 
     def _on_thumbs_section(choice: str):
         """
-        Switch which Thumbnails panel is visible.
-
-        Visibility-only — do NOT rebuild the whole gallery here. A full
-        `_all_gallery_updates` on every radio click races with timer / generate
-        yields and intermittently paints an empty panel. Slot content is kept
-        current by session load and by generation progress updates.
+        Switch which Thumbnails panel is visible and re-evaluate the bottom
+        section action buttons (Generate / Complete Gen / Emergency Stop) from
+        the current on-disk image counts so Remove / external deletes are
+        reflected immediately.
         """
         key = _set_thumbs_section(choice or "Cover Images")
         # Lyrics page switcher only meaningful on the Lyrics panel
@@ -2989,6 +3007,24 @@ def _build_thumbnails_tab() -> None:
         ]
         if _gen.get("lyrics_page_radio") is not None:
             outs.append(page_upd)
+
+        # Re-assess Generate / Complete Gen / Stop from current disk state
+        lyrics = ""
+        try:
+            proj = (configure.APP_STATE.get("current_project_folder") or "").strip()
+            if proj:
+                lp = Path(proj) / "lyrics.txt"
+                if lp.is_file():
+                    lyrics = lp.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            lyrics = ""
+        running = _any_image_or_prompt_work_active()
+        # Cover triple
+        outs.extend(_section_btn_triple("cover", lyrics, running=running))
+        # Theme triple
+        outs.extend(_section_btn_triple("theme", lyrics, running=running))
+        # Lyrics triple
+        outs.extend(_section_btn_triple("lyrics", lyrics, running=running))
         return tuple(outs)
 
     if _gen.get("thumbs_section") is not None:
@@ -3001,6 +3037,18 @@ def _build_thumbnails_tab() -> None:
         ]
         if _gen.get("lyrics_page_radio") is not None:
             _section_outs.append(_gen["lyrics_page_radio"])
+        # Action buttons refreshed on every section switch
+        _section_outs.extend([
+            _gen.get("cover_action_btn") or _gen.get("thumb_cover_btn"),
+            _gen.get("cover_complete_btn"),
+            _gen.get("cover_stop_btn"),
+            _gen.get("theme_action_btn") or _gen.get("thumb_theme_btn"),
+            _gen.get("theme_complete_btn"),
+            _gen.get("theme_stop_btn"),
+            _gen.get("thumb_run_btn"),
+            _gen.get("lyrics_complete_btn"),
+            _gen.get("lyrics_stop_btn"),
+        ])
         _gen["thumbs_section"].change(
             _on_thumbs_section,
             inputs=[_gen["thumbs_section"]],
@@ -3098,6 +3146,21 @@ def _execute_lyric_job(job: Any, ctx: Dict[str, Any]) -> str:
     return f"Regenerated lyrics still {int(line_idx) + 1} variant {variant}."
 
 
+def _slot_busy_value(val: Any) -> bool:
+    """True when a *_slot_generating / thumb_generating_line value means busy.
+
+    Active values are ints (slot/line index). Idle is None or an empty list
+    (legacy default). An empty list must NOT count as busy.
+    """
+    if val is None:
+        return False
+    if isinstance(val, (list, tuple, set, dict)) and len(val) == 0:
+        return False
+    if isinstance(val, bool):
+        return bool(val)
+    return True
+
+
 def _batch_image_work_active() -> bool:
     """
     True while a Cover / Theme / Lyrics *batch* pipeline is actively generating
@@ -3105,14 +3168,53 @@ def _batch_image_work_active() -> bool:
     "Generating" state while this is true — otherwise Lyrics slots flash
     Generating while Theme still holds the GPU / exclusive sd-cli slot.
     """
-    if configure.APP_STATE.get("cover_slot_generating") is not None:
+    if _slot_busy_value(configure.APP_STATE.get("cover_slot_generating")):
         return True
-    if configure.APP_STATE.get("theme_slot_generating") is not None:
+    if _slot_busy_value(configure.APP_STATE.get("theme_slot_generating")):
         return True
     # Batch lyrics pipeline sets thumb_generating_line while sd-cli runs
-    if configure.APP_STATE.get("thumb_generating_line") is not None:
+    if _slot_busy_value(configure.APP_STATE.get("thumb_generating_line")):
         return True
     return False
+
+
+def _any_image_or_prompt_work_active() -> bool:
+    """True when llama prompt regen or any image gen/regen is in flight."""
+    if configure.APP_STATE.get("prompt_regen_busy"):
+        return True
+    if configure.APP_STATE.get("generating"):
+        return True
+    if configure.APP_STATE.get("regen_worker_alive"):
+        return True
+    if _batch_image_work_active():
+        return True
+    if configure.APP_STATE.get("regen_queue"):
+        return True
+    if configure.APP_STATE.get("named_regen_queue"):
+        return True
+    return False
+
+
+def _clear_transient_work_state() -> None:
+    """Reset queues and busy flags after load / emergency stop / idle recovery."""
+    configure.APP_STATE["generating"] = False
+    configure.APP_STATE["regen_worker_alive"] = False
+    configure.APP_STATE["regen_worker_ctx"] = None
+    configure.APP_STATE["regen_queue"] = []
+    configure.APP_STATE["regen_busy_lines"] = []
+    configure.APP_STATE["regen_busy_keys"] = []
+    configure.APP_STATE["named_regen_queue"] = []
+    configure.APP_STATE["named_regen_busy"] = []
+    configure.APP_STATE["thumb_queued_lines"] = []
+    configure.APP_STATE["thumb_generating_line"] = None
+    configure.APP_STATE["cover_slot_queued"] = []
+    configure.APP_STATE["cover_slot_generating"] = None
+    configure.APP_STATE["theme_slot_queued"] = []
+    configure.APP_STATE["theme_slot_generating"] = None
+    configure.APP_STATE["prompt_regen_busy"] = False
+    configure.APP_STATE["prompt_dirty_lines"] = []
+    configure.APP_STATE["image_gen_t0"] = None
+    configure.APP_STATE["cancel_requested"] = False
 
 
 def _regen_worker_loop() -> None:
@@ -3218,7 +3320,11 @@ def _regen_worker_loop() -> None:
                     configure.APP_STATE["image_gen_t0"] = None
     finally:
         configure.APP_STATE["generating"] = False
-        configure.APP_STATE["session_status"] = "stopped"
+        # Idle when the queue drained cleanly; keep "stopped" only if cancel was set.
+        if inference.is_cancel_requested():
+            configure.APP_STATE["session_status"] = "stopped"
+        else:
+            configure.APP_STATE["session_status"] = "idle"
         with _regen_worker_lock:
             configure.APP_STATE["regen_worker_alive"] = False
         print("[regen-worker] idle", flush=True)
@@ -3464,29 +3570,18 @@ def _wire_create_events(status_box) -> None:
         st = str(configure.APP_STATE.get("session_status") or "").lower()
         if st in ("running", "images", "prompts", "analysis", "theme", "cover", "regen"):
             return True
-        if bool(configure.APP_STATE.get("generating")):
-            return True
-        if configure.APP_STATE.get("cover_slot_generating") is not None:
-            return True
-        if configure.APP_STATE.get("theme_slot_generating") is not None:
-            return True
-        if configure.APP_STATE.get("thumb_generating_line") is not None:
+        if _any_image_or_prompt_work_active():
             return True
         return False
 
     def _stop(lyrics="", song_name=""):
         msg = inference.emergency_stop()
+        _clear_transient_work_state()
         configure.APP_STATE["session_status"] = "idle"
-        configure.APP_STATE["generating"] = False
-        configure.APP_STATE["image_gen_t0"] = None
-        configure.APP_STATE["cover_slot_generating"] = None
-        configure.APP_STATE["theme_slot_generating"] = None
-        configure.APP_STATE["thumb_generating_line"] = None
         configure.APP_STATE["prefer_stop"] = False
+        # Keep cancel flag set until the next job starts so worker loops exit.
+        configure.APP_STATE["cancel_requested"] = True
         _begin_ui_job("stop")  # invalidate any residual UI timer loops
-        # Do NOT clear_cancel_state() here — the lyrics/theme/cover worker loops
-        # still need is_cancel_requested() True so they exit. Cancel is cleared
-        # when the next job starts (clear_cancel_state at pipeline entry).
         idle = _action_btn_updates(lyrics or "", song_name or "", running=False)
         return (msg, *idle)
 
@@ -3790,8 +3885,11 @@ def _wire_create_events(status_box) -> None:
             ) + tuple(_refresh_session_slots(""))
         configure.APP_STATE["active_session_id"] = sid
         configure.APP_STATE["current_project_folder"] = s["path"]
+        # Loading a project always means idle UI work state — clear sticky queues
+        # left over from a previous run / crash so Regen Prompt is not blocked.
+        _clear_transient_work_state()
         configure.APP_STATE["session_status"] = (
-            "done" if s.get("phase") == "done" else "stopped"
+            "done" if s.get("phase") == "done" else "idle"
         )
         # Prefer a fresh disk scan so partial projects show every still on load
         imgs = _list_project_images(s["path"])
@@ -3810,9 +3908,6 @@ def _wire_create_events(status_box) -> None:
         if line_count <= 0:
             line_count = int(s.get("line_count") or len(imgs) or 0)
         configure.APP_STATE["thumb_expected_count"] = line_count
-        configure.APP_STATE["thumb_generating_line"] = None
-        configure.APP_STATE["regen_busy_lines"] = []
-        configure.APP_STATE["thumb_queued_lines"] = []
         # Prefer stored lyrics; fall back to lyrics.txt
         lyrics = s.get("lyrics") or ""
         if not lyrics:
@@ -3823,6 +3918,8 @@ def _wire_create_events(status_box) -> None:
             except OSError:
                 pass
         song = s.get("song_name") or s.get("label") or sid
+        label = s.get("label") or song or sid
+        print(f"Project Loaded: {label}", flush=True)
         # Strip serial suffix for the song-name field when possible
         # (folder may be "midnight_drive" or "midnight_drive_2")
         style = configure.normalize_style(s.get("style"))
@@ -5572,12 +5669,17 @@ def _wire_create_events(status_box) -> None:
         configure.APP_STATE["regen_busy_lines"] = sorted(busy)
 
     def _do_remove(line_idx: int, active_session_id):
-        """Delete one still file; Generate Materials will refill gaps."""
+        """Delete ONLY the still in this thumbnail slot (one line + variant).
+
+        Never deletes sibling variants of the same lyric line. Complete Gen or
+        Regen Image can refill the gap.
+        """
         proj = (configure.APP_STATE.get("current_project_folder") or "").strip()
         if not proj or not Path(proj).is_dir():
             paths = _list_project_images()
             return (
                 "No active project folder.",
+                *_btn_pad(),
                 active_session_id or "",
             ) + _gallery_sessions_tab(active_session_id or "", lyric_paths=paths)
         paths = _list_project_images(proj)
@@ -5585,11 +5687,14 @@ def _wire_create_events(status_box) -> None:
         if resolved is None:
             return (
                 "Nothing to remove in that slot.",
+                *_btn_pad(),
                 active_session_id or "",
             ) + _gallery_sessions_tab(active_session_id or "", lyric_paths=paths)
         resolved_idx, target_var = resolved
         line_no = resolved_idx + 1
         per = _lyrics_per_line_count()
+        # Always target the exact variant of this slot (L1 → variant 1)
+        want_var = int(target_var) if per > 1 else 1
         removed = []
         for oldf in list(Path(proj).iterdir()):
             if not oldf.is_file():
@@ -5599,23 +5704,21 @@ def _wire_create_events(status_box) -> None:
             ln, var = _parse_still_line_variant(oldf.name)
             if ln != line_no:
                 continue
-            # Only the exact (line, variant) for this slot
-            if per > 1 and var != target_var:
+            # Strict: only this slot's variant. For L1 filenames without a
+            # variant digit we treat var==1 as the single still.
+            if int(var) != want_var:
                 continue
-            if per <= 1 and var not in (1, target_var):
-                # L1: remove any single still for the line
-                pass
             try:
                 oldf.unlink()
                 removed.append(oldf.name)
             except OSError as e:
                 print(f"[remove] {oldf}: {e}", flush=True)
-        # Drop from APP_STATE paths
+        # Drop only this (line, variant) from APP_STATE paths
         kept = []
         for p in (configure.APP_STATE.get("generation_output_paths") or []):
             try:
                 ln, var = _parse_still_line_variant(Path(p).name)
-                if ln == line_no and (per <= 1 or var == target_var):
+                if ln == line_no and int(var) == want_var:
                     continue
             except Exception:
                 pass
@@ -5628,18 +5731,104 @@ def _wire_create_events(status_box) -> None:
             })
         except Exception:
             pass
-        # Keep slot visible with no_image placeholder
         exp = int(configure.APP_STATE.get("thumb_expected_count") or 0)
         if line_no > exp:
             configure.APP_STATE["thumb_expected_count"] = line_no
-        var_bit = f" variant {target_var}" if per > 1 else ""
+        var_bit = f" variant {want_var}" if per > 1 else ""
         msg = (
-            f"Removed still {line_no}{var_bit}"
-            + (f" ({', '.join(removed)})" if removed else "")
-            + ". Slot shows placeholder — Generate Materials or Regenerate to refill."
+            f"Removed Image for line {line_no}{var_bit}"
+            + (f" ({', '.join(removed)})" if removed else " (already empty)")
+            + ". Slot shows placeholder — Complete Gen or Regen Image to refill."
         )
+        # Re-evaluate Generate / Complete Gen so the bottom buttons update
+        lyrics_txt = ""
+        try:
+            lp = Path(proj) / "lyrics.txt"
+            if lp.is_file():
+                lyrics_txt = lp.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
         return (
             msg,
+            *_action_btn_updates(lyrics_txt, Path(proj).name if proj else "", running=False),
+            active_session_id or "",
+        ) + _gallery_sessions_tab(active_session_id or "", lyric_paths=paths)
+
+    def _do_regen_prompt(line_idx: int, active_session_id):
+        """
+        Re-generate ONLY the text prompt for one lyric line (SCENE/POSE).
+        Does not touch existing images. Marks the line "prompt-dirty" so a
+        subsequent Regen Image on any variant of that line will re-render
+        ALL variants for the line with the new prompt. Complete Gen also
+        picks up the new prompt for any missing slots of that line.
+        """
+        proj = (configure.APP_STATE.get("current_project_folder") or "").strip()
+        if not proj or not Path(proj).is_dir():
+            paths = _list_project_images()
+            return (
+                "No active project folder — load a session or Generate first.",
+                *_btn_pad(),
+                active_session_id or "",
+            ) + _gallery_sessions_tab(active_session_id or "", lyric_paths=paths)
+
+        # Refuse while image regen / batch generation is active — concurrent
+        # llama + sd-cli on the same Vulkan device causes hangs/crashes.
+        # Uses a strict busy helper (empty lists / None do not count as busy).
+        if _any_image_or_prompt_work_active():
+            paths = _list_project_images(proj)
+            return (
+                "Cannot Regen Prompt while image generation or another prompt "
+                "regen is running. Wait for the queue to finish, then try again.",
+                *_btn_pad(),
+                active_session_id or "",
+            ) + _gallery_sessions_tab(active_session_id or "", lyric_paths=paths)
+
+        paths = _list_project_images(proj)
+        resolved = _resolve_line_from_slot(line_idx, paths)
+        if resolved is None:
+            try:
+                lv = _slot_to_line_variant(int(line_idx))
+                if lv is not None:
+                    resolved_idx = int(lv[0]) - 1
+                else:
+                    resolved_idx = int(line_idx)
+            except Exception:
+                resolved_idx = int(line_idx)
+        else:
+            resolved_idx, _ = resolved
+
+        line_no = int(resolved_idx) + 1
+        configure.APP_STATE["prompt_regen_busy"] = True
+        try:
+            from scripts.inference import regenerate_single_prompt
+            msg = regenerate_single_prompt(Path(proj), int(resolved_idx))
+            # Mark line dirty: next Regen Image on any of its slots regenerates
+            # every variant for the line so they all match the new prompt.
+            dirty = set(int(x) for x in (configure.APP_STATE.get("prompt_dirty_lines") or []))
+            dirty.add(line_no)
+            configure.APP_STATE["prompt_dirty_lines"] = sorted(dirty)
+            print(f"[regen-prompt] line {line_no} marked prompt-dirty", flush=True)
+            msg = (
+                f"{msg} Existing images kept — use Remove Image / Regen Image "
+                f"on slots you want updated (or Complete Gen for gaps)."
+            )
+        except Exception as e:
+            msg = f"Regen Prompt failed for line {line_no}: {e}"
+            print(f"[regen-prompt] {msg}", flush=True)
+        finally:
+            configure.APP_STATE["prompt_regen_busy"] = False
+
+        paths = _list_project_images(proj)
+        lyrics_txt = ""
+        try:
+            lp = Path(proj) / "lyrics.txt"
+            if lp.is_file():
+                lyrics_txt = lp.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+        return (
+            msg,
+            *_action_btn_updates(lyrics_txt, Path(proj).name if proj else "", running=False),
             active_session_id or "",
         ) + _gallery_sessions_tab(active_session_id or "", lyric_paths=paths)
 
@@ -5650,7 +5839,7 @@ def _wire_create_events(status_box) -> None:
         """
         # Immediate status so the user sees feedback on click before any I/O
         yield (
-            f"Regenerate requested for still slot {int(line_idx) + 1}…",
+            f"Regen Image requested for still slot {int(line_idx) + 1}…",
             *_btn_pad(), active_session_id or "",
         ) + _gallery_sessions_tab(active_session_id or "")
 
@@ -5758,6 +5947,12 @@ def _wire_create_events(status_box) -> None:
         })
         per = _lyrics_per_line_count()
         variant = int(target_var) if per > 1 else 1
+        # If Regen Prompt was used on this line, re-render ALL variants so they
+        # all match the new prompt. Otherwise only this specific slot/variant.
+        dirty = set(int(x) for x in (configure.APP_STATE.get("prompt_dirty_lines") or []))
+        line_is_dirty = line_no in dirty
+        variants_to_queue = list(range(1, per + 1)) if line_is_dirty else [variant]
+
         configure.APP_STATE["regen_worker_ctx"] = {
             "proj": proj,
             "cfg": cfg_now,
@@ -5765,28 +5960,43 @@ def _wire_create_events(status_box) -> None:
             "variant": variant,
         }
         q = list(configure.APP_STATE.get("regen_queue") or [])
-        job = {"line_idx": resolved_idx, "variant": variant}
-        # Avoid duplicate identical jobs
-        already = False
-        for existing in q:
-            if isinstance(existing, dict) and int(existing.get("line_idx", -1)) == resolved_idx and int(existing.get("variant") or 1) == variant:
-                already = True
-                break
-            if existing == resolved_idx and variant == 1:
-                already = True
-                break
-        if not already:
-            q.append(job)
+
+        def _job_exists(qi, qv):
+            for existing in q:
+                if isinstance(existing, dict) and int(existing.get("line_idx", -1)) == qi and int(existing.get("variant") or 1) == qv:
+                    return True
+                if existing == qi and qv == 1:
+                    return True
+            return False
+
+        queued_vars = []
+        for v in variants_to_queue:
+            if not _job_exists(resolved_idx, v):
+                q.append({"line_idx": resolved_idx, "variant": v})
+                queued_vars.append(v)
         configure.APP_STATE["regen_queue"] = q
         configure.APP_STATE["thumb_queued_lines"] = sorted(_queued_lines() | {line_no})
+        if line_is_dirty:
+            # Clear dirty after enqueue — subsequent single-slot regens stay single
+            dirty.discard(line_no)
+            configure.APP_STATE["prompt_dirty_lines"] = sorted(dirty)
+            print(f"[regen] line {line_no} was prompt-dirty — queued variants {queued_vars}", flush=True)
         _ensure_regen_worker()
 
-        var_bit = f" variant {variant}" if per > 1 else ""
-        yield (
-            f"Queued regenerate for still {line_no}{var_bit}…",
-            *_btn_pad(),
-            active_session_id or "",
-        ) + _gallery_sessions_tab(active_session_id or "")
+        if line_is_dirty and per > 1:
+            yield (
+                f"Queued regenerate for line {line_no} — all {per} variants "
+                f"(prompt was regenerated)…",
+                *_btn_pad(),
+                active_session_id or "",
+            ) + _gallery_sessions_tab(active_session_id or "")
+        else:
+            var_bit = f" variant {variant}" if per > 1 else ""
+            yield (
+                f"Queued regenerate for still {line_no}{var_bit}…",
+                *_btn_pad(),
+                active_session_id or "",
+            ) + _gallery_sessions_tab(active_session_id or "")
 
         # Poll until THIS line leaves queued + busy
         last_state = None
@@ -5848,6 +6058,7 @@ def _wire_create_events(status_box) -> None:
         if not proj or not Path(proj).is_dir() or not path:
             return (
                 "Nothing to remove in that slot.",
+                *_btn_pad(),
                 active_session_id or "",
             ) + _gallery_sessions_tab(active_session_id or "")
         target = Path(path)
@@ -5859,8 +6070,17 @@ def _wire_create_events(status_box) -> None:
                 msg = f"{kind} file already missing."
         except OSError as e:
             msg = f"Could not remove {target.name}: {e}"
+        lyrics_txt = ""
+        try:
+            if proj:
+                lp = Path(proj) / "lyrics.txt"
+                if lp.is_file():
+                    lyrics_txt = lp.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
         return (
             msg,
+            *_action_btn_updates(lyrics_txt, Path(proj).name if proj else "", running=False),
             active_session_id or "",
         ) + _gallery_sessions_tab(active_session_id or "")
 
@@ -6044,10 +6264,11 @@ def _wire_create_events(status_box) -> None:
 
     _remove_outputs = [
         status_box,
+        *_action_btn_components(),
         _gen["active_session_id"],
     ] + _thumb_panel_outputs() + _session_refresh_outputs + [_gen["main_tabs"]]
 
-    # Wire each Regenerate / Remove button to ONE slot index only
+    # Wire each Regen Image / Regen Prompt / Remove button to ONE slot index only
     for i, btn in enumerate(_gen["thumb_btns"]):
         btn.click(
             functools.partial(_do_regen, i),
@@ -6056,6 +6277,13 @@ def _wire_create_events(status_box) -> None:
                 _gen["ref_image"], _gen["negative_prompt"], _gen["active_session_id"],
             ],
             outputs=_regen_outputs,
+            show_progress="minimal",
+        )
+    for i, btn in enumerate(_gen.get("thumb_prompt_btns") or []):
+        btn.click(
+            functools.partial(_do_regen_prompt, i),
+            inputs=[_gen["active_session_id"]],
+            outputs=_remove_outputs,  # status + gallery refresh (no full action pad)
             show_progress="minimal",
         )
     for i, btn in enumerate(_gen.get("thumb_remove_btns") or []):
@@ -6182,7 +6410,7 @@ def _build_prompting_tab() -> None:
         except Exception:
             _neg_init = getattr(configure, "DEFAULT_NEGATIVE_PROMPT", "")
         _gen["negative_prompt"] = gr.Textbox(
-            label="Negative prompt (saved with templates)",
+            label="Negative Prompt",
             lines=3,
             max_lines=6,
             value=_neg_init,
@@ -7085,11 +7313,40 @@ def build_app():
   height: auto !important;
   cursor: default !important;
 }
-#materials-gallery .thumb-regen-btn {
+/* Lyrics slot button row: full width of slot, thin vertical lines between buttons, no rounded gaps */
+.materials-thumbs .thumb-btn-row,
+#materials-gallery .thumb-btn-row {
+  display: flex !important;
+  width: 100% !important;
+  gap: 0 !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border-top: 1px solid rgba(128,128,128,0.45);
+}
+.materials-thumbs .thumb-btn-row > *,
+#materials-gallery .thumb-btn-row > * {
+  flex: 1 1 0 !important;
+  min-width: 0 !important;
+  margin: 0 !important;
+  border-radius: 0 !important;
+  border: none !important;
+  border-right: 1px solid rgba(128,128,128,0.45) !important;
+  font-size: 0.62rem !important;
+  padding: 0.18rem 0.1rem !important;
+  line-height: 1.15 !important;
+}
+.materials-thumbs .thumb-btn-row > *:last-child,
+#materials-gallery .thumb-btn-row > *:last-child {
+  border-right: none !important;
+}
+#materials-gallery .thumb-regen-btn,
+#materials-gallery .thumb-prompt-btn,
+#materials-gallery .thumb-remove-btn {
   width: 100% !important;
   min-width: 0 !important;
-  font-size: 0.65rem !important;
-  padding: 0.12rem 0.2rem !important;
+  font-size: 0.62rem !important;
+  padding: 0.18rem 0.1rem !important;
+  border-radius: 0 !important;
 }
 #lyrics-box textarea {
   overflow-y: auto !important;

@@ -1097,7 +1097,7 @@ def gender_phrase(value: str) -> str:
 #   - Visual styles "Avatar Apocalypse" and "Techno Apocalypse"
 #   - Blue-Yotun bodyshape
 #   - Tribal outfit (includes Peacock-feather head-dress)
-#   - Gleaming Hazel-Grey eyes
+# (Hazel-Gray eyes are public — not gated.)
 # ---------------------------------------------------------------------------
 ACCESS_CODE = "WiseMan-TimeLord"
 
@@ -1206,13 +1206,15 @@ EYE_BLUE = "Blue"
 EYE_GREY = "Grey"
 EYE_BLACK = "Black"
 EYE_VIOLET = "Violet"
-EYE_GLEAMING = "Gleaming Hazel-Grey"  # access-gated
+EYE_HAZEL_GRAY = "Hazel-Gray"  # public (replaces former gated "Gleaming Hazel-Grey")
 EYE_NONE = "Unspecified"
+# Legacy alias so old session/prefs values still normalize cleanly
+EYE_GLEAMING = EYE_HAZEL_GRAY
 EYE_CHOICES_PUBLIC = [
     EYE_NONE, EYE_BROWN, EYE_DARK_BROWN, EYE_HAZEL, EYE_AMBER,
-    EYE_GREEN, EYE_BLUE, EYE_GREY, EYE_BLACK, EYE_VIOLET,
+    EYE_GREEN, EYE_BLUE, EYE_GREY, EYE_BLACK, EYE_VIOLET, EYE_HAZEL_GRAY,
 ]
-EYE_CHOICES_UNLOCKED = EYE_CHOICES_PUBLIC + [EYE_GLEAMING]
+EYE_CHOICES_UNLOCKED = list(EYE_CHOICES_PUBLIC)  # no gated eye colours
 EYE_DEFAULT = EYE_NONE
 EYE_WORDS = {
     EYE_BROWN: "brown",
@@ -1224,29 +1226,28 @@ EYE_WORDS = {
     EYE_GREY: "grey",
     EYE_BLACK: "black",
     EYE_VIOLET: "violet",
-    EYE_GLEAMING: "gleaming hazel-grey",
+    EYE_HAZEL_GRAY: "hazel-gray",
     EYE_NONE: "",
 }
 
 
 def eye_color_choices_for_ui() -> list:
-    return list(EYE_CHOICES_UNLOCKED if is_access_unlocked() else EYE_CHOICES_PUBLIC)
+    return list(EYE_CHOICES_PUBLIC)
 
 
 def normalize_eye_color(value: str) -> str:
     v = (value or "").strip()
     if not v or v.lower() in ("none", "unspecified", "default", ""):
         return EYE_NONE
-    if v == EYE_GLEAMING and not is_access_unlocked():
-        return EYE_DEFAULT
-    all_choices = EYE_CHOICES_UNLOCKED
+    # Accept legacy label from older installs / prefs
+    if v.lower() in ("gleaming hazel-grey", "gleaming hazel-gray", "hazel-grey"):
+        return EYE_HAZEL_GRAY
+    all_choices = EYE_CHOICES_PUBLIC
     if v in all_choices:
         return v
     low = v.lower()
     for c in all_choices:
         if c.lower() == low:
-            if c == EYE_GLEAMING and not is_access_unlocked():
-                return EYE_DEFAULT
             return c
     return EYE_DEFAULT
 
@@ -1644,7 +1645,8 @@ DEFAULT_NEGATIVE_BODY = (
     "mutated hands, fused fingers, fewer than five fingers on each hand, "
     "exaggerated proportions, contorted pose, head on backwards. "
     "multiple characters based on reference image. ghosts. "
-    "electronic devices, mobile phones, headphones."
+    "electronic devices, mobile phones, headphones. "
+    "church building, religious cross."
 )
 # Back-compat alias: full default assumes Photo Realistic style lead.
 DEFAULT_NEGATIVE_PROMPT = (
@@ -1660,6 +1662,7 @@ AMBIENT_NEGATIVE_PROMPT = (
     "blurry, out of focus, low quality, noisy. "
     "people, humans, person, human, face, portrait, character, characters, figure, crowd, body, "
     "man, woman, child, silhouette of a person, humanoid subject, ghost. "
+    "church building, religious cross. "
 )
 # Extra anti-text always merged into cover stills (Flux 4B loves to write titles).
 COVER_NEGATIVE_EXTRA = (
@@ -2130,7 +2133,7 @@ APP_STATE: Dict[str, Any] = {
     "regen_busy_lines": [],
     "regen_busy_keys": [],
     "named_regen_queue": [],
-    "named_regen_busy": False,
+    "named_regen_busy": [],          # list of "kind:slot" keys while busy
     "regen_worker_alive": False,
     "regen_worker_ctx": None,
     # Thumbnail / gallery live state (1-based line numbers where noted)
@@ -2138,13 +2141,16 @@ APP_STATE: Dict[str, Any] = {
     "thumb_generating_line": None, # currently generating lyric line (1-based) or None
     "thumb_expected_count": 0,
     "cover_slot_queued": [],
-    "cover_slot_generating": [],
+    "cover_slot_generating": None,  # int slot index while busy, else None
     "cover_slot_expected": 0,
     "theme_slot_queued": [],
-    "theme_slot_generating": [],
+    "theme_slot_generating": None,  # int slot index while busy, else None
     "theme_slot_expected": 0,
     "lyrics_page": 0,
     "thumbs_tab_auto_opened": False,
+    # Prompt regen coordination (in-memory only)
+    "prompt_regen_busy": False,
+    "prompt_dirty_lines": [],       # 1-based lyric lines whose prompt was regenerated
     # Live status / timing (UI polls these)
     "status_last_msg": "",
     "status_last_info": {},
@@ -2175,13 +2181,17 @@ def init_session_state() -> None:
     APP_STATE["regen_busy_lines"] = []
     APP_STATE["regen_busy_keys"] = []
     APP_STATE["named_regen_queue"] = []
-    APP_STATE["named_regen_busy"] = False
+    APP_STATE["named_regen_busy"] = []
+    APP_STATE["regen_worker_alive"] = False
+    APP_STATE["regen_worker_ctx"] = None
     APP_STATE["thumb_queued_lines"] = []
     APP_STATE["thumb_generating_line"] = None
     APP_STATE["cover_slot_queued"] = []
-    APP_STATE["cover_slot_generating"] = []
+    APP_STATE["cover_slot_generating"] = None
     APP_STATE["theme_slot_queued"] = []
-    APP_STATE["theme_slot_generating"] = []
+    APP_STATE["theme_slot_generating"] = None
+    APP_STATE["prompt_regen_busy"] = False
+    APP_STATE["prompt_dirty_lines"] = []
     APP_STATE["image_gen_t0"] = None
     APP_STATE["still_finished_secs"] = None
     APP_STATE["still_finished_at"] = None
@@ -2431,6 +2441,10 @@ def _save_json_atomic(path: Path, data: Dict[str, Any]) -> None:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
         _replace_with_retry(tmp, path)
+        try:
+            print(f"Config Saved: {path.name}", flush=True)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

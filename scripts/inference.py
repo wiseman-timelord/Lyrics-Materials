@@ -1835,8 +1835,11 @@ def analyze_song_and_sections(
             "character — those are chosen later in the GUI and must not appear here.\n"
             "A reference photo will supply the main character's likeness on some stills.\n"
             "OTHER_FIGURES: 1-3 sentences on any secondary/support people the lyrics imply "
-            "(friends, crowd, antagonist, partner, etc.): who they are, rough role, and "
-            "what they should wear if clothing is relevant to the lyric or scene. "
+            "(friends, crowd, antagonist, partner, etc.): who they are, rough role/body type, "
+            "and a CONCISE DISTINCT outfit description they wear (e.g. 'ragged coats and boots', "
+            "'matching red jackets', 'plain work overalls'). "
+            "Their clothing MUST be different from the main/reference character's wardrobe. "
+            "If support figures are non-human (animals, creatures) write outfit as none. "
             "Secondary people are NOT the reference character and must never share that face. "
             "Do NOT assign numeric ages to secondary people — age range is set in the UI.\n"
             "If the lyrics never imply other people, write OTHER_FIGURES: none.\n"
@@ -1844,18 +1847,28 @@ def analyze_song_and_sections(
             "  SectionName: main none|distant|partial|full, others none|some|lots\n"
             "  main = reference character (none=absent, distant=far away, partial=partly visible, full=clearly present).\n"
             "  others = support/background actors (none=no extras, some=a few, lots=crowd/many).\n"
-            "  Vary main and others independently across the song when the lyrics support it.\n  CRITICAL: if OTHER_FIGURES is 'none', every section MUST use others none.\n  If OTHER_FIGURES describes people, at least one section MUST use others some or lots.\n"
+            "  CRITICAL RULES for CHARACTER_MAP:\n"
+            "  - Vary main and others independently across sections when the lyrics support it. Do NOT default everything to partial/none.\n"
+            "  - If OTHER_FIGURES is 'none', every section MUST use others none.\n"
+            "  - If OTHER_FIGURES describes people, at least one (preferably several) sections MUST use others some or lots — use the lyrics to decide which sections have crowds, friends, antagonists, or bystanders.\n"
+            "  - Read each section's lyrics: words like we/us/they/crowd/people/friends/together/audience/army/fans imply others some or lots for that section.\n"
+            "  - Solo/introspective verses often have others none; choruses and party/battle sections often have others some/lots.\n"
+            "  - Main presence should also vary: intros/outros may be distant or none; key emotional peaks full or partial.\n"
         )
     else:
         char_instr = (
             "CHARACTER: 1-2 sentences inventing a central figure from the lyrics "
             "(face, body type, attitude only), or 'none specified'.\n"
-            "Do NOT mention clothing, outfit, wardrobe, gear, or hair style for the central figure.\n"
+            "Do NOT mention clothing, outfit,wardrobe, gear, or hair style for the central figure.\n"
             "OTHER_FIGURES: 1-3 sentences on any secondary people the lyrics imply, including "
-            "appropriate distinct outfits when clothing matters; or 'none'. "
+            "a concise DISTINCT outfit they wear (different from the main figure), or 'none'. "
+            "Non-human support (animals, creatures) use outfit none. "
             "Do NOT assign numeric ages to secondary people — age range is set in the UI.\n"
             "CHARACTER_MAP: one line per section as\n"
             "  SectionName: main none|distant|partial|full, others none|some|lots\n"
+            "  Vary main and others across sections based on the actual lyric content of each section.\n"
+            "  Words like we/us/they/crowd/people/friends imply others some or lots for that section.\n"
+            "  If OTHER_FIGURES is none, force others none everywhere; otherwise use some/lots where lyrics support people.\n"
         )
 
     # Optional user Narrative Guidance (critical overall direction, max 128 chars)
@@ -2126,33 +2139,51 @@ def analyze_song_and_sections(
         )
         if all_none:
             people_re = re.compile(
-                r"(crowd|people|figures|actors|soldiers|officers|dancers|"
-                r"throng|spectators|followers|army|mob|extras|bystanders)",
+                r"\b(crowd|people|figures|actors|soldiers|officers|dancers|"
+                r"throng|spectators|followers|army|mob|extras|bystanders|"
+                r"friends|group|together|audience|fans|we\b|us\b|they\b|"
+                r"partner|lover|enemy|antagonist|chorus|band)\b",
                 re.I,
             )
             promoted = 0
             for lab in list(presence.keys()) or list(section_notes.keys()):
                 note = section_notes.get(lab) or ""
+                low = lab.lower()
+                # Prefer promoting choruses / bridges / verses that mention people
                 if people_re.search(note) or people_re.search(of_clean):
-                    low = lab.lower()
                     if any(k in low for k in ("intro", "outro", "fade")):
                         others_map[lab] = "some"
+                    elif any(k in low for k in ("chorus", "bridge", "hook")):
+                        others_map[lab] = "lots"
                     else:
                         others_map[lab] = "some"
                     promoted += 1
             if promoted:
                 print(
                     f"[analysis] OTHER_FIGURES describes people but CHARACTER_MAP had "
-                    f"others=none everywhere — promoted {promoted} section(s) to others=some",
+                    f"others=none everywhere — promoted {promoted} section(s) to others=some/lots",
                     flush=True,
                 )
             else:
-                # Keep prose for context but leave map as none (no forced crowds)
-                print(
-                    "[analysis] OTHER_FIGURES text present but no section notes imply people "
-                    "— keeping others=none (prose is advisory only)",
-                    flush=True,
-                )
+                # Still force at least body/chorus sections to some when OTHER_FIGURES exists
+                forced = 0
+                for lab in list(presence.keys()) or list(section_notes.keys()):
+                    low = lab.lower()
+                    if any(k in low for k in ("chorus", "bridge", "hook", "verse", "body")):
+                        others_map[lab] = "some"
+                        forced += 1
+                if forced:
+                    print(
+                        f"[analysis] OTHER_FIGURES present but no keyword match — "
+                        f"forced {forced} body/chorus/bridge section(s) to others=some",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "[analysis] OTHER_FIGURES text present but no section notes imply people "
+                        "— keeping others=none (prose is advisory only)",
+                        flush=True,
+                    )
 
     print("[analysis] CHARACTERS_MAP (main + others):", flush=True)
     for lab in presence.keys():
@@ -2425,26 +2456,56 @@ def generate_visual_prompts(
                 "Do not invent crowds, extras, bystanders, or secondary figures. "
                 "Environment and objects only unless the lyric itself names a person.\n"
             )
-        elif others_pres != "none" and other_figures and other_figures.lower().strip() not in ("none", "none.", "n/a", "na"):
-            density = {
-                "some": "a few support actors in the scene",
-                "lots": "many support actors / a crowd in the scene",
-            }.get(others_pres, "support actors in the scene")
-            other_bit = (
-                f"Secondary people (not the main reference): {other_figures[:200]}\n"
-                f"Support-actor density for this section: {density}. "
-                f"All support/background people are {support_age_bit}, "
-                f"adults only — no children or teens.\n"
+        else:
+            density_phrase = {
+                "some": "a few",
+                "lots": "many / a crowd of",
+            }.get(others_pres, "some")
+            of_clean = (other_figures or "").strip()
+            of_none = (not of_clean) or of_clean.lower() in (
+                "none", "none.", "n/a", "na", "(none)",
             )
-        elif others_pres != "none":
-            density = {
-                "some": "a few anonymous support actors",
-                "lots": "a crowd of support actors",
-            }.get(others_pres, "support actors")
+            # Extract a short outfit hint from OTHER_FIGURES when present
+            outfit_hint = ""
+            is_nonhuman = False
+            if not of_none:
+                # Non-human / explicitly none outfit → no "wearing" clause at all
+                is_nonhuman = bool(re.search(
+                    r"\b(outfit\s*[:=]?\s*none|non[- ]human|animal|creature|snake|"
+                    r"beast|no clothing|unclothed)\b",
+                    of_clean,
+                    re.I,
+                ))
+                if not is_nonhuman:
+                    m_out = re.search(
+                        r"(?:wear(?:ing)?|dressed in|outfit[s]?[:\s]|clothes?[:\s]|"
+                        r"clad in|in\s+)([^\.;\n]{4,80})",
+                        of_clean,
+                        re.I,
+                    )
+                    if m_out:
+                        outfit_hint = m_out.group(1).strip(" .,:;")
+            if is_nonhuman:
+                wear_clause = ""
+            elif outfit_hint:
+                wear_clause = (
+                    f" wearing only {outfit_hint} — clothing MUST be clearly different "
+                    f"from the main/reference character's outfit"
+                )
+            else:
+                wear_clause = (
+                    " wearing outfits clearly different from the main/reference character "
+                    "(do not copy the main character's clothes, colours, or style)"
+                )
+            role_bit = ""
+            if not of_none:
+                role_bit = f" Role/look from assessment: {of_clean[:180]}."
             other_bit = (
-                f"Include {density} (not the main reference). "
-                f"All support/background people are {support_age_bit}, "
-                f"adults only — no children or teens.\n"
+                f"Background characters: {density_phrase} support actors, "
+                f"{support_age_bit}, adults only — no children or teens."
+                f"{wear_clause}.{role_bit}\n"
+                "They are NOT the main/reference character and must not share that face "
+                "or wardrobe. Describe them only as secondary figures in the scene.\n"
             )
 
         if bridge_ctx:
@@ -4014,6 +4075,118 @@ def regenerate_named_still(
         dest, prompt, cfg_run,
         reference_image="",
         attach_ref=False,
+    )
+
+
+def regenerate_single_prompt(project_dir: Path, line_index: int) -> str:
+    """
+    Re-generate the SCENE/POSE prompt text for one lyric line only.
+    Uses the saved analysis + character map so the new prompt respects
+    main/others presence for that section. Writes the updated entry back
+    into prompts.txt. Does not touch any image files.
+    Returns a short status message.
+    """
+    project_dir = Path(project_dir)
+    if not project_dir.is_dir():
+        raise RuntimeError(f"Project folder not found: {project_dir}")
+
+    raw = (
+        (project_dir / "lyrics.txt").read_text(encoding="utf-8")
+        if (project_dir / "lyrics.txt").exists()
+        else ""
+    )
+    parsed = parse_lyrics(raw)
+    lines = lyric_lines_only(parsed)
+    if not lines:
+        raise RuntimeError("No lyrics lines in project — cannot regenerate prompt.")
+    if line_index < 0 or line_index >= len(lines):
+        raise RuntimeError(
+            f"Line index {line_index + 1} out of range (1..{len(lines)})."
+        )
+
+    analysis = _load_analysis_from_disk(project_dir) or {}
+    cfg = dict(configure.load_configuration())
+    # Merge live generation + preference fields that affect prompting
+    try:
+        g = configure.load_generation()
+        for k in (
+            "style", "image_style", "hair_style", "outfit_worn", "footwear",
+            "ref_gender", "ref_bodyshape", "eye_color", "ref_age",
+            "support_age_min", "support_age_max", "narrative_guidance",
+        ):
+            if g.get(k) is not None:
+                cfg[k] = g[k]
+    except Exception:
+        pass
+    try:
+        prefs = configure.load_preferences()
+        if prefs.get("style"):
+            cfg["style"] = prefs.get("style")
+    except Exception:
+        pass
+
+    has_ref = False
+    for cand in project_dir.glob("reference.*"):
+        if cand.is_file():
+            has_ref = True
+            break
+
+    # Build a minimal parsed list that preserves the real section label for this line
+    single_parsed = []
+    for e in parsed:
+        if e.get("type") == "line" and int(e.get("index", -1)) == int(line_index):
+            # Keep original index so presence_map lookup still works via section
+            single_parsed.append({"type": "line", "index": 0, "section": e.get("section") or "Body", "text": lines[line_index]})
+            break
+    if not single_parsed:
+        single_parsed = [{"type": "line", "index": 0, "section": "Body", "text": lines[line_index]}]
+
+    # Single-line call only (fast enough for a per-slot button)
+    prompts, presence_per_line = generate_visual_prompts(
+        lines=[lines[line_index]],
+        parsed=single_parsed,
+        analysis=analysis or {},
+        cfg=cfg,
+        has_character_ref=has_ref,
+        progress_callback=None,
+    )
+    if not prompts or not (prompts[0] or "").strip():
+        raise RuntimeError("Model returned an empty scene for this line.")
+    new_prompt = prompts[0].strip()
+    new_pres = (presence_per_line[0] if presence_per_line else "none") or "none"
+
+    # Rewrite prompts.txt, replacing only this line's block (leave others intact)
+    ppath = project_dir / "prompts.txt"
+    old_text = ppath.read_text(encoding="utf-8") if ppath.is_file() else ""
+    line_no = int(line_index) + 1
+    new_block = (
+        f"=== line {line_no} ===\n{lines[line_index]}\n"
+        f"character: {new_pres}\n"
+        f"--- prompt ---\n{new_prompt}\n\n"
+    )
+    # Match this line's block up to (but not including) the next === line N === or EOF
+    pat = re.compile(
+        rf"(?ms)^=== line {line_no} ===\s*\n.*?(?=^=== line \d+ ===\s*\n|\Z)"
+    )
+    if pat.search(old_text or ""):
+        new_text = pat.sub(new_block, old_text, count=1)
+    else:
+        # Append if this line was missing from prompts.txt
+        base = (old_text or "").rstrip() + ("\n\n" if (old_text or "").strip() else "")
+        new_text = base + new_block
+    try:
+        ppath.write_text(new_text, encoding="utf-8")
+    except OSError as e:
+        raise RuntimeError(f"Could not write prompts.txt: {e}") from e
+
+    print(
+        f"[regen-prompt] line {line_index + 1} updated "
+        f"(character={new_pres}, {len(new_prompt)} chars)",
+        flush=True,
+    )
+    return (
+        f"Regen Prompt complete for line {line_index + 1} "
+        f"(character={new_pres}). Use Regen Image to re-render the still."
     )
 
 
