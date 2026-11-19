@@ -57,13 +57,20 @@ analysis + prompts when set (I used q4). The prompt generation and encoding can 
 - Encoding: Ideogram4-Turbo requires the Qwen3-vl-8b for encoding.
 
 ### Instructions:
-- These are my current instructions for using the program...(Note; If you are unsure as to if Flux2 will be ok with your settings and VRam settings, then open Task Manager, there check python process, and monitor GPU memory/shaders. 
-- As I have repeating stated "for 8GB VRam you would want image settings to, 768x512 or 640x360 (half 720p), that is with Diffuser Placement set to "Split". I would assume one could load the complete Flux2 model to GPU on 12GB card, but then Encoder must be loaded at same time, so possibly still need cpu for Encoder if Full; failure to take consideration may crash or mess up graphics drivers, worse case scenario requiring factory reset install.)
+- These are my current instructions for using the program...
+```
 1. The program will start, you will be in a new project, so collapse the left pane, unless you are going to hop sessions.
 2. User enters **song name** (folder slug) and pastes lyrics; optional (advised) single **reference image** for central character.
 3. Ensure Image frequency and other settings are correct (and not too wild, see notes), then click "Generate All Assets".
 4. When all assets are generated, then click on "Lyrics Thumbnails", have a look at the images, and regenerate them individually as required.
 5. When images are all how you intended, then copy them to the movie making app you have. For basic/simple editing, possibly you could use "Microsoft Movie Maker" that came with the "Microsoft Essentials 2012" package.
+
+- As I have repeating stated "for 8GB VRam you would want image settings to, 768x512 or 640x360 (half 720p), that is with Diffuser Placement set to "Split". I would assume one could load the complete Flux2 model to GPU on 12GB card, but then Encoder must be loaded at same time, so possibly still need cpu for Encoder if Full; failure to take consideration may crash or mess up graphics drivers, worse case scenario requiring factory reset install.)
+- If you are unsure as to if Flux2 will be ok with your settings and VRam settings, then open Task Manager, there check python process, and monitor GPU memory/shaders. 
+- Program designed for Portrait mode monitor, but it should/will work on Landscape too just with some sliders.
+- the mmproj from the Qwen3-VL-4B is not used, and if present then is auto-moved to `**model_folder**\mmproj\`, saving complication in the scripts, but the mmproj is superseded by Flux2/Ideogram4.
+
+```
 - Lyrics should be in format of (as many chorus as you like)...
 ```
 [Intro]
