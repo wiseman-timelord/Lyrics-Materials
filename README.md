@@ -45,12 +45,16 @@ Size,Area vs 768×512,8 GB Split outlook
 ...ask Grok and remember to say, how much vram you have and "Qwen3 encoder on CPU and Flux2 model load Split/Full".
 
 ### Models
-Available on [HuggingFace.Co](https://huggingface.co/)...  
-- Encoder/Prompting: [Huihui-Qwen3-VL-4B-Thinking-abliterated-GGUF](https://huggingface.co/mradermacher/Huihui-Qwen3-VL-4B-Thinking-abliterated-GGUF) for Rich analysis + prompts when set (I used q4).
+Available on [HuggingFace.Co](https://huggingface.co/) (the program uses gguf versions of models where possible) (this section needs further updating)...  
+1. Generation with Flux2-4b...
 - Diffuser: [flux-2-klein-4b-GGUF](https://huggingface.co/models?search=flux2%204b%20gguf) Image generation (one of those, cant remember which one I used) (I used q8).
 - VAE: [diffusion_pytorch_model.safetensors](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B/resolve/main/vae/diffusion_pytorch_model.safetensors?download=true) the other image generation file (one file).
-- Note the mmproj from the Qwen3-VL-4B is not used, and if present then is auto-moved to `**model_folder**\mmproj\`, saving complication in the scripts, but the mmproj is superseded by Flux2.
-- Program designed for Portrait mode monitor, but it should/will work on Landscape too just with some sliders.
+- Encoder/Prompting: [Huihui-Qwen3-VL-4B-Thinking-abliterated-GGUF](https://huggingface.co/mradermacher/Huihui-Qwen3-VL-4B-Thinking-abliterated-GGUF) for Rich 
+analysis + prompts when set (I used q4). The prompt generation and encoding can be done from the thinking model or the instruct model mode, flux2-Klein-4b requires the 4b version.
+2. Generation with IDeogram...
+- Encoder/Prompting: [Huihui-Qwen3-VL-4B-Thinking-abliterated-GGUF](https://huggingface.co/mradermacher/Huihui-Qwen3-VL-8B-Thinking-abliterated-GGUF) for Rich 
+analysis + prompts when set (I used q4). The prompt generation and encoding can be done from the thinking model or the instruct model model, Ideogram4 requires Qwen3-VL-8B. 
+- Encoding: Ideogram4-Turbo requires the Qwen3-vl-8b for encoding.
 
 ### Instructions:
 - These are my current instructions for using the program...(Note; If you are unsure as to if Flux2 will be ok with your settings and VRam settings, then open Task Manager, there check python process, and monitor GPU memory/shaders. 
