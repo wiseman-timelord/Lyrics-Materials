@@ -52,9 +52,10 @@ Available on [HuggingFace.Co](https://huggingface.co/) (the program uses gguf ve
 - Encoder/Prompting: [Huihui-Qwen3-VL-4B-Thinking-abliterated-GGUF](https://huggingface.co/mradermacher/Huihui-Qwen3-VL-4B-Thinking-abliterated-GGUF) for Rich 
 analysis + prompts when set (I used q4). The prompt generation and encoding can be done from the thinking model or the instruct model mode, flux2-Klein-4b requires the 4b version.
 2. Generation with IDeogram...
-- Encoder/Prompting: [Huihui-Qwen3-VL-4B-Thinking-abliterated-GGUF](https://huggingface.co/mradermacher/Huihui-Qwen3-VL-8B-Thinking-abliterated-GGUF) for Rich 
-analysis + prompts when set (I used q4). The prompt generation and encoding can be done from the thinking model or the instruct model model, Ideogram4 requires Qwen3-VL-8B. 
-- Encoding: Ideogram4-Turbo requires the Qwen3-vl-8b for encoding.
+
+- Encoder/Prompting: [Huihui-Qwen3-VL-8B-Thinking-abliterated-GGUF](https://huggingface.co/mradermacher/Huihui-Qwen3-VL-8B-Thinking-abliterated-GGUF) for Rich 
+analysis + prompts when set (I used q4). The prompt generation and encoding can be done from the thinking model or the instruct model model, Ideogram4 requires 8B variants of Qwen3-VL. 
+- Diffusion: Ideogram4-Turbo requires the Ideogram4-Turbo gguf file and the flux2-vae, while the uncondit file for Ideogram4 is optional if you can run the whole thing on GPU, because if you select diffuser placement as split on ideogram, its assumed you have low VRAM, so there is no uncond file if diffuser placement is split. This may need improving later, but myself have 8GB VRAM.
 
 ### Instructions:
 - These are my current instructions for using the program...
@@ -91,6 +92,7 @@ analysis + prompts when set (I used q4). The prompt generation and encoding can 
 - If it crashes back to the batch menu, and wont start up because of "port" issues, then try and find python processes and close them, and try again, albeit, give the machine a restart for good measure. This typically happens when more than 1 instance is running. 
 
 ### Notation:
+- Ideogram4 requires ~850s per image, while flux2 requires ~575s per image on my rx470. On initial tests the ideogram had less likeness to the reference image, so while there will be a video made with ideogram4, the furture of the inclusion of Ideogram is uncertain, given that qwen-image-2.1 integration will begin soon, and its likely I will go with the 2 best, which may end up being, qwen-image-2.1 and flux2, with the way things are going.
 - This program was created through converting Image-Glamour, there was extensive testing required to confirm things and craft the prompts, and on top of that there was 2/3 stages of major corruption of prompting for setbacks, but WiseMan-TimeLord, struggled with injuries and endeavored to produce results.
 - Got your own lyrics, but do need your own songs to make AI music slideshow videos with Lyrics-Materials, then why not give [Suno](https://suno.com/invite/@wisemantimelord) (its an affiliate link so I get kudos), but its what I typically use, from experience I found basic use to be simple to understand, you yourself can do the singing, while the more you look at the interface and learn it then the more you can find.
 - Ensure that the reference image is not HUGE, and I advise trimming it down to, torso and head, or bust and head, then setting the bodyshape correctly. Limiting the reference image to, smaller body area and full head, assists with facial likeness. 
