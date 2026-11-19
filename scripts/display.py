@@ -155,7 +155,7 @@ def _models_configured() -> bool:
     cfg = _cfg()
     text_m = configure.resolve_text_model_path(cfg)
     diff = (cfg.get("imagegen_model_path") or "").strip()
-    # VAE is validated at generate time (Flux.2 resolver); not required to unlock Generate
+    # VAE is validated at generate time (Flux.2 / Ideogram resolver); not required to unlock Generate
     if not text_m or not Path(text_m).expanduser().exists():
         return False
     if not diff or not Path(diff).expanduser().exists():
@@ -6596,9 +6596,9 @@ def _build_config_tab() -> None:
         with gr.Column(scale=1):
             gr.Markdown("#### Text Model (Thinking)")
             gr.Markdown(
-                "One Qwen3-VL-4B **Thinking** GGUF for assessment, visual prompts, "
-                "and Flux.2 `--llm` encoding. "
-                "Prefer [Huihui-Thinking-abliterated](https://huggingface.co/mradermacher/Huihui-Qwen3-VL-4B-Thinking-abliterated-GGUF). "
+                "One Qwen3-VL GGUF for assessment, visual prompts, and `--llm` encoding "
+                "(Flux.2 or Ideogram4). Prefer 4B **Thinking** (abliterated) for general use; "
+                "8B **Instruct** is preferred when the diffuser is Ideogram4. "
                 "mmproj is auto-quarantined under `models/mmproj/`."
             )
             _conf["prompting_backend"] = gr.Dropdown(
@@ -6638,32 +6638,40 @@ def _build_config_tab() -> None:
                 precision=0,
             )
 
-        # —— ImageGen (Flux) ——
+        # —— ImageGen (Flux / Ideogram) ——
+        # Normal setup = ONE diffusion GGUF + Flux.2 VAE + Qwen encoder.
+        # Full Ideogram dual-transformer (uncond) is advanced/optional and not
+        # exposed here — leave uncond_model_path empty in configuration.json
+        # (required for 8GB Split: diffuser on GPU, VAE+TE on CPU).
         with gr.Column(scale=1):
-            gr.Markdown("#### ImageGen (Flux)")
+            gr.Markdown("#### ImageGen (Flux / Ideogram4)")
             _conf["imagegen_backend"] = gr.Dropdown(
                 label="Backend",
                 choices=backends,
                 value=_backend_default("imagegen_backend"),
             )
             _conf["diffuser_path"] = gr.Textbox(
-                label="Diffusion model",
+                label="Diffusion model (one file)",
                 value=_path_or_empty("imagegen_model_path"),
                 placeholder=configure.MODEL_PATH_PLACEHOLDERS.get(
-                    "diffuser", "flux-2-klein-4b-*.gguf"
+                    "diffuser", "flux-2-klein-4b-*.gguf  OR  ideogram4-*.gguf"
                 ),
                 lines=2,
+                info="Pick ONE diffuser GGUF: Flux.2-klein or Ideogram4 / turbo "
+                     "(e.g. ideogram4-transformer-q4_0.gguf). "
+                     "Do not also load the unconditional_transformer file here.",
             )
             _conf["browse_diffuser"] = gr.Button("Browse diffuser", size="sm")
             _conf["vae_path"] = gr.Textbox(
-                label="VAE",
+                label="VAE (Flux.2 autoencoder)",
                 value=_path_or_empty("vae_model_path"),
                 placeholder=configure.MODEL_PATH_PLACEHOLDERS.get(
-                    "vae", "flux2_ae.safetensors"
+                    "vae", "flux2_ae.safetensors / flux2-vae.safetensors"
                 ),
                 lines=2,
-                info="Must be Flux.2 VAE: flux2_ae.safetensors (from black-forest-labs/FLUX.2-dev). "
-                     "Flux.1 / schnell ae.safetensors will fail with tensor shape errors.",
+                info="Required for both Flux.2-klein and Ideogram4. "
+                     "Use flux2_ae.safetensors or flux2-vae.safetensors (~320–450 MB). "
+                     "With Placement=Split this stays on CPU (8GB-friendly).",
             )
             _conf["browse_vae"] = gr.Button("Browse VAE", size="sm")
             _conf["imagegen_load_mode"] = gr.Dropdown(
@@ -6678,7 +6686,7 @@ def _build_config_tab() -> None:
                 value=configure.normalize_placement(
                     str(cfg.get("imagegen_placement", configure.DEFAULT_PLACEMENT))
                 ),
-                info="Split = VAE on CPU (saves VRAM). TE device follows Encoding Processing. "
+                info="Split = VAE on CPU (recommended for ≤8GB). TE follows Encoding Processing. "
                      "Gpu_Only puts VAE with diffusion when Encoding is also on GPU.",
             )
 
@@ -6695,6 +6703,40 @@ def _wire_config_events(status_box) -> None:
     _conf["browse_diffuser"].click(_b("diffuser"), outputs=_conf["diffuser_path"])
     _conf["browse_vae"].click(_b("vae"), outputs=_conf["vae_path"])
 
+    def _on_diffuser_change(path: str):
+        """Refresh VAE label/info when the diffusion model path changes."""
+        p = (path or "").lower()
+        is_ideo = "ideogram" in p
+        is_flux = ("flux" in p or "klein" in p) and not is_ideo
+        if is_ideo:
+            vae_info = (
+                "Required for Ideogram4. Use flux2_ae.safetensors or flux2-vae.safetensors "
+                "(~320–450 MB). Same Flux.2 autoencoder as Flux.2-klein. "
+                "With Placement=Split this stays on CPU (8GB-friendly)."
+            )
+            vae_label = "VAE (Flux.2 autoencoder)"
+        elif is_flux:
+            vae_info = (
+                "Required for Flux.2-klein. Use flux2_ae.safetensors or flux2-vae.safetensors "
+                "(~320–450 MB). Flux.1 / schnell ae.safetensors will fail. "
+                "With Placement=Split this stays on CPU (8GB-friendly)."
+            )
+            vae_label = "VAE (Flux.2 autoencoder)"
+        else:
+            vae_info = (
+                "Required for both Flux.2-klein and Ideogram4. "
+                "Use flux2_ae.safetensors or flux2-vae.safetensors (~320–450 MB). "
+                "Flux.1 / schnell ae.safetensors will fail with tensor shape errors."
+            )
+            vae_label = "VAE (Flux.2 autoencoder)"
+        return gr.update(label=vae_label, info=vae_info)
+
+    _conf["diffuser_path"].change(
+        _on_diffuser_change,
+        inputs=[_conf["diffuser_path"]],
+        outputs=[_conf["vae_path"]],
+    )
+
     def _save(
         workers,
         th_path, th_load, th_layers,
@@ -6705,6 +6747,8 @@ def _wire_config_events(status_box) -> None:
         th_path_s = (th_path or "").strip()
         prompt_s = (prompt_b or "CPU").strip() or "CPU"
         encode_s = (encode_b or "CPU").strip() or "CPU"
+        # Preserve any existing uncond_model_path (advanced / hand-edited config).
+        # UI no longer exposes a second diffuser box — single diffusion GGUF is the path.
         configure.update_configuration({
             "worker_threads": int(workers or configure.WORKER_THREADS_DEFAULT),
             "thinking_model_path": th_path_s,

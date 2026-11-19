@@ -1,5 +1,5 @@
 """
-inference.py - Lyrics → song/section analysis → visual prompts → images (Flux.2-klein-4B).
+inference.py - Lyrics → song/section analysis → visual prompts → images (Flux.2-klein / Ideogram4).
 Produces numbered stills for external AI video generation (Lyrics-Materials).
 """
 from __future__ import annotations
@@ -719,7 +719,7 @@ def log_phase_plan(cfg: Dict[str, Any], text_role: str) -> None:
     print(f"[plan]   Prompting Processing : {prompt_backend}  ({prompt_key})", flush=True)
     print(f"[plan]   load mode            : {text_mode}"
           f"{' (CPU mlock only; skipped on GPU)' if text_mlock else ''}", flush=True)
-    print(f"[plan] Phase 2 — image generation (sd-cli + Flux)", flush=True)
+    print(f"[plan] Phase 2 — image generation (sd-cli + Flux/Ideogram)", flush=True)
     print(f"[plan]   ImageGen (diffusion) : {img_backend}  ({img_key})", flush=True)
     print(f"[plan]   Encoding Processing  : {encode_backend}  ({encode_key})"
           f"  ← Qwen --llm / TE", flush=True)
@@ -727,25 +727,25 @@ def log_phase_plan(cfg: Dict[str, Any], text_role: str) -> None:
     # Guidance for VRAM strategies
     if prompt_key != "cpu" and prompt_key == img_key:
         print(
-            f"[plan] Prompting shares {prompt_key} with Flux → Phase 1 fully exits "
-            f"before Flux loads (llama process ends; GPU VRAM freed).",
+            f"[plan] Prompting shares {prompt_key} with ImageGen → Phase 1 fully exits "
+            f"before diffusion loads (llama process ends; GPU VRAM freed).",
             flush=True,
         )
     if encode_key == "cpu" and img_key != "cpu":
         print(
-            f"[plan] 8GB-friendly: Encoding on CPU, Flux on {img_key} — "
-            f"Qwen TE stays in system RAM so the GPU can hold Flux.",
+            f"[plan] 8GB-friendly: Encoding on CPU, ImageGen on {img_key} — "
+            f"Qwen TE stays in system RAM so the GPU can hold the diffuser.",
             flush=True,
         )
     elif encode_key != "cpu" and encode_key == img_key:
         print(
-            f"[plan] Encoding + Flux both on {img_key} — TE and diffusion share "
+            f"[plan] Encoding + ImageGen both on {img_key} — TE and diffusion share "
             f"the same GPU (needs enough VRAM; try Placement=Split / Encoding=CPU if OOM).",
             flush=True,
         )
     elif encode_key != "cpu" and img_key != "cpu" and encode_key != img_key:
         print(
-            f"[plan] Encoding on {encode_key}, Flux on {img_key} — dual-GPU split.",
+            f"[plan] Encoding on {encode_key}, ImageGen on {img_key} — dual-GPU split.",
             flush=True,
         )
     print("[plan] ══════════════════════════════════════════════", flush=True)
@@ -904,7 +904,7 @@ _PROMPT_PREDICT = 280
 _TIMEOUT_NAME = 120.0
 _TIMEOUT_ANALYSIS = 720.0
 _TIMEOUT_PROMPT = 240.0
-_TIMEOUT_SD = 600.0
+_TIMEOUT_SD = 1200.0  # Ideogram on modest GPUs can exceed 850s even at 8 steps
 
 _THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -2569,7 +2569,7 @@ def generate_visual_prompts(
 
 
 
-def _run_sd_cli_once(cmd: List[str], exe: Path, timeout: float = 600.0) -> Tuple[str, int]:
+def _run_sd_cli_once(cmd: List[str], exe: Path, timeout: float = _TIMEOUT_SD) -> Tuple[str, int]:
     """
     One-shot sd-cli. Returns (captured_tail, returncode).
 
@@ -2667,7 +2667,7 @@ def _sd_line_means_saved(low: str) -> bool:
     )
 
 
-def _run_sd_cli_once_unlocked(cmd: List[str], exe: Path, timeout: float = 600.0) -> Tuple[str, int]:
+def _run_sd_cli_once_unlocked(cmd: List[str], exe: Path, timeout: float = _TIMEOUT_SD) -> Tuple[str, int]:
     if "-v" not in cmd and "--verbose" not in cmd:
         cmd = list(cmd) + ["-v"]
     print("[sd-cli] " + " ".join(str(c) for c in cmd), flush=True)
@@ -2964,6 +2964,32 @@ def _path_has_flux2_marker(p: str) -> bool:
     return any(k in n for k in ("flux2", "flux.2", "flux-2", "flux_2"))
 
 
+def _path_has_ideogram_marker(p: str) -> bool:
+    n = _norm_path_key(p)
+    return "ideogram" in n
+
+
+def _is_ideogram_diffuser(path: str) -> bool:
+    """True when the diffusion model path looks like Ideogram4 / Ideogram4-turbo."""
+    return _path_has_ideogram_marker(path or "")
+
+
+def _resolve_uncond_model(cfg: Dict[str, Any], diffusion_path: str) -> str:
+    """
+    Return a usable --uncond-diffusion-model path, or "" if none applies.
+    Only returned for Ideogram-family diffusers; missing files are ignored.
+    """
+    path = (cfg.get("uncond_model_path") or "").strip()
+    if not path:
+        return ""
+    if not _is_ideogram_diffuser(diffusion_path):
+        return ""
+    if not Path(path).is_file():
+        print(f"[images] uncond model path set but missing — ignoring: {path}", flush=True)
+        return ""
+    return path
+
+
 def _path_has_flux1_marker(p: str) -> bool:
     n = _norm_path_key(p)
     if _path_has_flux2_marker(p):
@@ -3012,8 +3038,10 @@ def _vae_is_dit_weights(vae_path: str) -> bool:
         return False
     name = Path(vae_path).name.lower()
     # Explicit VAE names are never DiT
-    if any(k in name for k in ("flux2_ae", "flux2-ae", "flux2_vae", "flux2-vae",
-                               "flux.2_ae", "autoencoder")):
+    if any(k in name for k in (
+        "flux2_ae", "flux2-ae", "flux2_vae", "flux2-vae",
+        "flux.2_ae", "flux.2-vae", "autoencoder",
+    )):
         return False
     if name.endswith("_vae.safetensors") or name.endswith("-vae.safetensors"):
         return False
@@ -3045,6 +3073,7 @@ def _flux2_vae_candidates_near(diffusion_path: str) -> List[Path]:
         "flux2_vae.safetensors",
         "flux2-vae.safetensors",
         "flux.2_ae.safetensors",
+        "flux.2-vae.safetensors",
         "ae.safetensors",  # only accepted when under a flux2-marked folder
     )
     search_dirs = [
@@ -3130,13 +3159,14 @@ def _flux2_vae_help(diffusion_path: str = "", tried: str = "") -> str:
         "\nNo Flux.2 VAE found next to the diffusion model."
     )
     return (
-        "Flux.2-klein needs its own autoencoder (32 latent channels).\n\n"
+        "Flux.2-klein and Ideogram4 need the Flux.2 autoencoder (32 latent channels).\n\n"
         "Valid VAE files:\n"
-        "  • flux2_ae.safetensors  (preferred name)\n"
+        "  • flux2_ae.safetensors / flux2-vae.safetensors / flux2_vae.safetensors\n"
         "  • diffusion_pytorch_model.safetensors from the BFL FLUX.2 **vae/** folder\n"
         "    (~300–450 MB — NOT the multi-GB DiT file next to the GGUF)\n\n"
         "Download: https://huggingface.co/black-forest-labs/FLUX.2-dev\n"
-        "  (vae/diffusion_pytorch_model.safetensors or flux2_ae.safetensors)\n\n"
+        "  (vae/diffusion_pytorch_model.safetensors or flux2_ae.safetensors)\n"
+        "  Ideogram packs often ship flux2-vae.safetensors beside the GGUF.\n\n"
         "Do NOT use:\n"
         "  • Flux.1 / schnell ae.safetensors (16 channels)\n"
         "  • The DiT GGUF or multi-GB diffusion_pytorch_model as --vae\n"
@@ -3568,28 +3598,36 @@ def generate_images_from_prompts(
     if not model_path or not Path(model_path).exists():
         raise RuntimeError(f"Diffuser model not set/found: {model_path or '(empty)'}")
 
-    # Flux.2 --llm text conditioning: Thinking (Qwen3-VL) GGUF
+    is_ideogram = _is_ideogram_diffuser(model_path)
+    family = "Ideogram4" if is_ideogram else "Flux.2"
+
+    # --llm text conditioning: Thinking / Instruct (Qwen3-VL) GGUF
+    # 4B Thinking works for both; 8B Instruct is preferred for Ideogram4.
     llm_path = configure.resolve_text_model_path(cfg)
     if not llm_path or not Path(llm_path).exists():
         raise RuntimeError(
-            "Thinking model (Qwen3-VL) not set/found — required for Flux.2 --llm.\n"
+            f"Thinking/Encoder model (Qwen3-VL) not set/found — required for {family} --llm.\n"
             "Set Configuration → Text Model (Thinking) → Model location.\n"
             f"Current path: {llm_path or '(empty)'}"
         )
 
-    # Resolve VAE: configured path must be Flux.2 autoencoder, not Flux.1 ae
-    # and not the DiT safetensors that often sits beside the GGUF.
+    # Resolve VAE: both Flux.2-klein and Ideogram4 use the Flux.2 autoencoder
+    # (flux2_ae / flux2-vae). Reject Flux.1 ae and DiT weights.
     vae_path = _resolve_flux2_vae(cfg, model_path)
     if not vae_path:
         msg = _flux2_vae_help(model_path, (cfg.get("vae_model_path") or "").strip())
         print(f"[images] ERROR: {msg}", flush=True)
         raise RuntimeError(msg)
 
+    uncond_path = _resolve_uncond_model(cfg, model_path)
+
     ref_path = (reference_image or "").strip()
     has_ref = bool(ref_path and Path(ref_path).is_file())
-    print(f"[images] diffusion = {Path(model_path).name}", flush=True)
+    print(f"[images] diffusion = {Path(model_path).name}  ({family})", flush=True)
     print(f"[images] thinking/--llm = {Path(llm_path).name}", flush=True)
     print(f"[images] vae       = {Path(vae_path).name if vae_path else '(none)'}", flush=True)
+    if uncond_path:
+        print(f"[images] uncond    = {Path(uncond_path).name}", flush=True)
 
     out_dir = project_dir if project_dir is not None else configure.get_output_dir()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -3662,6 +3700,8 @@ def generate_images_from_prompts(
             "-s", str(seed if seed >= 0 else seed),
             "-t", str(threads),
         ]
+        if uncond_path and Path(uncond_path).is_file():
+            c.extend(["--uncond-diffusion-model", str(uncond_path)])
         if vae_path and Path(vae_path).exists():
             c.extend(["--vae", str(vae_path)])
         c.append("--vae-tiling")
@@ -3896,7 +3936,7 @@ def generate_images_from_prompts(
             )
             t_img = time.time()
             mark_still_started(t_img)
-            out, rc = _run_sd_cli_once(cmd, exe)
+            out, rc = _run_sd_cli_once(cmd, exe, timeout=_TIMEOUT_SD)
             found = _find_still_for_line(
                 out_dir, line_no, variant=var if freq > 1 else None,
             )
@@ -3915,7 +3955,7 @@ def generate_images_from_prompts(
                     flush=True,
                 )
                 cmd2 = _build_sd_cmd(final_prompt, img_path, attach_ref=False, ref_override="")
-                out, rc = _run_sd_cli_once(cmd2, exe)
+                out, rc = _run_sd_cli_once(cmd2, exe, timeout=_TIMEOUT_SD)
                 found = _find_still_for_line(
                     out_dir, line_no, variant=var if freq > 1 else None,
                 )
@@ -4264,12 +4304,18 @@ def regenerate_single_still(
     model_path = (cfg.get("imagegen_model_path") or "").strip()
     if not model_path or not Path(model_path).exists():
         raise RuntimeError(f"Diffuser model not set/found: {model_path or '(empty)'}")
+    is_ideogram = _is_ideogram_diffuser(model_path)
+    family = "Ideogram4" if is_ideogram else "Flux.2"
     llm_path = configure.resolve_text_model_path(cfg)
     if not llm_path or not Path(llm_path).exists():
-        raise RuntimeError(f"Thinking model not set/found: {llm_path or '(empty)'}")
+        raise RuntimeError(
+            f"Thinking/Encoder model not set/found — required for {family} --llm: "
+            f"{llm_path or '(empty)'}"
+        )
     vae_path = _resolve_flux2_vae(cfg, model_path)
     if not vae_path:
         raise RuntimeError(_flux2_vae_help(model_path, (cfg.get("vae_model_path") or "").strip()))
+    uncond_path = _resolve_uncond_model(cfg, model_path)
 
     backend = str(cfg.get("imagegen_backend") or "CPU")
     use_gpu = backend.upper().startswith(("VULKAN", "CUDA"))
@@ -4363,6 +4409,8 @@ def regenerate_single_still(
             "-s", str(seed if seed >= 0 else seed),
             "-t", str(threads),
         ]
+        if uncond_path and Path(uncond_path).is_file():
+            c.extend(["--uncond-diffusion-model", str(uncond_path)])
         if vae_path and Path(vae_path).exists():
             c.extend(["--vae", str(vae_path)])
         c.append("--vae-tiling")
@@ -4395,7 +4443,7 @@ def regenerate_single_still(
 
     t_img = time.time()
     mark_still_started(t_img)
-    out, rc = _run_sd_cli_once(_one_cmd(attach_ref=use_ref), exe)
+    out, rc = _run_sd_cli_once(_one_cmd(attach_ref=use_ref), exe, timeout=_TIMEOUT_SD)
     found = partial if partial.is_file() else None
     if found is None:
         found = _find_still_for_line(
@@ -4409,7 +4457,7 @@ def regenerate_single_still(
                 partial.unlink()
         except OSError:
             pass
-        out, rc = _run_sd_cli_once(_one_cmd(attach_ref=False), exe)
+        out, rc = _run_sd_cli_once(_one_cmd(attach_ref=False), exe, timeout=_TIMEOUT_SD)
         found = partial if partial.is_file() else None
         if found is None:
             found = _find_still_for_line(
@@ -4776,12 +4824,18 @@ def _generate_named_still(
     model_path = (cfg.get("imagegen_model_path") or "").strip()
     if not model_path or not Path(model_path).exists():
         raise RuntimeError(f"Diffuser model not set/found: {model_path or '(empty)'}")
+    is_ideogram = _is_ideogram_diffuser(model_path)
+    family = "Ideogram4" if is_ideogram else "Flux.2"
     llm_path = configure.resolve_text_model_path(cfg)
     if not llm_path or not Path(llm_path).exists():
-        raise RuntimeError(f"Thinking model not set/found: {llm_path or '(empty)'}")
+        raise RuntimeError(
+            f"Thinking/Encoder model not set/found — required for {family} --llm: "
+            f"{llm_path or '(empty)'}"
+        )
     vae_path = _resolve_flux2_vae(cfg, model_path)
     if not vae_path:
         raise RuntimeError(_flux2_vae_help(model_path, (cfg.get("vae_model_path") or "").strip()))
+    uncond_path = _resolve_uncond_model(cfg, model_path)
 
     backend = str(cfg.get("imagegen_backend") or "CPU")
     use_gpu = backend.upper().startswith(("VULKAN", "CUDA"))
@@ -4837,6 +4891,8 @@ def _generate_named_still(
         "-s", str(seed if seed >= 0 else seed),
         "-t", str(threads),
     ]
+    if uncond_path and Path(uncond_path).is_file():
+        cmd.extend(["--uncond-diffusion-model", str(uncond_path)])
     if vae_path and Path(vae_path).exists():
         cmd.extend(["--vae", str(vae_path)])
     cmd.append("--vae-tiling")
@@ -4868,7 +4924,7 @@ def _generate_named_still(
 
     t_img = time.time()
     mark_still_started(t_img)
-    out, rc = _run_sd_cli_once(cmd, exe)
+    out, rc = _run_sd_cli_once(cmd, exe, timeout=_TIMEOUT_SD)
     # Prefer the partial we asked for; fall back to newest matching partial stem
     found = partial if partial.is_file() else None
     if found is None and dest.parent.is_dir():

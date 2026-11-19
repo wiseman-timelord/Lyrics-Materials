@@ -2,9 +2,11 @@
 configure.py - Constants, paths, settings I/O for Lyrics-Materials.
 Lyrics → per-line visual materials (images) for external AI video use.
 Models:
-  Text     : Qwen3-VL-4B Thinking (assessment, prompts, Flux.2 --llm encoding)
-             Prefer Huihui-Qwen3-VL-4B-Thinking-abliterated*.gguf
-  Diffuser : FLUX.2-klein-4B (Q8)
+  Text     : Qwen3-VL-4B Thinking (assessment, prompts, --llm encoding)
+             or Qwen3-VL-8B Instruct (preferred for Ideogram4)
+             Prefer Huihui-*-abliterated*.gguf
+  Diffuser : FLUX.2-klein-4B  OR  Ideogram4 / Ideogram4-turbo
+  VAE      : Flux.2 autoencoder (flux2_ae / flux2-vae) for both families
   mmproj moved beside the active model into <model_dir>/mmproj/ (not used for pure-text loads)
 """
 from __future__ import annotations
@@ -244,19 +246,32 @@ ENCODER_MODEL_HINT = (
 )
 THINKING_MODEL_HINT = (
     "Huihui-Qwen3-VL-4B-Thinking-abliterated*.gguf  OR  "
-    "Qwen3-VL-4B-Thinking*.gguf"
+    "Qwen3-VL-4B-Thinking*.gguf  OR  "
+    "Huihui-Qwen3-VL-8B-Instruct-abliterated*.gguf / Qwen3-VL-8B-Instruct*.gguf "
+    "(8B Instruct preferred when using Ideogram4)"
 )
 TEXT_MODEL_HINT = THINKING_MODEL_HINT  # single text model role
 MMPROJ_HINT = "mmproj*.gguf  (moved to <model_dir>/mmproj/ — not used for pure text)"
-DIFFUSER_MODEL_HINT = "flux-2-klein-4b-Q8_0.gguf  OR  diffusion_pytorch_model_4b.safetensors"
-VAE_HINT = "flux2_ae.safetensors (Flux.2 VAE from black-forest-labs/FLUX.2-dev — NOT Flux.1 ae.safetensors)"
+DIFFUSER_MODEL_HINT = (
+    "flux-2-klein-4b-*.gguf  OR  ideogram4-turbo-*.gguf / ideogram4-*.gguf  "
+    "(or diffusion_pytorch_model*.safetensors)"
+)
+VAE_HINT = (
+    "flux2_ae.safetensors / flux2-vae.safetensors / flux2_vae.safetensors "
+    "(Flux.2 VAE — required for both Flux.2-klein and Ideogram4; "
+    "NOT Flux.1 / schnell ae.safetensors)"
+)
+UNCOND_MODEL_HINT = (
+    "ideogram4_uncond*.gguf / ideogram4_unconditional*.gguf "
+    "(optional for Ideogram4; turbo often runs without it)"
+)
 
-# Qwen3-VL-4B backbone (Thinking family; Instruct paths accepted only as legacy fallback)
+# Qwen3-VL backbone (4B Thinking primary; 8B Instruct accepted for Ideogram4 --llm)
 ENCODER_MAX_LAYERS = 36
 ENCODER_MAX_CONTEXT = 40960
 ENCODER_DIM = 2560
 
-# Flux.2-klein-4B
+# Diffuser (Flux.2-klein-4B or Ideogram4) — sd.cpp loads whole module
 DIFFUSER_MAX_LAYERS = 30  # informational only; sd.cpp is whole-module
 
 # Hard-coded CPU threads for heavy work (user request)
@@ -302,11 +317,20 @@ MODEL_VRAM_PROFILES = {
         "gpu_only_mb": 8200,   # diffusion + TE + VAE co-resident
         "layers": DIFFUSER_MAX_LAYERS,
     },
+    # Ideogram4 (~9B DiT). Q4_K_M ~5.7–6.0 GB disk; runtime higher than Flux.2-klein
+    "ideogram_q4": {
+        "disk_mb": 5800,
+        "full_gpu_mb": 7200,   # diffusion on GPU, Split (TE/VAE on CPU)
+        "gpu_only_mb": 11000,  # diffusion + TE + VAE (tight on 12 GB)
+        "layers": DIFFUSER_MAX_LAYERS,
+    },
 }
 
 
 def _match_vram_profile(filename: str) -> Dict[str, int]:
     n = (filename or "").lower()
+    if "ideogram" in n:
+        return dict(MODEL_VRAM_PROFILES["ideogram_q4"])
     if "flux" in n or "klein" in n:
         return dict(MODEL_VRAM_PROFILES["flux_q8"])
     if "q5_k" in n or "q5k" in n:
@@ -2080,12 +2104,13 @@ STATUS_BAR_KEY = "status-bar"
 # Greyed-out placeholders for Configuration path fields
 MODEL_PATH_PLACEHOLDERS = {
     "encoder": "DEPRECATED — set Thinking model instead",
-    "thinking": "Huihui-Qwen3-VL-4B-Thinking-abliterated…Q4_K_M / Q5_K_M.gguf",
-    "text": "Huihui-Qwen3-VL-4B-Thinking-abliterated…Q4_K_M / Q5_K_M.gguf",
+    "thinking": "Huihui-Qwen3-VL-4B-Thinking… or Qwen3-VL-8B-Instruct…Q4_K_M.gguf",
+    "text": "Huihui-Qwen3-VL-4B-Thinking… or Qwen3-VL-8B-Instruct…Q4_K_M.gguf",
     "mmproj": "mmproj*.gguf (auto-quarantined; not used for pure text)",
-    "diffuser": "flux-2-klein-4b-Q8_0.gguf",
-    "llm": "Same as Thinking GGUF (Flux.2 --llm text conditioning)",
-    "vae": "flux2_ae.safetensors OR BFL vae/diffusion_pytorch_model.safetensors (~350MB)",
+    "diffuser": "flux-2-klein-4b-*.gguf  OR  ideogram4-transformer-*.gguf / ideogram4-*.gguf",
+    "llm": "Same as Thinking GGUF (Flux.2 / Ideogram4 --llm text conditioning)",
+    "vae": "flux2_ae.safetensors / flux2-vae.safetensors (~320–450 MB)",
+    "uncond": "advanced only — leave empty for single-file / 8GB",
 }
 
 
@@ -2457,6 +2482,7 @@ CONFIGURATION_KEYS = [
     "thinking_model_path",
     "imagegen_model_path",
     "vae_model_path",
+    "uncond_model_path",
     "llm_model_path",
     "encoder_backend",
     "thinking_backend",
@@ -2496,6 +2522,7 @@ def _default_configuration() -> Dict[str, Any]:
         "thinking_model_path": "",
         "imagegen_model_path": "",
         "vae_model_path": "",
+        "uncond_model_path": "",
         "llm_model_path": "",
         "encoder_backend": "CPU",
         "thinking_backend": "CPU",
