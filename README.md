@@ -1,5 +1,5 @@
 # Lyrics-Materials
-Status: Beta - Initial development done, the program seems to work, still some remaining issues, things have been worked on and expanded. 
+Status: Beta - Initial development done, the program seems to work, still some remaining issues, things have been worked on and expanded, and it now supports Flux2 and Ideogram4 models (readme.md still needs updating for ideogram properly).
 
 ### Description:
 It convert lines of lyrics into AI generated images, up to 30 per line (20 is quite fast enough for me). The idea is one could arrange these in a movie editor, and tactically use theme images for fillers in the video or promotional material, so its a program to make simple AI music videos. One could also take the line of lyrics and the generated images, and feed that into AI video generator to make clips, that could then be assembled into a video clips.
