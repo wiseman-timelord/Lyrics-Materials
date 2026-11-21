@@ -2419,8 +2419,8 @@ def _build_create_tab() -> None:
                 choices=[
                     "Project Settings",
                     "Name and Lyrics",
+                    "Actors and Outfits",
                     "Song Assessment",
-                    "Characters",
                 ],
                 value="Name and Lyrics",
                 elem_id="details-mode-radio",
@@ -2432,7 +2432,7 @@ def _build_create_tab() -> None:
                     "### Project Settings\n"
                     "Visual style, image style, still size, and independent "
                     "**C**over / **T**heme / **L**yrics-per-line counts, plus sampling. "
-                    "Default steps **8** (better eyes / detail on Flux.2)."
+                    "Default steps **16** (Flux.2) / **8** (Ideogram4). Cover 4 · Theme 8 · Lyrics 6."
                 )
                 with gr.Row():
                     _gen["style"] = gr.Dropdown(
@@ -2535,36 +2535,11 @@ def _build_create_tab() -> None:
                 )
             _gen["details_name_lyrics"] = _details_nl
 
-            # 3 — Song Assessment
-            with gr.Column(visible=False, elem_id="details-assessment") as _details_assess:
-                _gen["assessment_view"] = gr.Textbox(
-                    label="Song assessment (editable — Save before generating)",
-                    lines=18,
-                    max_lines=24,
-                    value="",
-                    interactive=True,
-                    elem_id="assessment-view-box",
-                )
-                with gr.Row():
-                    _gen["save_assessment_btn"] = gr.Button(
-                        "Save Assessment",
-                        variant="primary",
-                        size="sm",
-                        elem_id="save-assessment-btn",
-                    )
-                    _gen["reload_assessment_btn"] = gr.Button(
-                        "Reload Assessment",
-                        variant="secondary",
-                        size="sm",
-                        elem_id="reload-assessment-btn",
-                    )
-            _gen["details_assessment"] = _details_assess
-
-            # 4 — Characters (main reference + background support actors)
+            # 3 — Actors and Outfits (main reference + background support actors)
             # Layout: two columns (image | traits), main age, then support age range.
             with gr.Column(visible=False, elem_id="details-reference") as _details_ref:
                 gr.Markdown(
-                    "### Characters\n"
+                    "### Actors and Outfits\n"
                     "Configure the **main/reference character** and a simple age band "
                     "for **background / support actors**. "
                     "Main traits (gender, bodyshape, age, hair, outfit) are injected into "
@@ -2678,6 +2653,31 @@ def _build_create_tab() -> None:
                         info="Upper bound. Swapped with min if needed.",
                     )
             _gen["details_reference"] = _details_ref
+
+            # 4 — Song Assessment
+            with gr.Column(visible=False, elem_id="details-assessment") as _details_assess:
+                _gen["assessment_view"] = gr.Textbox(
+                    label="Song assessment (editable — Save before generating)",
+                    lines=18,
+                    max_lines=24,
+                    value="",
+                    interactive=True,
+                    elem_id="assessment-view-box",
+                )
+                with gr.Row():
+                    _gen["save_assessment_btn"] = gr.Button(
+                        "Save Details",
+                        variant="primary",
+                        size="sm",
+                        elem_id="save-details-btn",
+                    )
+                    _gen["reload_assessment_btn"] = gr.Button(
+                        "Reload Assessment",
+                        variant="secondary",
+                        size="sm",
+                        elem_id="reload-assessment-btn",
+                    )
+            _gen["details_assessment"] = _details_assess
 
             # Shared under every Details Mode: dynamic Run Assessment + asset buttons
             with gr.Row(elem_id="gen-action-row"):
@@ -3425,8 +3425,8 @@ def _wire_create_events(status_box) -> None:
         m = (mode or "").strip()
         show_settings = m == "Project Settings"
         show_nl = m == "Name and Lyrics"
+        show_ref = m == "Actors and Outfits"
         show_assess = m == "Song Assessment"
-        show_ref = m == "Characters"
         # Always return explicit visible=True/False (never bare gr.update()) so a
         # cancelled/partial previous event cannot leave every panel hidden.
         assess_upd = gr.update()
@@ -3457,8 +3457,38 @@ def _wire_create_events(status_box) -> None:
             show_progress="hidden",
         )
 
-    def _save_assessment(text_val: str, song_name: str, lyrics: str, active_session_id: str):
-        """Write the Assessment panel text to analysis.txt for the active project."""
+    def _save_assessment(
+        text_val: str,
+        song_name: str,
+        lyrics: str,
+        active_session_id: str,
+        style=None,
+        image_style=None,
+        image_size=None,
+        steps=None,
+        cfg_scale=None,
+        cover_count=None,
+        theme_count=None,
+        lyrics_per_line=None,
+        narrative_guidance=None,
+        ref_image=None,
+        negative_prompt=None,
+        hair_style=None,
+        outfit_worn=None,
+        footwear=None,
+        ref_gender=None,
+        ref_bodyshape=None,
+        eye_color=None,
+        ref_age=None,
+        support_age_min=None,
+        support_age_max=None,
+    ):
+        """
+        Save Details — persist every Details Mode field (Project Settings,
+        Name/Lyrics, Actors/Outfits, Assessment) to the active project's
+        session.json + analysis.txt + lyrics.txt. Creates the project folder
+        from song name when needed.
+        """
         label = (song_name or "").strip()
         folder = (configure.APP_STATE.get("current_project_folder") or "").strip()
         if not folder and active_session_id:
@@ -3467,7 +3497,6 @@ def _wire_create_events(status_box) -> None:
             if cand.is_dir():
                 folder = str(cand)
         if not folder and label:
-            # Ensure project dir exists so Save works before Run Assessment finishes
             try:
                 from scripts.inference import ensure_project_dir, _slugify_folder_name
                 slug = _slugify_folder_name(label, fallback="")
@@ -3479,44 +3508,220 @@ def _wire_create_events(status_box) -> None:
                 return f"Cannot create project folder: {e}", *_action_btn_updates(lyrics, song_name)
         if not folder:
             return (
-                "Save Assessment: set a song name (or run assessment first) so a project folder exists.",
+                "Save Details: set a song name (or open a project) so a project folder exists.",
                 *_action_btn_updates(lyrics, song_name),
             )
-        path = Path(folder) / "analysis.txt"
-        body = (text_val or "").strip()
-        if not body:
-            return "Assessment is empty — nothing saved.", *_action_btn_updates(lyrics, song_name)
+
+        # Resolve size / frequency
         try:
-            path.write_text(body if body.endswith("\n") else body + "\n", encoding="utf-8")
+            size_label = configure.normalize_image_size(
+                str(image_size or configure.DEFAULT_IMAGE_SIZE)
+            )
+            w, h = configure.image_size_pixels(size_label)
+        except Exception:
+            size_label = configure.DEFAULT_IMAGE_SIZE
+            w, h = configure.DEFAULT_WIDTH, configure.DEFAULT_HEIGHT
+        try:
+            cover_n = configure.clamp_cover_count(cover_count)
+            theme_n = configure.clamp_theme_count(theme_count)
+            lyrics_n = configure.clamp_lyrics_per_line(lyrics_per_line)
+        except Exception:
+            cover_n = configure.DEFAULT_COVER_COUNT
+            theme_n = configure.DEFAULT_THEME_COUNT
+            lyrics_n = configure.DEFAULT_LYRICS_PER_LINE
+        try:
+            stp = int(steps if steps is not None else configure.DEFAULT_STEPS)
+        except (TypeError, ValueError):
+            stp = configure.DEFAULT_STEPS
+        try:
+            cfgv = float(cfg_scale if cfg_scale is not None else configure.DEFAULT_CFG)
+        except (TypeError, ValueError):
+            cfgv = configure.DEFAULT_CFG
+        ng = str(narrative_guidance or "").strip()[:128]
+        st = configure.normalize_style(style)
+        img_st = configure.normalize_image_style(str(image_style or ""))
+        neg = (
+            negative_prompt
+            if negative_prompt is not None
+            else configure.DEFAULT_NEGATIVE_PROMPT
+        )
+        if neg is None:
+            neg = configure.DEFAULT_NEGATIVE_PROMPT
+
+        updates = {
+            "song_name": label or Path(folder).name,
+            "lyrics": lyrics or "",
+            "style": st,
+            "steps": stp,
+            "cfg_scale": cfgv,
+            "reference_image": (ref_image or "").strip(),
+            "negative_prompt": neg or "",
+            "narrative_guidance": ng,
+            "image_style": img_st,
+            "imagegen_size": size_label,
+            "imagegen_width": w,
+            "imagegen_height": h,
+            "cover_count": cover_n,
+            "theme_count": theme_n,
+            "lyrics_per_line": lyrics_n,
+            "imagegen_frequency": configure.format_image_frequency(cover_n, theme_n, lyrics_n),
+            "hair_style": configure.normalize_hair_style(str(hair_style or "")),
+            "outfit_worn": configure.normalize_outfit(str(outfit_worn or "")),
+            "footwear": configure.normalize_footwear(str(footwear or "")),
+            "ref_gender": configure.normalize_gender(str(ref_gender or "")),
+            "ref_bodyshape": configure.normalize_bodyshape(str(ref_bodyshape or "")),
+            "eye_color": configure.normalize_eye_color(str(eye_color or "")),
+            "ref_age": configure.normalize_age(ref_age),
+            "support_age_min": configure.normalize_support_age(support_age_min, is_min=True),
+            "support_age_max": configure.normalize_support_age(support_age_max, is_min=False),
+        }
+        try:
+            configure.save_session_meta(Path(folder), updates)
+        except Exception as e:
+            return f"Save Details failed (session.json): {e}", *_action_btn_updates(lyrics, song_name)
+
+        # Mirror onto generation.json so the live pipeline sees them
+        try:
+            configure.update_generation({
+                "narrative_guidance": ng,
+                "image_style": img_st,
+                "imagegen_size": size_label,
+                "imagegen_width": w,
+                "imagegen_height": h,
+                "imagegen_steps": stp,
+                "imagegen_cfg_scale": cfgv,
+                "cover_count": cover_n,
+                "theme_count": theme_n,
+                "lyrics_per_line": lyrics_n,
+                "imagegen_frequency": updates["imagegen_frequency"],
+                "hair_style": updates["hair_style"],
+                "outfit_worn": updates["outfit_worn"],
+                "footwear": updates["footwear"],
+                "ref_gender": updates["ref_gender"],
+                "ref_bodyshape": updates["ref_bodyshape"],
+                "eye_color": updates["eye_color"],
+                "ref_age": updates["ref_age"],
+                "support_age_min": updates["support_age_min"],
+                "support_age_max": updates["support_age_max"],
+                "last_project_folder": folder,
+                "project_label": label,
+            })
+            configure.save_frequency_counts(cover_n, theme_n, lyrics_n)
+            configure.update_preferences({"style": st})
+        except Exception as e:
+            print(f"[save-details] generation mirror: {e}", flush=True)
+
+        # Assessment text → analysis.txt (optional — empty is allowed)
+        body = (text_val or "").strip()
+        assess_note = ""
+        if body:
+            path = Path(folder) / "analysis.txt"
             try:
-                (Path(folder) / "lyrics.txt").write_text(lyrics or "", encoding="utf-8")
-            except OSError:
+                path.write_text(body if body.endswith("\n") else body + "\n", encoding="utf-8")
+                assess_note = f"; assessment → {path.name}"
+            except OSError as e:
+                assess_note = f"; assessment save failed: {e}"
+        try:
+            (Path(folder) / "lyrics.txt").write_text(lyrics or "", encoding="utf-8")
+        except OSError:
+            pass
+        # Place reference into project when a path is given
+        if (ref_image or "").strip() and Path(ref_image).is_file():
+            try:
+                configure.ensure_project_reference(folder, ref_image)
+            except Exception:
                 pass
-            configure.APP_STATE["current_project_folder"] = folder
-            configure.APP_STATE["active_session_id"] = Path(folder).name
-            msg = f"Assessment saved → {path}"
-            return msg, *_action_btn_updates(lyrics, song_name)
-        except OSError as e:
-            return f"Save failed: {e}", *_action_btn_updates(lyrics, song_name)
+
+        configure.APP_STATE["current_project_folder"] = folder
+        configure.APP_STATE["active_session_id"] = Path(folder).name
+        msg = f"Details saved → {Path(folder).name}/session.json{assess_note}"
+        return msg, *_action_btn_updates(lyrics, song_name)
+
 
     def _reload_assessment(lyrics: str, song_name: str):
         text_val = _load_assessment_text()
         return text_val, f"Reloaded assessment from disk.", *_action_btn_updates(lyrics, song_name)
 
     if _gen.get("save_assessment_btn") is not None:
+        _save_details_inputs = [
+            _gen["assessment_view"],
+            _gen["song_name"],
+            _gen["lyrics"],
+            _gen["active_session_id"],
+            _gen.get("style"),
+            _gen.get("image_style"),
+            _gen.get("image_size"),
+            _gen.get("steps"),
+            _gen.get("cfg"),
+            _gen.get("cover_count"),
+            _gen.get("theme_count"),
+            _gen.get("lyrics_per_line"),
+            _gen.get("narrative_guidance"),
+            _gen.get("ref_image"),
+            _gen.get("negative_prompt"),
+            _gen.get("hair_style"),
+            _gen.get("outfit_worn"),
+            _gen.get("footwear"),
+            _gen.get("ref_gender"),
+            _gen.get("ref_bodyshape"),
+            _gen.get("eye_color"),
+            _gen.get("ref_age"),
+            _gen.get("support_age_min"),
+            _gen.get("support_age_max"),
+        ]
+        # Gradio rejects None in inputs list — keep only present components
+        # but _save_assessment expects fixed positional args; pass updates
+        # via a thin wrapper that pulls missing keys as None.
+        def _save_details_click(*args):
+            # Map positional from the filtered input list is fragile; use APP_STATE
+            # + the first four required args which are always present.
+            text_val = args[0] if len(args) > 0 else ""
+            song_name = args[1] if len(args) > 1 else ""
+            lyrics = args[2] if len(args) > 2 else ""
+            active_session_id = args[3] if len(args) > 3 else ""
+            # Remaining optional UI values follow the order of _save_details_inputs[4:]
+            keys = [
+                "style", "image_style", "image_size", "steps", "cfg_scale",
+                "cover_count", "theme_count", "lyrics_per_line",
+                "narrative_guidance", "ref_image", "negative_prompt",
+                "hair_style", "outfit_worn", "footwear",
+                "ref_gender", "ref_bodyshape", "eye_color", "ref_age",
+                "support_age_min", "support_age_max",
+            ]
+            present = [c for c in _save_details_inputs[4:] if c is not None]
+            kwargs = {}
+            for i, c in enumerate(present):
+                # match component to key by scanning original order
+                pass
+            # Build kwargs by walking the full optional list
+            opt_vals = list(args[4:])
+            oi = 0
+            kw = {}
+            opt_comps = [
+                _gen.get("style"), _gen.get("image_style"), _gen.get("image_size"),
+                _gen.get("steps"), _gen.get("cfg"),
+                _gen.get("cover_count"), _gen.get("theme_count"), _gen.get("lyrics_per_line"),
+                _gen.get("narrative_guidance"), _gen.get("ref_image"), _gen.get("negative_prompt"),
+                _gen.get("hair_style"), _gen.get("outfit_worn"), _gen.get("footwear"),
+                _gen.get("ref_gender"), _gen.get("ref_bodyshape"), _gen.get("eye_color"),
+                _gen.get("ref_age"), _gen.get("support_age_min"), _gen.get("support_age_max"),
+            ]
+            for key, comp in zip(keys, opt_comps):
+                if comp is None:
+                    kw[key] = None
+                else:
+                    kw[key] = opt_vals[oi] if oi < len(opt_vals) else None
+                    oi += 1
+            return _save_assessment(
+                text_val, song_name, lyrics, active_session_id, **kw
+            )
+
         _gen["save_assessment_btn"].click(
-            _save_assessment,
-            inputs=[
-                _gen["assessment_view"],
-                _gen["song_name"],
-                _gen["lyrics"],
-                _gen["active_session_id"],
-            ],
-            outputs=[
-                status_box,
-                *_action_btn_components(),
-            ],
+            _save_details_click,
+            inputs=[c for c in _save_details_inputs if c is not None],
+            outputs=[status_box, *_action_btn_components()],
         )
+
     if _gen.get("reload_assessment_btn") is not None:
         _gen["reload_assessment_btn"].click(
             _reload_assessment,
@@ -3736,6 +3941,8 @@ def _wire_create_events(status_box) -> None:
             "ref_bodyshape",
             "eye_color",
             "ref_age",
+            "support_age_min",
+            "support_age_max",
         ):
             if _gen.get(key) is not None:
                 outs.append(_gen[key])
@@ -3765,6 +3972,8 @@ def _wire_create_events(status_box) -> None:
         ref_bodyshape=None,
         eye_color=None,
         ref_age=None,
+        support_age_min=None,
+        support_age_max=None,
         narrative_guidance=None,
         running=False,
     ):
@@ -3846,6 +4055,16 @@ def _wire_create_events(status_box) -> None:
             "ref_age": configure.normalize_age(
                 ref_age if ref_age is not None else g.get("ref_age", configure.AGE_DEFAULT)
             ),
+            "support_age_min": configure.normalize_support_age(
+                support_age_min if support_age_min is not None
+                else g.get("support_age_min", configure.SUPPORT_AGE_MIN_DEFAULT),
+                is_min=True,
+            ),
+            "support_age_max": configure.normalize_support_age(
+                support_age_max if support_age_max is not None
+                else g.get("support_age_max", configure.SUPPORT_AGE_MAX_DEFAULT),
+                is_min=False,
+            ),
         }
         for key in (
             "narrative_guidance",
@@ -3861,6 +4080,8 @@ def _wire_create_events(status_box) -> None:
             "ref_bodyshape",
             "eye_color",
             "ref_age",
+            "support_age_min",
+            "support_age_max",
         ):
             if _gen.get(key) is not None:
                 main.append(gr.update(value=extras[key]))
@@ -3960,12 +4181,89 @@ def _wire_create_events(status_box) -> None:
             meta = configure.load_session_meta(Path(s["path"])) or {}
         except Exception:
             meta = {}
-        ng = str(meta.get("narrative_guidance") or g.get("narrative_guidance") or "").strip()[:128]
-        if ng:
+        # Prefer session.json for ALL Details Mode fields (project-specific).
+        # Fall back to generation.json only for keys missing from older sessions.
+        ng = str(meta.get("narrative_guidance") if "narrative_guidance" in meta else (g.get("narrative_guidance") or "")).strip()[:128]
+        # Sync generation.json from the loaded project so pipeline / hidden
+        # components see the same values the UI is about to show.
+        try:
+            size_from_meta = meta.get("imagegen_size") or ""
+            if size_from_meta:
+                size_label = configure.normalize_image_size(str(size_from_meta))
+            elif meta.get("imagegen_width") and meta.get("imagegen_height"):
+                size_label = configure.image_size_label_from_wh(
+                    int(meta["imagegen_width"]), int(meta["imagegen_height"])
+                )
+            cover_m = meta.get("cover_count", g.get("cover_count", configure.DEFAULT_COVER_COUNT))
+            theme_m = meta.get("theme_count", g.get("theme_count", configure.DEFAULT_THEME_COUNT))
+            lyrics_m = meta.get("lyrics_per_line", g.get("lyrics_per_line", configure.DEFAULT_LYRICS_PER_LINE))
+            steps = int(meta.get("steps", steps if steps is not None else configure.DEFAULT_STEPS))
+            cfg_scale = float(meta.get("cfg_scale", cfg_scale if cfg_scale is not None else configure.DEFAULT_CFG))
+            image_style_m = meta.get("image_style", g.get("image_style", configure.IMAGE_STYLE_DEFAULT))
+            hair_m = meta.get("hair_style", g.get("hair_style", configure.HAIR_STYLE_DEFAULT))
+            outfit_m = meta.get("outfit_worn", g.get("outfit_worn", configure.OUTFIT_DEFAULT))
+            footwear_m = meta.get("footwear", g.get("footwear", configure.FOOTWEAR_DEFAULT))
+            gender_m = meta.get("ref_gender", g.get("ref_gender", configure.GENDER_DEFAULT))
+            body_m = meta.get("ref_bodyshape", g.get("ref_bodyshape", configure.BODYSHAPE_DEFAULT))
+            eye_m = meta.get("eye_color", g.get("eye_color", configure.EYE_DEFAULT))
+            age_m = meta.get("ref_age", g.get("ref_age", configure.AGE_DEFAULT))
+            smin_m = meta.get("support_age_min", g.get("support_age_min", configure.SUPPORT_AGE_MIN_DEFAULT))
+            smax_m = meta.get("support_age_max", g.get("support_age_max", configure.SUPPORT_AGE_MAX_DEFAULT))
+            neg = (
+                s.get("negative_prompt")
+                if s.get("negative_prompt") is not None
+                else (
+                    meta.get("negative_prompt")
+                    if meta.get("negative_prompt") is not None
+                    else configure.DEFAULT_NEGATIVE_PROMPT
+                )
+            )
+            # Mirror onto generation.json so inference.cfg sees project values
+            configure.update_generation({
+                "narrative_guidance": ng,
+                "image_style": configure.normalize_image_style(str(image_style_m or "")),
+                "imagegen_size": size_label,
+                "imagegen_steps": steps,
+                "imagegen_cfg_scale": cfg_scale,
+                "cover_count": configure.clamp_cover_count(cover_m),
+                "theme_count": configure.clamp_theme_count(theme_m),
+                "lyrics_per_line": configure.clamp_lyrics_per_line(lyrics_m),
+                "imagegen_frequency": configure.format_image_frequency(cover_m, theme_m, lyrics_m),
+                "hair_style": configure.normalize_hair_style(str(hair_m or "")),
+                "outfit_worn": configure.normalize_outfit(str(outfit_m or "")),
+                "footwear": configure.normalize_footwear(str(footwear_m or "")),
+                "ref_gender": configure.normalize_gender(str(gender_m or "")),
+                "ref_bodyshape": configure.normalize_bodyshape(str(body_m or "")),
+                "eye_color": configure.normalize_eye_color(str(eye_m or "")),
+                "ref_age": configure.normalize_age(age_m),
+                "support_age_min": configure.normalize_support_age(smin_m, is_min=True),
+                "support_age_max": configure.normalize_support_age(smax_m, is_min=False),
+                "last_project_folder": s["path"],
+            })
             try:
-                configure.update_generation({"narrative_guidance": ng})
+                configure.save_frequency_counts(cover_m, theme_m, lyrics_m)
             except Exception:
                 pass
+        except Exception as e:
+            print(f"[session] load project settings: {e}", flush=True)
+            image_style_m = g.get("image_style", configure.IMAGE_STYLE_DEFAULT)
+            hair_m = g.get("hair_style", configure.HAIR_STYLE_DEFAULT)
+            outfit_m = g.get("outfit_worn", configure.OUTFIT_DEFAULT)
+            footwear_m = g.get("footwear", configure.FOOTWEAR_DEFAULT)
+            gender_m = g.get("ref_gender", configure.GENDER_DEFAULT)
+            body_m = g.get("ref_bodyshape", configure.BODYSHAPE_DEFAULT)
+            eye_m = g.get("eye_color", configure.EYE_DEFAULT)
+            age_m = g.get("ref_age", configure.AGE_DEFAULT)
+            smin_m = g.get("support_age_min", configure.SUPPORT_AGE_MIN_DEFAULT)
+            smax_m = g.get("support_age_max", configure.SUPPORT_AGE_MAX_DEFAULT)
+            cover_m = g.get("cover_count", configure.DEFAULT_COVER_COUNT)
+            theme_m = g.get("theme_count", configure.DEFAULT_THEME_COUNT)
+            lyrics_m = g.get("lyrics_per_line", configure.DEFAULT_LYRICS_PER_LINE)
+            neg = (
+                s.get("negative_prompt")
+                if s.get("negative_prompt") is not None
+                else configure.DEFAULT_NEGATIVE_PROMPT
+            )
         form = _session_form_updates(
             song=song,
             lyrics=lyrics,
@@ -3974,19 +4272,34 @@ def _wire_create_events(status_box) -> None:
             steps=steps,
             cfg_scale=cfg_scale,
             ref=ref,
-            negative=(s.get("negative_prompt") if s.get("negative_prompt") is not None else configure.DEFAULT_NEGATIVE_PROMPT),
+            negative=neg,
             status=status,
             sid=sid,
             narrative_guidance=ng,
+            image_style=image_style_m,
+            cover_count=cover_m,
+            theme_count=theme_m,
+            lyrics_per_line=lyrics_m,
+            hair_style=hair_m,
+            outfit_worn=outfit_m,
+            footwear=footwear_m,
+            ref_gender=gender_m,
+            ref_bodyshape=body_m,
+            eye_color=eye_m,
+            ref_age=age_m,
+            support_age_min=smin_m,
+            support_age_max=smax_m,
             running=False,
         )
         refresh = _refresh_session_slots(sid)
+        assess_text = _load_assessment_text(s["path"])
         # Pass project path so Cover/Theme/Lyrics all re-scan the same folder
         return (
             form
             + tuple(_all_gallery_updates(project_dir=s["path"], lyric_paths=list(imgs)))
             + tuple(refresh)
-            + (gr.update(),)
+            + (gr.update(),)  # main_tabs
+            + (gr.update(value=assess_text or ""),)  # assessment_view
         )
 
     # Wire each select button with its index
@@ -3994,7 +4307,10 @@ def _wire_create_events(status_box) -> None:
         btn.click(
             lambda sid_list, i=i: _select_session(i, sid_list or []),
             inputs=[_gen["session_ids"]],
-            outputs=_session_form_outputs() + _thumb_panel_outputs() + _session_refresh_outputs + [_gen["main_tabs"]],
+            outputs=_session_form_outputs() + _thumb_panel_outputs() + _session_refresh_outputs + [
+                _gen["main_tabs"],
+                _gen["assessment_view"],
+            ],
         )
 
     def _delete_one(idx: int, session_ids: list, active_id: str):
@@ -4034,18 +4350,56 @@ def _wire_create_events(status_box) -> None:
         configure.APP_STATE["theme_slot_expected"] = 0
         configure.APP_STATE["theme_slot_queued"] = []
         configure.APP_STATE["theme_slot_generating"] = None
+        # New project: blank narrative, frequency C4/T8/L6, steps from diffuser family
+        try:
+            diff_path = (configure.load_configuration().get("imagegen_model_path") or "")
+            new_steps = configure.default_steps_for_diffuser(diff_path)
+        except Exception:
+            new_steps = configure.DEFAULT_STEPS
+        try:
+            configure.update_generation({
+                "narrative_guidance": "",
+                "cover_count": configure.DEFAULT_COVER_COUNT,
+                "theme_count": configure.DEFAULT_THEME_COUNT,
+                "lyrics_per_line": configure.DEFAULT_LYRICS_PER_LINE,
+                "imagegen_frequency": configure.DEFAULT_IMAGE_FREQUENCY,
+                "imagegen_steps": new_steps,
+                "imagegen_cfg_scale": configure.DEFAULT_CFG,
+                "imagegen_size": configure.DEFAULT_IMAGE_SIZE,
+                "last_project_folder": "",
+            })
+            configure.save_frequency_counts(
+                configure.DEFAULT_COVER_COUNT,
+                configure.DEFAULT_THEME_COUNT,
+                configure.DEFAULT_LYRICS_PER_LINE,
+            )
+        except Exception:
+            pass
         form = _session_form_updates(
             song="",
             lyrics="",
             ref="",
             status="New session — enter song name & lyrics, then Generate.",
             sid="",
-            # Keep global generation prefs for style/size/frequency/subject tokens
             style=configure.normalize_style(configure.load_preferences().get("style")),
             image_size=configure.DEFAULT_IMAGE_SIZE,
-            steps=configure.DEFAULT_STEPS,
+            steps=new_steps,
             cfg_scale=configure.DEFAULT_CFG,
             negative=configure.DEFAULT_NEGATIVE_PROMPT,
+            narrative_guidance="",  # always blank on new project
+            cover_count=configure.DEFAULT_COVER_COUNT,
+            theme_count=configure.DEFAULT_THEME_COUNT,
+            lyrics_per_line=configure.DEFAULT_LYRICS_PER_LINE,
+            image_style=configure.IMAGE_STYLE_DEFAULT,
+            hair_style=configure.HAIR_STYLE_DEFAULT,
+            outfit_worn=configure.OUTFIT_DEFAULT,
+            footwear=configure.FOOTWEAR_DEFAULT,
+            ref_gender=configure.GENDER_DEFAULT,
+            ref_bodyshape=configure.BODYSHAPE_DEFAULT,
+            eye_color=configure.EYE_DEFAULT,
+            ref_age=configure.AGE_DEFAULT,
+            support_age_min=configure.SUPPORT_AGE_MIN_DEFAULT,
+            support_age_max=configure.SUPPORT_AGE_MAX_DEFAULT,
             running=False,
         )
         _reset_thumbs_tab_flag()
@@ -4495,7 +4849,7 @@ def _wire_create_events(status_box) -> None:
     def _persist_subject_tokens(
         hair_style, outfit_worn, footwear, ref_gender, ref_bodyshape, ref_age, eye_color=None,
     ):
-        configure.update_generation({
+        payload = {
             "hair_style": configure.normalize_hair_style(str(hair_style or "")),
             "outfit_worn": configure.normalize_outfit(str(outfit_worn or "")),
             "footwear": configure.normalize_footwear(str(footwear or "")),
@@ -4503,7 +4857,14 @@ def _wire_create_events(status_box) -> None:
             "ref_bodyshape": configure.normalize_bodyshape(str(ref_bodyshape or "")),
             "ref_age": configure.normalize_age(ref_age),
             "eye_color": configure.normalize_eye_color(str(eye_color or "")),
-        })
+        }
+        configure.update_generation(payload)
+        try:
+            folder = (configure.APP_STATE.get("current_project_folder") or "").strip()
+            if folder and Path(folder).is_dir():
+                configure.save_session_meta(Path(folder), payload)
+        except Exception:
+            pass
 
     _subject_token_inputs = [
         _gen["hair_style"], _gen["outfit_worn"], _gen["footwear"],
@@ -4525,10 +4886,17 @@ def _wire_create_events(status_box) -> None:
         hi = configure.normalize_support_age(age_max, is_min=False)
         if lo > hi:
             lo, hi = hi, lo
-        configure.update_generation({
+        payload = {
             "support_age_min": lo,
             "support_age_max": hi,
-        })
+        }
+        configure.update_generation(payload)
+        try:
+            folder = (configure.APP_STATE.get("current_project_folder") or "").strip()
+            if folder and Path(folder).is_dir():
+                configure.save_session_meta(Path(folder), payload)
+        except Exception:
+            pass
 
     if _gen.get("support_age_min") is not None and _gen.get("support_age_max") is not None:
         for _s in (_gen["support_age_min"], _gen["support_age_max"]):
@@ -4544,9 +4912,16 @@ def _wire_create_events(status_box) -> None:
             )
 
     def _persist_image_style(image_style):
-        configure.update_generation({
+        payload = {
             "image_style": configure.normalize_image_style(str(image_style or "")),
-        })
+        }
+        configure.update_generation(payload)
+        try:
+            folder = (configure.APP_STATE.get("current_project_folder") or "").strip()
+            if folder and Path(folder).is_dir():
+                configure.save_session_meta(Path(folder), payload)
+        except Exception:
+            pass
 
     if _gen.get("image_style") is not None:
         _gen["image_style"].change(
@@ -4600,6 +4975,65 @@ def _wire_create_events(status_box) -> None:
             inputs=[_gen["narrative_guidance"]],
             outputs=[],
         )
+    def _persist_steps_cfg_size(steps, cfg_scale, image_size):
+        try:
+            stp = int(steps if steps is not None else configure.DEFAULT_STEPS)
+        except (TypeError, ValueError):
+            stp = configure.DEFAULT_STEPS
+        try:
+            cfgv = float(cfg_scale if cfg_scale is not None else configure.DEFAULT_CFG)
+        except (TypeError, ValueError):
+            cfgv = configure.DEFAULT_CFG
+        try:
+            size_label = configure.normalize_image_size(str(image_size or configure.DEFAULT_IMAGE_SIZE))
+            w, h = configure.image_size_pixels(size_label)
+        except Exception:
+            size_label = configure.DEFAULT_IMAGE_SIZE
+            w, h = configure.DEFAULT_WIDTH, configure.DEFAULT_HEIGHT
+        payload = {
+            "imagegen_steps": stp,
+            "imagegen_cfg_scale": cfgv,
+            "imagegen_size": size_label,
+            "imagegen_width": w,
+            "imagegen_height": h,
+            "steps": stp,
+            "cfg_scale": cfgv,
+        }
+        configure.update_generation({
+            "imagegen_steps": stp,
+            "imagegen_cfg_scale": cfgv,
+            "imagegen_size": size_label,
+            "imagegen_width": w,
+            "imagegen_height": h,
+        })
+        try:
+            folder = (configure.APP_STATE.get("current_project_folder") or "").strip()
+            if folder and Path(folder).is_dir():
+                configure.save_session_meta(Path(folder), payload)
+        except Exception:
+            pass
+
+    _scs_inputs = [c for c in (_gen.get("steps"), _gen.get("cfg"), _gen.get("image_size")) if c is not None]
+    if len(_scs_inputs) == 3:
+        for _c in _scs_inputs:
+            try:
+                _c.change(
+                    _persist_steps_cfg_size,
+                    inputs=_scs_inputs,
+                    outputs=[],
+                )
+            except Exception:
+                pass
+            try:
+                if hasattr(_c, "release"):
+                    _c.release(
+                        _persist_steps_cfg_size,
+                        inputs=_scs_inputs,
+                        outputs=[],
+                    )
+            except Exception:
+                pass
+
 
     def _on_frequency_counts_change(cover_count, theme_count, lyrics_per_line, lyrics, song_name, active_session_id):
         """Persist independent C/T/L counts and refresh Cover/Theme/Lyrics grids.
@@ -4612,6 +5046,17 @@ def _wire_create_events(status_box) -> None:
         freq = configure.format_image_frequency(
             counts["cover"], counts["theme"], counts["lyrics"]
         )
+        try:
+            folder = (configure.APP_STATE.get("current_project_folder") or "").strip()
+            if folder and Path(folder).is_dir():
+                configure.save_session_meta(Path(folder), {
+                    "cover_count": counts["cover"],
+                    "theme_count": counts["theme"],
+                    "lyrics_per_line": counts["lyrics"],
+                    "imagegen_frequency": freq,
+                })
+        except Exception:
+            pass
         # Drop batch-pinned expectations so the UI counts are the display authority
         configure.APP_STATE["cover_slot_expected"] = 0
         configure.APP_STATE["theme_slot_expected"] = 0
@@ -5251,8 +5696,8 @@ def _wire_create_events(status_box) -> None:
             gr.update(value="Song Assessment"),
             gr.update(visible=False),  # Project Settings
             gr.update(visible=False),  # Name and Lyrics
+            gr.update(visible=False),  # Actors and Outfits
             gr.update(visible=True),   # Song Assessment
-            gr.update(visible=False),  # Characters
             gr.update(value=assess_text),
         )
 

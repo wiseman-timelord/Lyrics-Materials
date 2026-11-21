@@ -1684,17 +1684,100 @@ def _snapshot_session(
             ng = ""
     if len(ng) > 128:
         ng = ng[:128]
+    # Prefer explicit cfg keys; fall back to generation.json for fields not
+    # always present on the live cfg dict (character tokens, frequency, size).
+    try:
+        g = configure.load_generation()
+    except Exception:
+        g = {}
+
+    def _g(key, default=""):
+        v = cfg.get(key)
+        if v is None or (isinstance(v, str) and not str(v).strip() and key not in (
+            "negative_prompt", "narrative_guidance", "reference_image", "lyrics",
+        )):
+            v = g.get(key, default)
+        return v
+
+    try:
+        w = int(cfg.get("imagegen_width") or g.get("imagegen_width") or configure.DEFAULT_WIDTH)
+        h = int(cfg.get("imagegen_height") or g.get("imagegen_height") or configure.DEFAULT_HEIGHT)
+    except (TypeError, ValueError):
+        w, h = configure.DEFAULT_WIDTH, configure.DEFAULT_HEIGHT
+    size_label = str(
+        cfg.get("imagegen_size")
+        or g.get("imagegen_size")
+        or configure.image_size_label_from_wh(w, h)
+    )
+    try:
+        size_label = configure.normalize_image_size(size_label)
+    except Exception:
+        size_label = configure.DEFAULT_IMAGE_SIZE
+
+    cover = configure.clamp_cover_count(_g("cover_count", configure.DEFAULT_COVER_COUNT))
+    theme = configure.clamp_theme_count(_g("theme_count", configure.DEFAULT_THEME_COUNT))
+    lyrics_n = configure.clamp_lyrics_per_line(
+        _g("lyrics_per_line", configure.DEFAULT_LYRICS_PER_LINE)
+    )
+
     updates: Dict[str, Any] = {
         "song_name": (song_name or cfg.get("project_label") or project_dir.name).strip()
         or project_dir.name,
         "lyrics": lyrics if lyrics is not None else "",
-        "style": configure.normalize_style(cfg.get("style")),
-        "steps": int(cfg.get("imagegen_steps") or configure.DEFAULT_STEPS),
-        "cfg_scale": float(cfg.get("imagegen_cfg_scale") or configure.DEFAULT_CFG),
-        "reference_image": reference_image or "",
-        "negative_prompt": (cfg.get("negative_prompt") if cfg.get("negative_prompt") is not None
-                            else configure.DEFAULT_NEGATIVE_PROMPT) or "",
+        "style": configure.normalize_style(cfg.get("style") or g.get("style")),
+        "steps": int(cfg.get("imagegen_steps") or g.get("imagegen_steps") or configure.DEFAULT_STEPS),
+        "cfg_scale": float(
+            cfg.get("imagegen_cfg_scale")
+            if cfg.get("imagegen_cfg_scale") is not None
+            else (g.get("imagegen_cfg_scale") if g.get("imagegen_cfg_scale") is not None
+                  else configure.DEFAULT_CFG)
+        ),
+        "reference_image": reference_image or str(_g("reference_image_path", "") or ""),
+        "negative_prompt": (
+            cfg.get("negative_prompt")
+            if cfg.get("negative_prompt") is not None
+            else (
+                g.get("negative_prompt")
+                if g.get("negative_prompt") is not None
+                else configure.DEFAULT_NEGATIVE_PROMPT
+            )
+        ) or "",
         "narrative_guidance": ng,
+        "image_style": configure.normalize_image_style(
+            str(_g("image_style", configure.IMAGE_STYLE_DEFAULT) or configure.IMAGE_STYLE_DEFAULT)
+        ),
+        "imagegen_size": size_label,
+        "imagegen_width": w,
+        "imagegen_height": h,
+        "cover_count": cover,
+        "theme_count": theme,
+        "lyrics_per_line": lyrics_n,
+        "imagegen_frequency": configure.format_image_frequency(cover, theme, lyrics_n),
+        "hair_style": configure.normalize_hair_style(
+            str(_g("hair_style", configure.HAIR_STYLE_DEFAULT) or configure.HAIR_STYLE_DEFAULT)
+        ),
+        "outfit_worn": configure.normalize_outfit(
+            str(_g("outfit_worn", configure.OUTFIT_DEFAULT) or configure.OUTFIT_DEFAULT)
+        ),
+        "footwear": configure.normalize_footwear(
+            str(_g("footwear", configure.FOOTWEAR_DEFAULT) or configure.FOOTWEAR_DEFAULT)
+        ),
+        "ref_gender": configure.normalize_gender(
+            str(_g("ref_gender", configure.GENDER_DEFAULT) or configure.GENDER_DEFAULT)
+        ),
+        "ref_bodyshape": configure.normalize_bodyshape(
+            str(_g("ref_bodyshape", configure.BODYSHAPE_DEFAULT) or configure.BODYSHAPE_DEFAULT)
+        ),
+        "eye_color": configure.normalize_eye_color(
+            str(_g("eye_color", configure.EYE_DEFAULT) or configure.EYE_DEFAULT)
+        ),
+        "ref_age": configure.normalize_age(_g("ref_age", configure.AGE_DEFAULT)),
+        "support_age_min": configure.normalize_support_age(
+            _g("support_age_min", configure.SUPPORT_AGE_MIN_DEFAULT), is_min=True
+        ),
+        "support_age_max": configure.normalize_support_age(
+            _g("support_age_max", configure.SUPPORT_AGE_MAX_DEFAULT), is_min=False
+        ),
         "line_count": int(line_count or 0),
         "images_done": int(images_done),
     }

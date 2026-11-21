@@ -1658,8 +1658,24 @@ RESOLUTION_PIXELS = {
 # Default generation values for Flux.2-klein-4B distilled
 DEFAULT_WIDTH = 768
 DEFAULT_HEIGHT = 432
-DEFAULT_STEPS = 18  # higher detail for Flux.2-klein stills
+DEFAULT_STEPS = 16  # Flux.2-klein default
+DEFAULT_STEPS_FLUX = 16
+DEFAULT_STEPS_IDEOGRAM = 8
 DEFAULT_CFG = 1.1
+
+
+def is_ideogram_model_path(path_str: str = "") -> bool:
+    """True when the diffusion model filename looks like Ideogram4."""
+    n = Path(path_str or "").name.lower()
+    return "ideogram" in n
+
+
+def default_steps_for_diffuser(path_str: str = "") -> int:
+    """Default sampling steps: Ideogram4 → 8, Flux.2 (and unknown) → 16."""
+    if is_ideogram_model_path(path_str):
+        return int(DEFAULT_STEPS_IDEOGRAM)
+    return int(DEFAULT_STEPS_FLUX)
+
 # Shared negative body (style lead is prepended dynamically from Image Style).
 # Periods group: overlays / quality / anatomy / identity / devices.
 DEFAULT_NEGATIVE_BODY = (
@@ -1862,15 +1878,15 @@ def merge_negative_prompt(
 # imagegen_frequency remains a synthesized "C#/T#/L#" label for compatibility.
 COVER_COUNT_MIN = 0
 COVER_COUNT_MAX = 10
-DEFAULT_COVER_COUNT = 10
+DEFAULT_COVER_COUNT = 4
 
 THEME_COUNT_MIN = 0
 THEME_COUNT_MAX = 20
-DEFAULT_THEME_COUNT = 20
+DEFAULT_THEME_COUNT = 8
 
 LYRICS_PER_LINE_MIN = 0
 LYRICS_PER_LINE_MAX = 30
-DEFAULT_LYRICS_PER_LINE = 4
+DEFAULT_LYRICS_PER_LINE = 6
 
 DEFAULT_IMAGE_FREQUENCY = (
     f"C{DEFAULT_COVER_COUNT}/T{DEFAULT_THEME_COUNT}/L{DEFAULT_LYRICS_PER_LINE}"
@@ -2901,19 +2917,16 @@ def get_images_dir() -> Path:
 
 SESSION_META_NAME = "session.json"
 
-# session.json schema (written by pipeline / UI):
+# session.json schema (written by pipeline / UI) — full per-project Details:
 # {
-#   "song_name": str,
-#   "lyrics": str,
-#   "style": str,
-#   "steps": int,
-#   "cfg_scale": float,
-#   "reference_image": str,   # original path or project-relative
-#   "phase": "none"|"analysis"|"prompts"|"images"|"done"|"stopped",
-#   "line_count": int,
-#   "images_done": int,
-#   "created": float,         # unix time
-#   "updated": float,
+#   "song_name", "lyrics", "style", "steps", "cfg_scale",
+#   "reference_image", "negative_prompt", "narrative_guidance",
+#   "image_style", "imagegen_size", "imagegen_width", "imagegen_height",
+#   "cover_count", "theme_count", "lyrics_per_line", "imagegen_frequency",
+#   "hair_style", "outfit_worn", "footwear",
+#   "ref_gender", "ref_bodyshape", "eye_color", "ref_age",
+#   "support_age_min", "support_age_max",
+#   "phase", "line_count", "images_done", "created", "updated",
 # }
 
 
@@ -2923,6 +2936,8 @@ def _session_meta_path(project_dir: Path) -> Path:
 
 def load_session_meta(project_dir: Path) -> Dict[str, Any]:
     path = _session_meta_path(project_dir)
+    # Full per-project settings (Details Mode panels). Global generation.json
+    # is only a fallback for brand-new projects / migration of old sessions.
     defaults: Dict[str, Any] = {
         "song_name": project_dir.name,
         "lyrics": "",
@@ -2931,6 +2946,24 @@ def load_session_meta(project_dir: Path) -> Dict[str, Any]:
         "cfg_scale": DEFAULT_CFG,
         "reference_image": "",
         "negative_prompt": DEFAULT_NEGATIVE_PROMPT,
+        "narrative_guidance": "",
+        "image_style": IMAGE_STYLE_DEFAULT,
+        "imagegen_size": DEFAULT_IMAGE_SIZE,
+        "imagegen_width": DEFAULT_WIDTH,
+        "imagegen_height": DEFAULT_HEIGHT,
+        "cover_count": DEFAULT_COVER_COUNT,
+        "theme_count": DEFAULT_THEME_COUNT,
+        "lyrics_per_line": DEFAULT_LYRICS_PER_LINE,
+        "imagegen_frequency": DEFAULT_IMAGE_FREQUENCY,
+        "hair_style": HAIR_STYLE_DEFAULT,
+        "outfit_worn": OUTFIT_DEFAULT,
+        "footwear": FOOTWEAR_DEFAULT,
+        "ref_gender": GENDER_DEFAULT,
+        "ref_bodyshape": BODYSHAPE_DEFAULT,
+        "eye_color": EYE_DEFAULT,
+        "ref_age": AGE_DEFAULT,
+        "support_age_min": SUPPORT_AGE_MIN_DEFAULT,
+        "support_age_max": SUPPORT_AGE_MAX_DEFAULT,
         "phase": "none",
         "line_count": 0,
         "images_done": 0,
@@ -2948,6 +2981,51 @@ def load_session_meta(project_dir: Path) -> Dict[str, Any]:
         pass
     # Always canonicalise style so empty / legacy values become STYLE_DEFAULT
     defaults["style"] = normalize_style(defaults.get("style"))
+    if "image_style" in defaults:
+        defaults["image_style"] = normalize_image_style(defaults.get("image_style"))
+    if "hair_style" in defaults:
+        defaults["hair_style"] = normalize_hair_style(defaults.get("hair_style"))
+    if "outfit_worn" in defaults:
+        defaults["outfit_worn"] = normalize_outfit(defaults.get("outfit_worn"))
+    if "footwear" in defaults:
+        defaults["footwear"] = normalize_footwear(defaults.get("footwear"))
+    if "ref_gender" in defaults:
+        defaults["ref_gender"] = normalize_gender(defaults.get("ref_gender"))
+    if "ref_bodyshape" in defaults:
+        defaults["ref_bodyshape"] = normalize_bodyshape(defaults.get("ref_bodyshape"))
+    if "eye_color" in defaults:
+        defaults["eye_color"] = normalize_eye_color(defaults.get("eye_color"))
+    try:
+        defaults["ref_age"] = normalize_age(defaults.get("ref_age", AGE_DEFAULT))
+    except Exception:
+        defaults["ref_age"] = AGE_DEFAULT
+    try:
+        defaults["support_age_min"] = normalize_support_age(
+            defaults.get("support_age_min", SUPPORT_AGE_MIN_DEFAULT), is_min=True
+        )
+        defaults["support_age_max"] = normalize_support_age(
+            defaults.get("support_age_max", SUPPORT_AGE_MAX_DEFAULT), is_min=False
+        )
+    except Exception:
+        pass
+    # Frequency counts — keep synthesised label in sync
+    try:
+        c = clamp_cover_count(defaults.get("cover_count", DEFAULT_COVER_COUNT))
+        t = clamp_theme_count(defaults.get("theme_count", DEFAULT_THEME_COUNT))
+        l = clamp_lyrics_per_line(defaults.get("lyrics_per_line", DEFAULT_LYRICS_PER_LINE))
+        defaults["cover_count"] = c
+        defaults["theme_count"] = t
+        defaults["lyrics_per_line"] = l
+        defaults["imagegen_frequency"] = format_image_frequency(c, t, l)
+    except Exception:
+        pass
+    if "imagegen_size" in defaults and defaults.get("imagegen_size"):
+        try:
+            defaults["imagegen_size"] = normalize_image_size(str(defaults["imagegen_size"]))
+        except Exception:
+            pass
+    # narrative_guidance always string, max 128
+    defaults["narrative_guidance"] = str(defaults.get("narrative_guidance") or "").strip()[:128]
     return defaults
 
 
