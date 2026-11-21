@@ -904,7 +904,20 @@ _PROMPT_PREDICT = 280
 _TIMEOUT_NAME = 120.0
 _TIMEOUT_ANALYSIS = 720.0
 _TIMEOUT_PROMPT = 240.0
-_TIMEOUT_SD = 1200.0  # Ideogram on modest GPUs can exceed 850s even at 8 steps
+# SD stall watchdog (NOT a hard wall-clock kill):
+# While sampling progress lines keep arriving (e.g. "| 3/8 - 422s/it"), generation
+# is allowed to run indefinitely — slow Ideogram on RX 470 can exceed 7 minutes/step.
+# If NO progress is seen for this many seconds, emit a warning and wait one more
+# window; a second consecutive silent window fails with a hardware-too-slow message.
+_TIMEOUT_SD = 1200.0
+_TIMEOUT_SD_WARN = (
+    "Image generation is taking longer than expected — still waiting for progress…"
+)
+_TIMEOUT_SD_STALL_FAIL = (
+    "Your hardware is too slow for this model at the current settings "
+    "(no sampling progress for a long time). Try fewer steps, a smaller resolution, "
+    "or a faster GPU, then try again."
+)
 
 _THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -2671,7 +2684,11 @@ def _run_sd_cli_once_unlocked(cmd: List[str], exe: Path, timeout: float = _TIMEO
     if "-v" not in cmd and "--verbose" not in cmd:
         cmd = list(cmd) + ["-v"]
     print("[sd-cli] " + " ".join(str(c) for c in cmd), flush=True)
-    print(f"[sd-cli] starting (timeout {timeout:.0f}s) — streaming output…", flush=True)
+    print(
+        f"[sd-cli] starting (stall watchdog {timeout:.0f}s — no hard wall-clock limit "
+        f"while sampling progress continues) — streaming output…",
+        flush=True,
+    )
     out_path = _out_path_from_cmd(cmd)
     t0 = time.time()
     proc = subprocess.Popen(
@@ -2698,8 +2715,11 @@ def _run_sd_cli_once_unlocked(cmd: List[str], exe: Path, timeout: float = _TIMEO
         pass
 
     line_q: "queue.Queue[Optional[str]]" = queue.Queue()
-    marks: Dict[str, Any] = {"first_step": None, "last_step": None, "steps": 0,
-                             "total": 0, "sit_first": None, "sit_last": None}
+    marks: Dict[str, Any] = {
+        "first_step": None, "last_step": None, "steps": 0,
+        "total": 0, "sit_first": None, "sit_last": None,
+        "last_progress_at": t0,  # wall time of last real progress (step / model load)
+    }
     saved_evt = threading.Event()      # set the instant the image is on disk
     stop_watch = threading.Event()     # tells the file watcher to quit
     saved_lock = threading.Lock()
@@ -2733,7 +2753,11 @@ def _run_sd_cli_once_unlocked(cmd: List[str], exe: Path, timeout: float = _TIMEO
         )
 
     def _note_step(ln: str) -> None:
-        """Record sampling-step progress lines ('| 3/12 - 18.4s/it') for the timing summary."""
+        """Record sampling-step progress lines ('| 3/12 - 18.4s/it') for the timing summary.
+
+        Also refreshes last_progress_at so the stall watchdog never kills a still
+        that is still advancing (even at 400+ s/it on slow GPUs).
+        """
         m = _SD_STEP_RE.search(ln)
         if not m:
             return
@@ -2746,6 +2770,7 @@ def _run_sd_cli_once_unlocked(cmd: List[str], exe: Path, timeout: float = _TIMEO
                 marks["first_step"], marks["sit_first"] = now, sit
             marks["last_step"], marks["sit_last"] = now, sit
             marks["steps"], marks["total"] = n, tot
+            marks["last_progress_at"] = now
         except Exception:
             pass
 
@@ -2803,20 +2828,60 @@ def _run_sd_cli_once_unlocked(cmd: List[str], exe: Path, timeout: float = _TIMEO
     flags: List[str] = []
 
     try:
-        deadline = t0 + timeout
+        # Progress-aware stall watchdog (NOT a hard wall-clock limit):
+        # - Any sampling step line or model-load marker refreshes last_progress_at.
+        # - If silence exceeds `timeout`, warn once and grant one more full window.
+        # - A second consecutive silent window → kill with hardware-too-slow message.
+        # - While steps keep arriving (even at 400+ s/it), never kill.
+        stall_deadline = t0 + timeout
+        stall_warned = False
         while True:
             if is_cancel_requested():
                 proc.kill()
                 flags.append("[[CANCELLED]] sd-cli was stopped by a cancel request.")
                 break
-            if not saved_evt.is_set() and time.time() > deadline:
-                proc.kill()
-                print(f"[sd-cli] TIMEOUT after {time.time() - t0:.1f}s", flush=True)
-                flags.append(
-                    f"[[TIMEOUT]] sd-cli was killed after {time.time() - t0:.0f}s "
-                    f"(limit {timeout:.0f}s) before saving an image."
-                )
-                break
+            if not saved_evt.is_set():
+                now = time.time()
+                last_prog = float(marks.get("last_progress_at") or t0)
+                # Any recent progress pushes the stall deadline forward and
+                # clears a prior warning so a later gap gets a fresh warning.
+                if last_prog + timeout > stall_deadline:
+                    stall_deadline = last_prog + timeout
+                    if stall_warned:
+                        stall_warned = False
+                        print(
+                            f"[sd-cli] progress resumed (step "
+                            f"{marks.get('steps') or '?'}/{marks.get('total') or '?'}) — "
+                            f"stall warning cleared",
+                            flush=True,
+                        )
+                if now > stall_deadline:
+                    if not stall_warned:
+                        stall_warned = True
+                        stall_deadline = now + timeout  # one more full window
+                        print(f"[sd-cli] {_TIMEOUT_SD_WARN}", flush=True)
+                        print(
+                            f"[sd-cli] stall watchdog: no progress for {timeout:.0f}s — "
+                            f"granting one more {timeout:.0f}s window "
+                            f"(elapsed {now - t0:.0f}s, steps {marks.get('steps') or 0}/"
+                            f"{marks.get('total') or '?'})",
+                            flush=True,
+                        )
+                    else:
+                        # Second consecutive silent window → give up
+                        proc.kill()
+                        print(
+                            f"[sd-cli] STALL after {now - t0:.1f}s "
+                            f"(no progress for {timeout:.0f}s × 2)",
+                            flush=True,
+                        )
+                        flags.append(
+                            f"[[TIMEOUT]] {_TIMEOUT_SD_STALL_FAIL} "
+                            f"(elapsed {now - t0:.0f}s, last progress "
+                            f"{now - last_prog:.0f}s ago, steps "
+                            f"{marks.get('steps') or 0}/{marks.get('total') or '?'})."
+                        )
+                        break
             # Release check runs FIRST on every pass, regardless of console
             # traffic. MUST kill promptly after the save — otherwise the next
             # still is held up and the UI stays parked on this one.
@@ -2874,8 +2939,22 @@ def _run_sd_cli_once_unlocked(cmd: List[str], exe: Path, timeout: float = _TIMEO
                         k in low for k in ("loaded", "load model", "diffusion", "vae", "tensor")
                     ):
                         model_loaded = True
+                        marks["last_progress_at"] = time.time()
                         print(f"[sd-cli] *** MODEL ACTIVITY ({time.time() - t0:.1f}s) ***", flush=True)
                         break
+            # Any sampling-step line already updated marks via _note_step;
+            # also treat "generating image" / encode completion as progress so
+            # the pre-sampling phase is not falsely stalled.
+            for t in texts:
+                low = t.lower()
+                if (
+                    "generating image" in low
+                    or "get_learned_condition completed" in low
+                    or "encode_first_stage completed" in low
+                    or "computing condition graph completed" in low
+                ):
+                    marks["last_progress_at"] = time.time()
+                    break
             if ended:
                 break
         try:
@@ -3565,6 +3644,29 @@ def _appearance_bit(cfg: Dict[str, Any], presence: str = "full") -> str:
     )
 
 
+
+def _is_vulkan_device_lost(out: str) -> bool:
+    """True when sd-cli died because the GPU/driver reset (AMD TDR / device lost)."""
+    low = (out or "").lower()
+    return (
+        "device lost" in low
+        or "errordevicelost" in low
+        or "device fault" in low
+        or "vk::queue::submit: errordevicelost" in low
+        or ("ggml_vulkan" in low and "fault" in low)
+    )
+
+
+def _sd_device_lost_cooldown(seconds: float = 20.0) -> None:
+    """Give the GPU/driver a short rest after a device-lost before retrying."""
+    print(
+        f"[sd-cli] Vulkan device-lost detected — cooling down {seconds:.0f}s "
+        f"before retry (driver reset / TDR recovery)…",
+        flush=True,
+    )
+    time.sleep(max(1.0, float(seconds)))
+
+
 def _sd_attempt_succeeded(out: str, rc: int, found: Optional[Path]) -> bool:
     """True when sd-cli actually produced a still — never retry in that case."""
     if found is not None and found.is_file() and found.stat().st_size > 64:
@@ -3850,8 +3952,14 @@ def generate_images_from_prompts(
             hint = seq_hints[var - 1] if var - 1 < len(seq_hints) else ""
             seq_bit = f" [Sequence {var}/{freq}: {hint}.]" if hint else ""
 
-            # Progressive chain: var>1 uses previous still as visual reference
-            progressive = bool(freq > 1 and var > 1 and prev_still and prev_still.is_file())
+            # Progressive chain: var>1 uses previous still as visual reference.
+            # Ideogram4 on modest GPUs (e.g. RX 470) often device-losts under the
+            # extra VAE-encode + heavier graph that -r adds — skip progressive -r
+            # for Ideogram; identity still comes from the text clause + character photo.
+            progressive = bool(
+                freq > 1 and var > 1 and prev_still and prev_still.is_file()
+                and not is_ideogram
+            )
             ref_override = ""
             attach_ref = False
             scene = scene0
@@ -3948,7 +4056,13 @@ def generate_images_from_prompts(
                     cmd, out, rc,
                 )
 
+            # --- recovery path ---
+            # 1) If we had a ref and failed → retry without ref (lighter graph).
+            # 2) If Vulkan device-lost → cooldown + one more attempt without ref.
+            # 3) If still failed → log and CONTINUE (do not abort the whole pipeline).
             if not _sd_attempt_succeeded(out, rc, found) and attach_ref:
+                if _is_vulkan_device_lost(out):
+                    _sd_device_lost_cooldown(20.0)
                 print(
                     f"[images] line {line_no} var {var} failed with ref — "
                     "retrying without reference…",
@@ -3965,15 +4079,43 @@ def generate_images_from_prompts(
                         out_dir, line_no, f"var{var} retry, no reference", cmd2, out, rc,
                     )
 
+            if not _sd_attempt_succeeded(out, rc, found) and _is_vulkan_device_lost(out):
+                # One bare retry after a device-lost (no ref), with cooldown
+                _sd_device_lost_cooldown(25.0)
+                print(
+                    f"[images] line {line_no} var {var} device-lost — "
+                    "one more attempt after cooldown (no reference)…",
+                    flush=True,
+                )
+                cmd3 = _build_sd_cmd(final_prompt, img_path, attach_ref=False, ref_override="")
+                out, rc = _run_sd_cli_once(cmd3, exe, timeout=_TIMEOUT_SD)
+                found = _find_still_for_line(
+                    out_dir, line_no, variant=var if freq > 1 else None,
+                )
+                if not _sd_attempt_succeeded(out, rc, found):
+                    log_path = _write_sd_failure_log(
+                        out_dir, line_no, f"var{var} device-lost retry", cmd3, out, rc,
+                    )
+
             if not _sd_attempt_succeeded(out, rc, found):
                 detail = _format_sd_failure(out, vae_path, model_path, rc)
                 where = f"\nFull log: {log_path}" if log_path else ""
-                raise RuntimeError(
-                    f"Image generation failed for line {line_no}/{total} "
-                    f"variant {var}/{freq}"
-                    f" ({'reference attached' if attach_ref else 'no reference'}).\n"
-                    f"{detail}{where}"
+                lost = _is_vulkan_device_lost(out)
+                print(
+                    f"[images] SKIP line {line_no}/{total} var {var}/{freq} — generation failed"
+                    f"{' (Vulkan device-lost — GPU/driver reset under load)' if lost else ''}.\n"
+                    f"{detail}{where}",
+                    flush=True,
                 )
+                if lost:
+                    print(
+                        "[images] Tip: Ideogram4 ~5.7GB weights is very heavy on older AMD "
+                        "(RX 470 class). Flux.2-klein is more reliable on this hardware. "
+                        "Device-lost mid-step is a GPU/driver limit, not a Lyrics-Materials bug.",
+                        flush=True,
+                    )
+                # Do NOT raise — continue filling remaining gaps
+                continue
 
             dest = found if found is not None else img_path
             images.append(dest)
