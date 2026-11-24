@@ -809,6 +809,17 @@ IMAGE_STYLE_NEGATIVE_LEAD = {
     IMAGE_STYLE_GAME: "photorealistic, drawing",
     IMAGE_STYLE_PIXEL: "photorealistic, drawing",
 }
+# Extra anti-text / HUD terms applied only for specific Image Styles.
+# Computer Game Graphics often bakes in SCENE labels, HUD chrome, and
+# segmented lyric-like lettering — reinforce negatives beyond the shared body.
+# Terms already in DEFAULT_NEGATIVE_BODY / AMBIENT (e.g. "graphical overlay")
+# are omitted here; merge_negative_prompt dedupes by lowercased token.
+IMAGE_STYLE_NEGATIVE_EXTRA = {
+    IMAGE_STYLE_GAME: (
+        "alphabet, calligraphy, album title text, readable text, "
+        "misspelled text, text overlay"
+    ),
+}
 
 
 def normalize_image_style(value: str) -> str:
@@ -1831,17 +1842,25 @@ def merge_negative_prompt(
     """
     Assemble the negative prompt:
 
-      [Image-Style lead]. [shared body OR ambient body] [+ cover anti-text]
+      [Image-Style lead]. [style extra]. [shared body OR ambient body]
+      [+ cover anti-text]
 
     Style lead is always dynamic from Image Style so Photo / Cartoon / Manga /
     Game / Pixel do not fight their own positive lead word.
+
+    IMAGE_STYLE_NEGATIVE_EXTRA adds style-specific anti-text (e.g. HUD /
+    alphabet reinforcement for Computer Game Graphics) without bloating the
+    shared body used by Photo Realistic and other styles.
     """
     style_key = normalize_image_style(image_style or IMAGE_STYLE_DEFAULT)
     style_lead = IMAGE_STYLE_NEGATIVE_LEAD.get(
         style_key, IMAGE_STYLE_NEGATIVE_LEAD[IMAGE_STYLE_DEFAULT]
     )
+    style_extra = (IMAGE_STYLE_NEGATIVE_EXTRA.get(style_key) or "").strip()
 
     bits: List[str] = [style_lead]
+    if style_extra:
+        bits.append(style_extra)
     b = (base or "").strip()
     if ambient:
         # Ambient stills: no-people prior; keep style lead + ambient body

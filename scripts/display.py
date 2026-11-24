@@ -181,9 +181,23 @@ def _assessment_exists(project_dir: str = "") -> bool:
         return False
     if len(raw) < 40:
         return False
+    low = raw.lower()
+    # Failure / cancel stubs are not a completed assessment
+    if (
+        "assessment failed" in low
+        or "click re-run assessment" in low
+        or "model returned unstructured" in low
+    ):
+        return False
     # Prefer structured content; accept any substantial text the user saved
     upper = raw.upper()
     if "OVERALL" in upper or "SECTIONS" in upper or "CHARACTER" in upper:
+        # Empty OVERALL body (headers only) is not usable
+        body = raw
+        for hdr in ("OVERALL", "CHARACTER", "OTHER_FIGURES", "CHARACTER_MAP", "SECTIONS"):
+            body = body.replace(hdr, "").replace(hdr.lower(), "")
+        if len(body.strip()) < 30:
+            return False
         return True
     return len(raw) >= 80
 
@@ -2162,11 +2176,9 @@ def _refresh_session_slots(active_id: str = "", expanded: bool = None):
             row_updates.append(gr.update(visible=False))
             sel_updates.append(gr.update(value="", visible=False))
             del_updates.append(gr.update(visible=False, scale=0, min_width=0))
-    show_new = bool(active_id) or configure.APP_STATE.get("session_status") in (
-        "stopped", "done",
-    )
+    # Always available so a blank project can be started without first selecting a session
     start_new = gr.update(
-        visible=show_new,
+        visible=True,
         value="Start New Session" if expanded else "New",
     )
     heading = gr.update(value="**Session Slots**" if expanded else "")
@@ -2340,7 +2352,7 @@ def _build_create_tab() -> None:
             _gen["start_new_session"] = gr.Button(
                 "Start New Session" if expanded else "New",
                 variant="secondary",
-                visible=False,  # shown when a stopped/done session is selected
+                visible=True,
                 elem_id="start-new-session",
                 size="sm",
             )
@@ -2664,20 +2676,22 @@ def _build_create_tab() -> None:
                     interactive=True,
                     elem_id="assessment-view-box",
                 )
-                with gr.Row():
-                    _gen["save_assessment_btn"] = gr.Button(
-                        "Save Details",
-                        variant="primary",
-                        size="sm",
-                        elem_id="save-details-btn",
-                    )
-                    _gen["reload_assessment_btn"] = gr.Button(
-                        "Reload Assessment",
-                        variant="secondary",
-                        size="sm",
-                        elem_id="reload-assessment-btn",
-                    )
             _gen["details_assessment"] = _details_assess
+
+            # Shared under EVERY Details Mode panel — save / reload all project details
+            with gr.Row(elem_id="details-save-reload-row"):
+                _gen["save_assessment_btn"] = gr.Button(
+                    "Save Details",
+                    variant="primary",
+                    size="sm",
+                    elem_id="save-details-btn",
+                )
+                _gen["reload_assessment_btn"] = gr.Button(
+                    "Reload Details",
+                    variant="secondary",
+                    size="sm",
+                    elem_id="reload-details-btn",
+                )
 
             # Shared under every Details Mode: dynamic Run Assessment + asset buttons
             with gr.Row(elem_id="gen-action-row"):
@@ -3625,22 +3639,166 @@ def _wire_create_events(status_box) -> None:
             (Path(folder) / "lyrics.txt").write_text(lyrics or "", encoding="utf-8")
         except OSError:
             pass
-        # Place reference into project when a path is given
+        # Place reference into project when a path is given; keep session + generation in sync
+        local_ref = ""
         if (ref_image or "").strip() and Path(ref_image).is_file():
             try:
-                configure.ensure_project_reference(folder, ref_image)
+                local_ref = configure.ensure_project_reference(folder, ref_image) or ""
+            except Exception:
+                local_ref = ""
+            if local_ref:
+                try:
+                    configure.save_session_meta(Path(folder), {"reference_image": local_ref})
+                    configure.update_generation({"reference_image_path": local_ref})
+                except Exception:
+                    pass
+        elif (ref_image or "").strip():
+            # Keep whatever path is stored even if the file is temporarily missing
+            try:
+                configure.save_session_meta(Path(folder), {"reference_image": (ref_image or "").strip()})
+                configure.update_generation({"reference_image_path": (ref_image or "").strip()})
             except Exception:
                 pass
 
         configure.APP_STATE["current_project_folder"] = folder
         configure.APP_STATE["active_session_id"] = Path(folder).name
         msg = f"Details saved → {Path(folder).name}/session.json{assess_note}"
+        if local_ref:
+            msg += f"; reference → {Path(local_ref).name}"
         return msg, *_action_btn_updates(lyrics, song_name)
 
 
-    def _reload_assessment(lyrics: str, song_name: str):
-        text_val = _load_assessment_text()
-        return text_val, f"Reloaded assessment from disk.", *_action_btn_updates(lyrics, song_name)
+    def _reload_details(active_session_id: str = ""):
+        """
+        Reload Details — restore every Details Mode field from the active
+        project's session.json / lyrics.txt / analysis.txt / reference.*.
+        """
+        folder = (configure.APP_STATE.get("current_project_folder") or "").strip()
+        if not folder and active_session_id:
+            cand = configure.get_output_dir() / str(active_session_id)
+            if cand.is_dir():
+                folder = str(cand)
+        if not folder or not Path(folder).is_dir():
+            # Nothing on disk — return no-op updates for form + assessment
+            form = _session_form_updates(
+                status="Reload Details: no project folder — set a song name or open a session first.",
+                running=False,
+            )
+            return form + (gr.update(), gr.update())  # assessment_view, ref_preview unchanged
+
+        meta = configure.load_session_meta(Path(folder)) or {}
+        # Lyrics: prefer lyrics.txt, fall back to session meta
+        lyrics = ""
+        try:
+            lp = Path(folder) / "lyrics.txt"
+            if lp.is_file():
+                lyrics = lp.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            pass
+        if not lyrics:
+            lyrics = meta.get("lyrics") or ""
+        song = (meta.get("song_name") or Path(folder).name or "").strip()
+        # Reference: session path, or discover reference.* in project
+        ref = (meta.get("reference_image") or "").strip()
+        if ref and not Path(ref).is_file():
+            cand = Path(folder) / Path(ref).name
+            if cand.is_file():
+                ref = str(cand)
+            else:
+                ref = configure.project_reference_path(folder) or ""
+        if not ref:
+            ref = configure.project_reference_path(folder) or ""
+        # Assessment text
+        assess_text = _load_assessment_text(folder)
+        # Size / counts from meta
+        try:
+            w = int(meta.get("imagegen_width") or configure.DEFAULT_WIDTH)
+            h = int(meta.get("imagegen_height") or configure.DEFAULT_HEIGHT)
+        except (TypeError, ValueError):
+            w, h = configure.DEFAULT_WIDTH, configure.DEFAULT_HEIGHT
+        size_label = meta.get("imagegen_size") or configure.image_size_label_from_wh(w, h)
+        try:
+            size_label = configure.normalize_image_size(str(size_label))
+        except Exception:
+            size_label = configure.DEFAULT_IMAGE_SIZE
+        cover_n = configure.clamp_cover_count(meta.get("cover_count", configure.DEFAULT_COVER_COUNT))
+        theme_n = configure.clamp_theme_count(meta.get("theme_count", configure.DEFAULT_THEME_COUNT))
+        lyrics_n = configure.clamp_lyrics_per_line(
+            meta.get("lyrics_per_line", configure.DEFAULT_LYRICS_PER_LINE)
+        )
+        freq = configure.format_image_frequency(cover_n, theme_n, lyrics_n)
+        # Keep APP_STATE + generation in sync
+        configure.APP_STATE["current_project_folder"] = folder
+        configure.APP_STATE["active_session_id"] = Path(folder).name
+        try:
+            configure.update_generation({
+                "reference_image_path": ref or "",
+                "last_project_folder": folder,
+                "project_label": song,
+                "narrative_guidance": str(meta.get("narrative_guidance") or "")[:128],
+                "image_style": configure.normalize_image_style(
+                    str(meta.get("image_style") or configure.IMAGE_STYLE_DEFAULT)
+                ),
+                "imagegen_size": size_label,
+                "imagegen_width": w,
+                "imagegen_height": h,
+                "imagegen_steps": int(meta.get("steps") or configure.DEFAULT_STEPS),
+                "imagegen_cfg_scale": float(meta.get("cfg_scale") or configure.DEFAULT_CFG),
+                "cover_count": cover_n,
+                "theme_count": theme_n,
+                "lyrics_per_line": lyrics_n,
+                "imagegen_frequency": freq,
+                "hair_style": configure.normalize_hair_style(str(meta.get("hair_style") or "")),
+                "outfit_worn": configure.normalize_outfit(str(meta.get("outfit_worn") or "")),
+                "footwear": configure.normalize_footwear(str(meta.get("footwear") or "")),
+                "ref_gender": configure.normalize_gender(str(meta.get("ref_gender") or "")),
+                "ref_bodyshape": configure.normalize_bodyshape(str(meta.get("ref_bodyshape") or "")),
+                "eye_color": configure.normalize_eye_color(str(meta.get("eye_color") or "")),
+                "ref_age": configure.normalize_age(meta.get("ref_age", configure.AGE_DEFAULT)),
+                "support_age_min": configure.normalize_support_age(
+                    meta.get("support_age_min", configure.SUPPORT_AGE_MIN_DEFAULT), is_min=True
+                ),
+                "support_age_max": configure.normalize_support_age(
+                    meta.get("support_age_max", configure.SUPPORT_AGE_MAX_DEFAULT), is_min=False
+                ),
+            })
+            configure.save_frequency_counts(cover_n, theme_n, lyrics_n)
+            configure.update_preferences({"style": configure.normalize_style(meta.get("style"))})
+        except Exception as e:
+            print(f"[reload-details] mirror failed: {e}", flush=True)
+
+        form = _session_form_updates(
+            song=song,
+            lyrics=lyrics,
+            style=meta.get("style"),
+            image_size=size_label,
+            steps=meta.get("steps", configure.DEFAULT_STEPS),
+            cfg_scale=meta.get("cfg_scale", configure.DEFAULT_CFG),
+            ref=ref,
+            negative=meta.get("negative_prompt"),
+            status=f"Details reloaded from {Path(folder).name}/",
+            sid=Path(folder).name,
+            narrative_guidance=str(meta.get("narrative_guidance") or "")[:128],
+            image_style=meta.get("image_style"),
+            cover_count=cover_n,
+            theme_count=theme_n,
+            lyrics_per_line=lyrics_n,
+            image_frequency=freq,
+            hair_style=meta.get("hair_style"),
+            outfit_worn=meta.get("outfit_worn"),
+            footwear=meta.get("footwear"),
+            ref_gender=meta.get("ref_gender"),
+            ref_bodyshape=meta.get("ref_bodyshape"),
+            eye_color=meta.get("eye_color"),
+            ref_age=meta.get("ref_age"),
+            support_age_min=meta.get("support_age_min"),
+            support_age_max=meta.get("support_age_max"),
+            running=False,
+        )
+        # form ends with action buttons; append assessment text + ref preview
+        ref_ok = bool(ref and Path(ref).is_file())
+        preview = gr.update(value=ref if ref_ok else None, visible=ref_ok)
+        return form + (gr.update(value=assess_text or ""), preview)
 
     if _gen.get("save_assessment_btn") is not None:
         _save_details_inputs = [
@@ -3722,16 +3880,7 @@ def _wire_create_events(status_box) -> None:
             outputs=[status_box, *_action_btn_components()],
         )
 
-    if _gen.get("reload_assessment_btn") is not None:
-        _gen["reload_assessment_btn"].click(
-            _reload_assessment,
-            inputs=[_gen["lyrics"], _gen["song_name"]],
-            outputs=[
-                _gen["assessment_view"],
-                status_box,
-                *_action_btn_components(),
-            ],
-        )
+    # reload_assessment_btn wired later (after _session_form_outputs is defined)
 
     def _ready_change(lyrics, song_name):
         # Return all 9 action updates (stop stays hidden; thumb copies included)
@@ -4418,6 +4567,16 @@ def _wire_create_events(status_box) -> None:
             + tuple(_refresh_session_slots(""))
             + (gr.update(),)  # main_tabs
             + details_reset
+        )
+
+    if _gen.get("reload_assessment_btn") is not None:
+        _reload_outs = _session_form_outputs() + [_gen["assessment_view"]]
+        if _gen.get("ref_preview") is not None:
+            _reload_outs.append(_gen["ref_preview"])
+        _gen["reload_assessment_btn"].click(
+            _reload_details,
+            inputs=[_gen["active_session_id"]],
+            outputs=_reload_outs,
         )
 
     _gen["start_new_session"].click(
@@ -5580,6 +5739,14 @@ def _wire_create_events(status_box) -> None:
 
         configure.APP_STATE["generating"] = True
         configure.APP_STATE["session_status"] = "running"
+        # Critical: clear residual cancel flag from Emergency Stop so the
+        # assessment (and any subsequent llama call) is not immediately aborted.
+        try:
+            from scripts import inference as _inf_clear
+            _inf_clear.clear_cancel_state()
+        except Exception:
+            configure.APP_STATE["cancel_requested"] = False
+            configure.APP_STATE["active_processes"] = []
         _reset_live_status(_ASSESS_START_MSG, {"phase": "analysis"})
 
         import queue
@@ -5638,7 +5805,46 @@ def _wire_create_events(status_box) -> None:
                 project_dir = ensure_project_dir(slug, sequential=False, resume_path=resume or None)
                 configure.APP_STATE["current_project_folder"] = str(project_dir)
                 configure.APP_STATE["active_session_id"] = project_dir.name
-                has_ref = bool(ref_image and Path(ref_image).is_file())
+                # Persist reference into the project folder BEFORE assessment so
+                # session.json / generation.json never lose the path on re-run.
+                local_ref = ""
+                if ref_image and Path(str(ref_image)).is_file():
+                    try:
+                        local_ref = configure.ensure_project_reference(
+                            project_dir, str(ref_image)
+                        ) or ""
+                    except Exception as e:
+                        print(f"[assess] could not place reference: {e}", flush=True)
+                        local_ref = str(ref_image)
+                elif ref_image:
+                    local_ref = str(ref_image)
+                if not local_ref:
+                    # Keep any existing project reference.* rather than clearing it
+                    try:
+                        local_ref = configure.project_reference_path(project_dir) or ""
+                    except Exception:
+                        local_ref = ""
+                if local_ref:
+                    cfg["reference_image"] = local_ref
+                    try:
+                        configure.update_generation({"reference_image_path": local_ref})
+                    except Exception:
+                        pass
+                has_ref = bool(local_ref and Path(local_ref).is_file())
+                # Snapshot full details (incl. reference) so reload/open always sees them
+                try:
+                    from scripts.inference import _snapshot_session
+                    _snapshot_session(
+                        project_dir,
+                        lyrics=lyrics or "",
+                        song_name=label or project_dir.name,
+                        cfg=cfg,
+                        reference_image=local_ref or "",
+                        phase="analysis",
+                        line_count=0,
+                    )
+                except Exception as e:
+                    print(f"[assess] snapshot before analysis: {e}", flush=True)
                 analysis = ensure_project_assessment(
                     project_dir,
                     lyrics or "",
@@ -5647,11 +5853,38 @@ def _wire_create_events(status_box) -> None:
                     progress_callback=_cb,
                     force=True,
                 )
+                cancelled = bool(inf.is_cancel_requested())
+                usable = bool(
+                    analysis
+                    and (analysis.get("overall") or analysis.get("sections"))
+                    and not cancelled
+                )
+                if cancelled:
+                    msg = "Assessment cancelled — click Run Assessment to try again."
+                elif usable:
+                    msg = "Assessment complete — Details Mode switched to Song Assessment. Edit if needed, then Save."
+                else:
+                    msg = "Assessment failed or returned empty — click Run Assessment to retry."
+                # Re-snapshot after assessment so phase / analysis presence is current
+                try:
+                    from scripts.inference import _snapshot_session
+                    _snapshot_session(
+                        project_dir,
+                        lyrics=lyrics or "",
+                        song_name=label or project_dir.name,
+                        cfg=cfg,
+                        reference_image=local_ref or "",
+                        phase="prompts" if usable else ("stopped" if cancelled else "analysis"),
+                        line_count=0,
+                    )
+                except Exception as e:
+                    print(f"[assess] snapshot after analysis: {e}", flush=True)
                 result_holder["r"] = {
-                    "success": bool(analysis and (analysis.get("overall") or analysis.get("sections"))),
-                    "message": "Assessment complete — Details Mode switched to Song Assessment. Edit if needed, then Save.",
+                    "success": usable,
+                    "message": msg,
                     "project_folder": str(project_dir),
                     "session_id": project_dir.name,
+                    "reference_image": local_ref or "",
                     "assessment_text": (project_dir / "analysis.txt").read_text(encoding="utf-8", errors="replace")
                     if (project_dir / "analysis.txt").is_file() else "",
                 }
@@ -5694,10 +5927,10 @@ def _wire_create_events(status_box) -> None:
             _status_plain(msg), *idle_btns, sid,
         ) + _gallery_sessions_tab(sid) + (
             gr.update(value="Song Assessment"),
-            gr.update(visible=False),  # Project Settings
-            gr.update(visible=False),  # Name and Lyrics
-            gr.update(visible=False),  # Actors and Outfits
-            gr.update(visible=True),   # Song Assessment
+            gr.update(visible=False),  # details_project_settings
+            gr.update(visible=False),  # details_name_lyrics
+            gr.update(visible=True),   # details_assessment  (Song Assessment panel)
+            gr.update(visible=False),  # details_reference   (Actors and Outfits)
             gr.update(value=assess_text),
         )
 

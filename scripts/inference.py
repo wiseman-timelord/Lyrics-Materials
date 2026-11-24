@@ -4757,6 +4757,15 @@ def _analysis_is_usable(analysis: Optional[Dict[str, Any]]) -> bool:
     if not analysis or not isinstance(analysis, dict):
         return False
     overall = (analysis.get("overall") or "").strip()
+    # Reject the failure / cancel stub written when the model returned nothing useful
+    low = overall.lower()
+    if (
+        "assessment failed" in low
+        or "click re-run assessment" in low
+        or "model returned unstructured" in low
+        or (overall.startswith("(") and "re-run" in low)
+    ):
+        return False
     if overall and not _looks_like_keyword_spam(overall):
         return True
     secs = analysis.get("sections") or {}
@@ -4865,6 +4874,24 @@ def ensure_project_assessment(
         has_character_ref=has_character_ref,
         progress_callback=progress_callback,
     )
+    # Cancelled mid-run: leave no analysis.txt so Re-run Assessment starts clean
+    if is_cancel_requested():
+        try:
+            stale = project_dir / "analysis.txt"
+            if stale.is_file():
+                stale.unlink()
+                print("[analysis] cancelled — removed incomplete analysis.txt", flush=True)
+        except OSError:
+            pass
+        print("[analysis] cancelled — not saving assessment", flush=True)
+        return {
+            "overall": "",
+            "sections": {},
+            "character_guidance": "",
+            "other_figures": "",
+            "character_presence": {},
+            "others_presence": {},
+        }
     if _analysis_is_usable(analysis):
         _write_analysis_file(project_dir, analysis)
         maybe_bleep_section()
