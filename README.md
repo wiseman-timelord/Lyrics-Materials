@@ -48,14 +48,17 @@ Size,Area vs 768×512,8 GB Split outlook
 Available on [HuggingFace.Co](https://huggingface.co/) (the program uses gguf versions of models where possible) (this section needs further updating)...  
 1. Generation with Flux2-4b...
 - Diffuser: [flux-2-klein-4b-GGUF](https://huggingface.co/models?search=flux2%204b%20gguf) Image generation (one of those, cant remember which one I used) (I used q8).
-- VAE: [diffusion_pytorch_model.safetensors](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B/resolve/main/vae/diffusion_pytorch_model.safetensors?download=true) the other image generation file (one file).
-- Encoder/Prompting: [Huihui-Qwen3-VL-4B-Thinking-abliterated-GGUF](https://huggingface.co/mradermacher/Huihui-Qwen3-VL-4B-Thinking-abliterated-GGUF) for Rich 
-analysis + prompts when set (I used q4). The prompt generation and encoding can be done from the thinking model or the instruct model mode, flux2-Klein-4b requires the 4b version.
-2. Generation with IDeogram...
-
-- Encoder/Prompting: [Huihui-Qwen3-VL-8B-Thinking-abliterated-GGUF](https://huggingface.co/mradermacher/Huihui-Qwen3-VL-8B-Thinking-abliterated-GGUF) for Rich 
-analysis + prompts when set (I used q4). The prompt generation and encoding can be done from the thinking model or the instruct model model, Ideogram4 requires 8B variants of Qwen3-VL. 
+- VAE: [diffusion_pytorch_model.safetensors](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B/resolve/main/vae/diffusion_pytorch_model.safetensors).
+- Encoder/Prompting: [Huihui-Qwen3-VL-8B-Instruct-abliterated](https://huggingface.co/models?search=Huihui-Qwen3-VL-4B-Instruct-abliterated-GGUF) (I used q4). The prompt generation and encoding can be done from the instruct model mode, flux2-Klein-4b requires the 4b version.
+2. Generation with Flux2-9b...
+- Diffuser: [flux-2-klein-9b-GGUF](https://huggingface.co/models?search=flux2%204b%20gguf) Image generation (one of those, cant remember which one I used) (I used q4 flux-2-klein-9b-Q4_K_M.gguf).
+- VAE: [flux2-vae.safetensors](https://huggingface.co/Comfy-Org/MOSS-Image/blob/main/vae/flux2-vae.safetensors) the other image generation file (one file).
+- Encoder/Prompting: [Huihui-Qwen3-VL-8B-Instruct-abliterated](https://huggingface.co/models?search=Huihui-Qwen3-VL-8B-Instruct-abliterated-GGUF) (I used q4). The prompt generation and encoding can be done from the instruct model mode, flux2-Klein-9b requires the 8b version.
+3. Generation with Ideogram...
 - Diffusion: Ideogram4-Turbo requires the Ideogram4-Turbo gguf file and the flux2-vae, while the uncondit file for Ideogram4 is optional if you can run the whole thing on GPU, because if you select diffuser placement as split on ideogram, its assumed you have low VRAM, so there is no uncond file if diffuser placement is split. This may need improving later, but myself have 8GB VRAM.
+- Encoder/Prompting: [Huihui-Qwen3-VL-8B-Instruct-abliterated](https://huggingface.co/models?search=Huihui-Qwen3-VL-8B-Instruct-abliterated-GGUF) (I used q4). The prompt generation and encoding can be done from the instruct model mode, Ideogram4 requires the 8b version.
+analysis + prompts when set (I used q4). The prompt generation and encoding can be done from the thinking model or the instruct model model, Ideogram4 requires 8B variants of Qwen3-VL. 
+
 
 ### Instructions:
 - These are my current instructions for using the program...
