@@ -958,6 +958,11 @@ def _is_llama_log_line(line: str) -> bool:
     if not s:
         return True
     low = s.lower()
+    # Timestamp + severity tags from ggml/llama verbose (e.g. "0.06.068.220 I …")
+    if re.match(r"^\d+\.\d+(?:\.\d+)?\s+[IWEDf]\b", s):
+        return True
+    if re.match(r"^\d{1,2}:\d{2}:\d{2}(?:\.\d+)?\s+[IWEDf]\b", s):
+        return True
     # Common log / telemetry prefixes
     if any(
         low.startswith(p) for p in (
@@ -966,6 +971,7 @@ def _is_llama_log_line(line: str) -> bool:
             "total time", "system info", "build:", "log_", "common_",
             "init:", "loading", "offloaded", "graph splits", "kv cache",
             "llama_model", "llama_context", "llama_new", "clip_",
+            "llama_completion", "common_init", "main:", "srv ",
         )
     ):
         return True
@@ -974,6 +980,48 @@ def _is_llama_log_line(line: str) -> bool:
     if "tokens/s" in low or "ms/token" in low or "t/s" in low:
         return True
     if low in ("[end of text]", "end of text", "<|endoftext|>", "<|im_end|>"):
+        return True
+    return False
+
+
+def _looks_like_backend_log(text: str) -> bool:
+    """
+    True when a candidate prompt / completion is mostly backend telemetry
+    rather than usable natural-language conditioning.
+
+    Final gate before any string is passed to sd-cli `-p` (or treated as a
+    successful model answer). Prevents residual log lines from becoming the
+    image prompt when extraction fails.
+    """
+    t = (text or "").strip()
+    if not t:
+        return False
+    lines = [ln.strip() for ln in t.replace("\r\n", "\n").split("\n") if ln.strip()]
+    if not lines:
+        return False
+    log_hits = 0
+    for ln in lines:
+        if _is_llama_log_line(ln):
+            log_hits += 1
+            continue
+        low = ln.lower()
+        if any(
+            k in low for k in (
+                "llama_completion", "ggml_", "gguf_", "system_info",
+                "prompt eval time", "eval time =", "total time =",
+                "sampling:", "sampler types", "repeat_penalty",
+                "kv cache", "offloaded", "graph splits",
+            )
+        ):
+            log_hits += 1
+    if log_hits >= max(2, (len(lines) + 1) // 2):
+        return True
+    compact = re.sub(r"\s+", " ", t)
+    if len(compact) < 120 and log_hits >= 1:
+        return True
+    if re.search(r"\b\d+\.\d+\.\d+\s+[IWEDf]\b", t):
+        return True
+    if "llama_completion:" in t.lower() or "print_info:" in t.lower():
         return True
     return False
 
@@ -1238,6 +1286,16 @@ def _run_llama_completion(
         print(
             f"[llama] CRASH detected (exit={proc.returncode}) — discarding output. "
             f"If this persists, try One-Shot load mode (M-Lock flag is omitted on Windows).",
+            flush=True,
+        )
+        return ""
+
+    # Never return backend telemetry as a "successful" completion — callers
+    # treat empty as failure and fall back (lyric scene / original prompt).
+    if cleaned and _looks_like_backend_log(cleaned):
+        print(
+            f"[llama] WARNING: cleaned completion still looks like backend logs "
+            f"({len(cleaned)} chars) — discarding so callers can fall back.",
             flush=True,
         )
         return ""
@@ -3539,6 +3597,14 @@ def _sanitize_visual_prompt(prompt: str, lyric: str, style_hint: str = "") -> st
     p = (prompt or "").strip()
     if not p:
         return ""
+    # Never let backend log residue become a "scene"
+    if _looks_like_backend_log(p):
+        print(
+            f"[images] scene rejected — looks like backend logs "
+            f"({len(p)} chars)",
+            flush=True,
+        )
+        return ""
 
     # Strip think / ChatML debris first
     p = _strip_think_tags(p)
@@ -4121,10 +4187,30 @@ def generate_images_from_prompts(
                 )
 
             final_prompt = _strip_prompt_chatml(final_prompt)
+            # Critical: never pass backend log residue to sd-cli -p
+            if not final_prompt or _looks_like_backend_log(final_prompt):
+                fallback = _lyric_scene_fallback(line_text)
+                print(
+                    f"[images] final prompt unsafe/empty — falling back to lyric scene "
+                    f"({len(final_prompt or '')} chars discarded)",
+                    flush=True,
+                )
+                final_prompt = fallback
             print(f"[images] final prompt ({len(final_prompt)} chars): {final_prompt[:220]}…", flush=True)
             cmd = _build_sd_cmd(
                 final_prompt, img_path, attach_ref=attach_ref, ref_override=ref_override,
             )
+            # Log argv summary (prompt length only — full -p is above)
+            try:
+                _argv_preview = []
+                for i, a in enumerate(cmd):
+                    if i > 0 and str(cmd[i - 1]) in ("-p", "-n"):
+                        _argv_preview.append(f"<{len(str(a))} chars>")
+                    else:
+                        _argv_preview.append(str(a))
+                print(f"[images] sd-cli argv: {' '.join(_argv_preview)}", flush=True)
+            except Exception:
+                pass
             t_img = time.time()
             mark_still_started(t_img)
             out, rc = _run_sd_cli_once(cmd, exe, timeout=_TIMEOUT_SD)
@@ -4584,6 +4670,12 @@ def regenerate_single_still(
         sequence_bit="",
     )
     final_prompt = _strip_prompt_chatml(final_prompt)
+    if not final_prompt or _looks_like_backend_log(final_prompt):
+        final_prompt = _lyric_scene_fallback(line_text)
+        print(
+            f"[regen] final prompt unsafe/empty — falling back to lyric scene",
+            flush=True,
+        )
     print(f"[regen] final prompt ({len(final_prompt)} chars): {final_prompt[:220]}…", flush=True)
 
     freq_label = configure.normalize_image_frequency(
@@ -5130,6 +5222,15 @@ def _generate_named_still(
         assembled = scene
     else:
         assembled = f"{style_lead}. {scene}".strip()
+    # Critical: never pass backend log residue (or empty) to sd-cli -p
+    if not assembled or _looks_like_backend_log(assembled):
+        print(
+            f"[images] named-still prompt unsafe/empty — using style lead only "
+            f"({len(assembled or '')} chars discarded)",
+            flush=True,
+        )
+        assembled = style_lead if style_lead.endswith(".") else (style_lead + ".")
+    print(f"[images] named-still -p ({len(assembled)} chars): {assembled[:220]}…", flush=True)
     cmd = [
         str(exe),
         "--diffusion-model", str(model_path),

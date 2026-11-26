@@ -5,8 +5,8 @@ Models:
   Text     : Qwen3-VL-4B Thinking (assessment, prompts, --llm encoding)
              or Qwen3-VL-8B Instruct (preferred for Ideogram4)
              Prefer Huihui-*-abliterated*.gguf
-  Diffuser : FLUX.2-klein-4B  OR  Ideogram4 / Ideogram4-turbo
-  VAE      : Flux.2 autoencoder (flux2_ae / flux2-vae) for both families
+  Diffuser : FLUX.2-klein-4B / Flux.2-9B  OR  Ideogram4 / Ideogram4-turbo
+  VAE      : Flux.2 autoencoder (flux2_ae / flux2-vae) for all Flux.2 / Ideogram families
   mmproj moved beside the active model into <model_dir>/mmproj/ (not used for pure-text loads)
 """
 from __future__ import annotations
@@ -253,12 +253,13 @@ THINKING_MODEL_HINT = (
 TEXT_MODEL_HINT = THINKING_MODEL_HINT  # single text model role
 MMPROJ_HINT = "mmproj*.gguf  (moved to <model_dir>/mmproj/ — not used for pure text)"
 DIFFUSER_MODEL_HINT = (
-    "flux-2-klein-4b-*.gguf  OR  ideogram4-turbo-*.gguf / ideogram4-*.gguf  "
+    "flux-2-klein-4b-*.gguf / flux-2-*-9b-*.gguf  OR  "
+    "ideogram4-turbo-*.gguf / ideogram4-*.gguf  "
     "(or diffusion_pytorch_model*.safetensors)"
 )
 VAE_HINT = (
     "flux2_ae.safetensors / flux2-vae.safetensors / flux2_vae.safetensors "
-    "(Flux.2 VAE — required for both Flux.2-klein and Ideogram4; "
+    "(Flux.2 VAE — required for Flux.2-klein 4B/9B and Ideogram4; "
     "NOT Flux.1 / schnell ae.safetensors)"
 )
 UNCOND_MODEL_HINT = (
@@ -317,6 +318,13 @@ MODEL_VRAM_PROFILES = {
         "gpu_only_mb": 8200,   # diffusion + TE + VAE co-resident
         "layers": DIFFUSER_MAX_LAYERS,
     },
+    # Flux.2 ~9B family (e.g. flux2-dev / larger klein packs). Higher than 4B Q8.
+    "flux_9b": {
+        "disk_mb": 9000,
+        "full_gpu_mb": 11000,  # diffusion on GPU, Split (TE/VAE on CPU)
+        "gpu_only_mb": 16000,  # diffusion + TE + VAE (needs ~16 GB+)
+        "layers": DIFFUSER_MAX_LAYERS,
+    },
     # Ideogram4 (~9B DiT). Q4_K_M ~5.7–6.0 GB disk; runtime higher than Flux.2-klein
     "ideogram_q4": {
         "disk_mb": 5800,
@@ -331,6 +339,11 @@ def _match_vram_profile(filename: str) -> Dict[str, int]:
     n = (filename or "").lower()
     if "ideogram" in n:
         return dict(MODEL_VRAM_PROFILES["ideogram_q4"])
+    # Prefer 9B budget when the filename clearly indicates a larger Flux.2 pack
+    if ("flux" in n or "klein" in n) and (
+        "9b" in n or "9-b" in n or "dev" in n or "12b" in n
+    ):
+        return dict(MODEL_VRAM_PROFILES["flux_9b"])
     if "flux" in n or "klein" in n:
         return dict(MODEL_VRAM_PROFILES["flux_q8"])
     if "q5_k" in n or "q5k" in n:
