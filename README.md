@@ -57,7 +57,6 @@ Available on [HuggingFace.Co](https://huggingface.co/) (the program uses gguf ve
 3. Generation with Ideogram...
 - Diffusion: Ideogram4-Turbo requires the Ideogram4-Turbo gguf file and the flux2-vae, while the uncondit file for Ideogram4 is optional if you can run the whole thing on GPU, because if you select diffuser placement as split on ideogram, its assumed you have low VRAM, so there is no uncond file if diffuser placement is split. This may need improving later, but myself have 8GB VRAM.
 - Encoder/Prompting: [Huihui-Qwen3-VL-8B-Instruct-abliterated](https://huggingface.co/models?search=Huihui-Qwen3-VL-8B-Instruct-abliterated-GGUF) (I used q4). The prompt generation and encoding can be done from the instruct model mode, Ideogram4 requires the 8b version.
-analysis + prompts when set (I used q4). The prompt generation and encoding can be done from the thinking model or the instruct model model, Ideogram4 requires 8B variants of Qwen3-VL. 
 
 
 ### Instructions:
